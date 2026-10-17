@@ -1,0 +1,6 @@
+{
+  "name": "GestãoFood - Vendas, Produção e Entregas",
+  "description": "Sistema completo para gestão de vendas, KDS cozinha, controle de entregas, cardápio digital via WhatsApp com QR Code e rastreio em tempo real.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
