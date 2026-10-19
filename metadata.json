@@ -1,6 +1,10 @@
 {
-  "name": "GestãoFood - Vendas, Produção e Entregas",
-  "description": "Sistema completo para gestão de vendas, KDS cozinha, controle de entregas, cardápio digital via WhatsApp com QR Code e rastreio em tempo real.",
-  "requestFramePermissions": ["camera"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "name": "Amandita Sabores - Sistema de Vendas, Produção e Entregas",
+  "description": "Amandita Sabores: Sistema completo de PDV balcão, controle de produção na cozinha KDS, entregadores e cardápio digital oficial via WhatsApp.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

@@ -528,6 +528,7 @@ export const INITIAL_ORDERS: Order[] = [
     paymentMethod: 'PIX',
     paymentStatus: 'PAGO',
     status: 'EM_ROTA',
+    trackingCode: 'tk_demo_1001_c7f1a94e82b449bca0d2f099',
     deliveryPerson: {
       id: 'user-entregador',
       name: 'Rodrigo Motoboy',
@@ -606,6 +607,7 @@ export const INITIAL_ORDERS: Order[] = [
     paymentMethod: 'CARTAO_DEBITO',
     paymentStatus: 'PAGO',
     status: 'EM_PREPARO',
+    trackingCode: 'tk_demo_1002_a3b8e7c1f5d246098b1e4c3a',
     movements: [
       {
         id: 'mov-5',
@@ -669,6 +671,7 @@ export const INITIAL_ORDERS: Order[] = [
     paymentChangeFor: 50.00,
     paymentStatus: 'PENDENTE',
     status: 'NOVO',
+    trackingCode: 'tk_demo_1003_f9c2d1b7a4e64805819d7e32',
     movements: [
       {
         id: 'mov-7',

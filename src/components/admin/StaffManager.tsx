@@ -49,6 +49,11 @@ export const StaffManager: React.FC = () => {
   const [users, setUsers] = useState<User[]>(() => store.getUsers());
   const [accessLogs, setAccessLogs] = useState<UserAccessLog[]>(() => store.getAccessLogs());
 
+  // Current logged in actor
+  const currentActor = store.getCurrentUser();
+  const isActorAdmin = currentActor?.role === 'ADMINISTRADOR';
+  const isActorGerente = currentActor?.role === 'GERENTE';
+
   // Search filter
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -79,6 +84,7 @@ export const StaffManager: React.FC = () => {
   };
 
   const handleRoleChange = (role: UserRole) => {
+    if (!isActorAdmin && role === 'ADMINISTRADOR') return;
     setFormRole(role);
     // Apply smart preset modules based on chosen role
     if (role === 'ADMINISTRADOR') {
@@ -95,6 +101,7 @@ export const StaffManager: React.FC = () => {
   };
 
   const toggleModule = (modId: AppModule) => {
+    if (isActorGerente && modId === 'usuarios') return;
     if (formAllowedModules.includes(modId)) {
       setFormAllowedModules(formAllowedModules.filter((m) => m !== modId));
     } else {
@@ -117,6 +124,7 @@ export const StaffManager: React.FC = () => {
   };
 
   const handleOpenEditUser = (user: User) => {
+    if (isActorGerente && user.role === 'ADMINISTRADOR') return;
     setEditingUserId(user.id);
     setFormName(user.name || '');
     setFormUsername(user.username);
@@ -134,8 +142,11 @@ export const StaffManager: React.FC = () => {
     e.preventDefault();
     setFormError(null);
 
-    if (!formUsername.trim() || !formEmail.trim() || !formName.trim()) {
-      setFormError('Preencha nome completo, nome de usuário e e-mail.');
+    const cleanUser = formUsername.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '');
+    const cleanName = formName.trim() || cleanUser;
+
+    if (!cleanUser) {
+      setFormError('Por favor, informe o nome ou nome de usuário do colaborador.');
       return;
     }
 
@@ -144,12 +155,14 @@ export const StaffManager: React.FC = () => {
       return;
     }
 
+    const resolvedEmail = formEmail.trim() || `${cleanUser}@staff.amanditasabores.com.br`;
+
     if (editingUserId) {
       // Update existing
       const res = store.updateUser(editingUserId, {
-        name: formName.trim(),
-        username: formUsername.trim().toLowerCase(),
-        email: formEmail.trim().toLowerCase(),
+        name: cleanName,
+        username: cleanUser,
+        email: resolvedEmail,
         phone: formPhone.trim() || undefined,
         role: formRole,
         status: formStatus,
@@ -170,9 +183,9 @@ export const StaffManager: React.FC = () => {
       // Create new
       const res = store.createUser(
         {
-          name: formName.trim(),
-          username: formUsername.trim().toLowerCase(),
-          email: formEmail.trim().toLowerCase(),
+          name: cleanName,
+          username: cleanUser,
+          email: resolvedEmail,
           phone: formPhone.trim() || undefined,
           role: formRole,
           status: formStatus,
@@ -192,13 +205,14 @@ export const StaffManager: React.FC = () => {
   };
 
   const handleToggleStatus = (user: User) => {
-    if (user.username === 'admin') return;
+    if (user.username === 'admin' || user.role === 'ADMINISTRADOR') return;
     const nextStatus: UserStatus = user.status === 'ATIVO' ? 'BLOQUEADO' : 'ATIVO';
     store.updateUser(user.id, { status: nextStatus });
     reloadData();
   };
 
   const handleOpenResetPassword = (user: User) => {
+    if (isActorGerente && (user.role === 'ADMINISTRADOR' || user.username === 'admin')) return;
     setResetModalUser(user);
     setNewPasswordInput('');
     setResetSuccessNotice(null);
@@ -402,46 +416,58 @@ export const StaffManager: React.FC = () => {
                     </div>
 
                     <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={() => handleOpenResetPassword(user)}
-                        className="px-2.5 py-1.5 bg-[#FAF7F2] hover:bg-[#EFE6DC] text-[#3D2314] font-semibold rounded-lg border border-[#E8DFD5] transition flex items-center gap-1"
-                        title="Redefinir senha do funcionário"
-                      >
-                        <KeyRound className="w-3.5 h-3.5 text-[#C86D3B]" />
-                        <span>Senha</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleOpenEditUser(user)}
-                        className="px-2.5 py-1.5 bg-[#FAF7F2] hover:bg-[#EFE6DC] text-[#3D2314] font-semibold rounded-lg border border-[#E8DFD5] transition flex items-center gap-1"
-                        title="Editar dados e permissões"
-                      >
-                        <Edit3 className="w-3.5 h-3.5" />
-                        <span>Editar</span>
-                      </button>
-
-                      {!isAdmin && (
+                      {isActorAdmin || (!isAdmin && isActorGerente) ? (
                         <>
                           <button
-                            onClick={() => handleToggleStatus(user)}
-                            className={`p-1.5 rounded-lg border transition ${
-                              isBlocked
-                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
-                                : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
-                            }`}
-                            title={isBlocked ? 'Desbloquear conta' : 'Bloquear acesso do funcionário'}
+                            type="button"
+                            onClick={() => handleOpenResetPassword(user)}
+                            className="px-2.5 py-1.5 bg-[#FAF7F2] hover:bg-[#EFE6DC] text-[#3D2314] font-semibold rounded-lg border border-[#E8DFD5] transition flex items-center gap-1 cursor-pointer"
+                            title="Redefinir senha do funcionário"
                           >
-                            {isBlocked ? <Check className="w-3.5 h-3.5" /> : <Ban className="w-3.5 h-3.5" />}
+                            <KeyRound className="w-3.5 h-3.5 text-[#C86D3B]" />
+                            <span>Senha</span>
                           </button>
 
                           <button
-                            onClick={() => setUserToDelete(user)}
-                            className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 transition"
-                            title="Excluir funcionário"
+                            type="button"
+                            onClick={() => handleOpenEditUser(user)}
+                            className="px-2.5 py-1.5 bg-[#FAF7F2] hover:bg-[#EFE6DC] text-[#3D2314] font-semibold rounded-lg border border-[#E8DFD5] transition flex items-center gap-1 cursor-pointer"
+                            title="Editar dados e permissões"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <Edit3 className="w-3.5 h-3.5" />
+                            <span>Editar</span>
                           </button>
+
+                          {!isAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => handleToggleStatus(user)}
+                              className={`p-1.5 rounded-lg border transition cursor-pointer ${
+                                isBlocked
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
+                                  : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
+                              }`}
+                              title={isBlocked ? 'Desbloquear conta' : 'Bloquear acesso do funcionário'}
+                            >
+                              {isBlocked ? <Check className="w-3.5 h-3.5" /> : <Ban className="w-3.5 h-3.5" />}
+                            </button>
+                          )}
+
+                          {!isAdmin && isActorAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => setUserToDelete(user)}
+                              className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 transition cursor-pointer"
+                              title="Excluir funcionário"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </>
+                      ) : (
+                        <span className="text-[10px] text-[#8C5E47] font-semibold px-2 py-1 bg-[#FAF7F2] rounded-md border border-[#E8DFD5]">
+                          Protegido
+                        </span>
                       )}
                     </div>
                   </div>
@@ -545,15 +571,21 @@ export const StaffManager: React.FC = () => {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1">
-                    Nome Completo *
+                    Nome Completo ou Apelido
                   </label>
                   <input
                     type="text"
                     value={formName}
-                    onChange={(e) => setFormName(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setFormName(val);
+                      if (!editingUserId && (!formUsername || formUsername === formName.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
+                        setFormUsername(val.toLowerCase().trim().replace(/[^a-z0-9_.-]/g, ''));
+                      }
+                    }}
                     placeholder="Ex: Carlos Mendes"
                     className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs text-[#2C1810]"
-                    required
+                    autoFocus
                   />
                 </div>
 
@@ -564,50 +596,23 @@ export const StaffManager: React.FC = () => {
                   <input
                     type="text"
                     value={formUsername}
-                    onChange={(e) => setFormUsername(e.target.value)}
+                    onChange={(e) => setFormUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_.-]/g, ''))}
                     placeholder="Ex: carlos, maria, caixa"
-                    className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs text-[#2C1810]"
+                    className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs font-mono text-[#2C1810]"
                     required
                   />
                 </div>
 
                 <div>
                   <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1">
-                    E-mail Corporativo ou Pessoal *
-                  </label>
-                  <input
-                    type="email"
-                    value={formEmail}
-                    onChange={(e) => setFormEmail(e.target.value)}
-                    placeholder="carlos@amanditasabores.com.br"
-                    className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs text-[#2C1810]"
-                    required
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1">
-                    Telefone / WhatsApp
-                  </label>
-                  <input
-                    type="text"
-                    value={formPhone}
-                    onChange={(e) => setFormPhone(e.target.value)}
-                    placeholder="(83) 99999-0000"
-                    className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs text-[#2C1810]"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1">
-                    Função / Cargo
+                    Função / Cargo *
                   </label>
                   <select
                     value={formRole}
                     onChange={(e) => handleRoleChange(e.target.value as UserRole)}
                     className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs font-bold text-[#2C1810]"
                   >
-                    <option value="ADMINISTRADOR">Administrador Geral</option>
+                    {isActorAdmin && <option value="ADMINISTRADOR">Administrador Geral</option>}
                     <option value="GERENTE">Gerente / Supervisor</option>
                     <option value="CAIXA">Caixa / Atendente</option>
                     <option value="COZINHA">Produção / Cozinha (KDS)</option>
@@ -616,9 +621,12 @@ export const StaffManager: React.FC = () => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1">
-                    Senha de Acesso
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-bold text-[#3D2314] uppercase">
+                      Senha de Acesso
+                    </label>
+                    <span className="text-[10px] text-[#8C5E47]">Padrão: 123456</span>
+                  </div>
                   <input
                     type="text"
                     value={formPassword}
@@ -627,30 +635,33 @@ export const StaffManager: React.FC = () => {
                     className="w-full px-3 py-2 bg-white border border-[#E8DFD5] rounded-xl text-xs font-mono text-[#2C1810]"
                   />
                 </div>
+
               </div>
 
-              {/* Status */}
-              <div>
-                <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1.5">
-                  Status da Conta
-                </label>
-                <div className="flex gap-2 text-xs font-bold">
-                  {(['ATIVO', 'BLOQUEADO', 'DESATIVADO'] as const).map((st) => (
-                    <button
-                      key={st}
-                      type="button"
-                      onClick={() => setFormStatus(st)}
-                      className={`px-3 py-1.5 rounded-xl border transition ${
-                        formStatus === st
-                          ? 'bg-[#3D2314] text-white border-[#3D2314]'
-                          : 'bg-white text-slate-600 border-[#E8DFD5]'
-                      }`}
-                    >
-                      {st}
-                    </button>
-                  ))}
+              {/* Status (shown when editing or creating) */}
+              {editingUserId && (
+                <div className="pt-2 border-t border-[#E8DFD5]/60">
+                  <label className="block text-xs font-bold text-[#3D2314] uppercase mb-1.5">
+                    Status da Conta
+                  </label>
+                  <div className="flex gap-2 text-xs font-bold">
+                    {(['ATIVO', 'BLOQUEADO', 'DESATIVADO'] as const).map((st) => (
+                      <button
+                        key={st}
+                        type="button"
+                        onClick={() => setFormStatus(st)}
+                        className={`px-3 py-1.5 rounded-xl border transition cursor-pointer ${
+                          formStatus === st
+                            ? 'bg-[#3D2314] text-white border-[#3D2314]'
+                            : 'bg-white text-slate-600 border-[#E8DFD5] hover:bg-[#FAF7F2]'
+                        }`}
+                      >
+                        {st}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
 
               {/* Modules selection checkboxes */}
               <div className="space-y-2 pt-2 border-t border-[#E8DFD5]">

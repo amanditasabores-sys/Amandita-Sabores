@@ -15,19 +15,23 @@ import {
   ChevronDown, 
   ChevronUp, 
   LogIn, 
-  ExternalLink 
+  ExternalLink,
+  Flame 
 } from 'lucide-react';
 import { ConfirmModal } from './components/common/ConfirmModal';
+import { FirebaseStatusModal } from './components/admin/FirebaseStatusModal';
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(() => store.getCurrentUser());
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
   const [isViewBarCollapsed, setIsViewBarCollapsed] = useState(false);
 
   // Current view detection from URL query parameters
   const [currentView, setCurrentView] = useState<'admin' | 'cardapio' | 'entregador' | 'rastreio'>('admin');
   const [selectedOrderId, setSelectedOrderId] = useState<string>('ord-1002');
+  const [selectedTrackingCode, setSelectedTrackingCode] = useState<string>('');
 
   const updateViewFromUrl = () => {
     const search = window.location.search;
@@ -37,6 +41,7 @@ export default function App() {
 
     let viewParam = params.get('view');
     let orderParam = params.get('pedido');
+    let tkParam = params.get('tk') || params.get('token');
 
     // Check hash fallback (e.g. #/cardapio, #cardapio, #view=cardapio)
     if (!viewParam && hash) {
@@ -49,6 +54,7 @@ export default function App() {
       if (hashParts[1]) {
         const hashParams = new URLSearchParams(hashParts[1]);
         if (hashParams.get('pedido')) orderParam = hashParams.get('pedido');
+        if (hashParams.get('tk')) tkParam = hashParams.get('tk');
       }
     }
 
@@ -64,6 +70,9 @@ export default function App() {
     }
     if (orderParam) {
       setSelectedOrderId(orderParam);
+    }
+    if (tkParam) {
+      setSelectedTrackingCode(tkParam);
     }
   };
 
@@ -93,10 +102,17 @@ export default function App() {
     };
   }, []);
 
-  const navigateTo = (view: 'admin' | 'cardapio' | 'entregador' | 'rastreio', orderId?: string) => {
+  const navigateTo = (
+    view: 'admin' | 'cardapio' | 'entregador' | 'rastreio', 
+    orderId?: string,
+    trackingCode?: string
+  ) => {
     setCurrentView(view);
     if (orderId) {
       setSelectedOrderId(orderId);
+    }
+    if (trackingCode !== undefined) {
+      setSelectedTrackingCode(trackingCode);
     }
 
     const url = new URL(window.location.href);
@@ -105,6 +121,12 @@ export default function App() {
       url.searchParams.set('pedido', orderId);
     } else if (view !== 'rastreio') {
       url.searchParams.delete('pedido');
+    }
+
+    if (trackingCode) {
+      url.searchParams.set('tk', trackingCode);
+    } else if (view !== 'rastreio') {
+      url.searchParams.delete('tk');
     }
     window.history.pushState({}, '', url.toString());
   };
@@ -179,7 +201,11 @@ export default function App() {
 
             {/* 4. Tracking */}
             <button
-              onClick={() => navigateTo('rastreio', selectedOrderId || 'ord-1002')}
+              onClick={() => {
+                const targetId = selectedOrderId || 'ord-1002';
+                const targetOrder = store.getOrderById(targetId);
+                navigateTo('rastreio', targetId, targetOrder?.trackingCode || selectedTrackingCode);
+              }}
               className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
                 currentView === 'rastreio'
                   ? 'bg-purple-600 text-white shadow-xs'
@@ -188,6 +214,16 @@ export default function App() {
             >
               <MapPin className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Rastreio Pedido</span>
+            </button>
+
+            {/* Firebase Cloud Status & Migration */}
+            <button
+              onClick={() => setIsFirebaseModalOpen(true)}
+              title="Status do Cloud Firestore & Migração de Dados"
+              className="px-2 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer bg-amber-500/20 text-[#FFCA28] hover:bg-amber-500/30 border border-[#FFCA28]/40"
+            >
+              <Flame className="w-3.5 h-3.5 text-[#FFCA28]" />
+              <span className="hidden sm:inline">Firebase</span>
             </button>
 
             {/* Reset data */}
@@ -249,7 +285,7 @@ export default function App() {
       {/* VIEW 2: CUSTOMER DIGITAL MENU (WHATSAPP ACCESS) */}
       {currentView === 'cardapio' && (
         <CustomerMenu
-          onNavigateToTracking={(orderId) => navigateTo('rastreio', orderId)}
+          onNavigateToTracking={(orderId, trackingCode) => navigateTo('rastreio', orderId, trackingCode)}
           onNavigateToAdmin={() => navigateTo('admin')}
         />
       )}
@@ -266,9 +302,16 @@ export default function App() {
       {currentView === 'rastreio' && (
         <OrderTrackingView
           orderId={selectedOrderId}
+          trackingCode={selectedTrackingCode}
           onNavigateToMenu={() => navigateTo('cardapio')}
         />
       )}
+
+      {/* FIREBASE STATUS & MIGRATION MODAL */}
+      <FirebaseStatusModal
+        isOpen={isFirebaseModalOpen}
+        onClose={() => setIsFirebaseModalOpen(false)}
+      />
 
       {/* AUTH MODAL */}
       <AuthModal

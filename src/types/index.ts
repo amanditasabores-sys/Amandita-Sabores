@@ -48,7 +48,10 @@ export interface User {
   allowedModules?: AppModule[];
   phone?: string;
   createdAt: string;
+  updatedAt?: string;
   lastLoginAt?: string;
+  authProvider?: 'firebase_email' | 'firebase_google' | 'local_contingency';
+  firebaseUid?: string;
 }
 
 export interface UserAccessLog {
@@ -56,7 +59,7 @@ export interface UserAccessLog {
   userId?: string;
   username: string;
   timestamp: string;
-  action: 'LOGIN_SUCESSO' | 'LOGIN_FALHA' | 'LOGOUT' | 'SENHA_ALTERADA' | 'CONTA_BLOQUEADA';
+  action: 'LOGIN_SUCESSO' | 'LOGIN_FALHA' | 'LOGOUT' | 'SENHA_ALTERADA' | 'CONTA_BLOQUEADA' | 'LOGIN_CONTINGENCIA_LOCAL' | 'VINCULO_FIREBASE';
   details?: string;
   role?: string;
 }
@@ -153,6 +156,36 @@ export interface Order {
   cancellationReason?: string;
   cancelledBy?: string;
   movements: OrderMovementLog[];
+  trackingCode?: string; // Código de alta entropia para rastreamento seguro público
+}
+
+export interface PublicOrderTracking {
+  id: string;
+  orderNumber: string;
+  createdAt: string;
+  estimatedDeliveryMinutes: number;
+  fulfillmentType: FulfillmentType;
+  status: OrderStatus;
+  items: {
+    id: string;
+    name: string;
+    quantity: number;
+    subtotal: number;
+    addons?: MenuItemAddon[];
+    notes?: string;
+  }[];
+  subtotal: number;
+  deliveryFee: number;
+  discount: number;
+  totalAmount: number;
+  paymentMethod: PaymentMethod;
+  paymentStatus: 'PENDENTE' | 'PAGO';
+  deliveryPerson?: {
+    name: string;
+  };
+  trackingCode: string;
+  // Note: PII sanitization: Customer phone, full address CPF and notes are stripped from public view
+  destinationSummary?: string; // e.g. "Bela Vista, Campina Grande" (bairro/cidade apenas)
 }
 
 export interface RestaurantConfig {

@@ -1,0 +1,147 @@
+{
+  "entities": {
+    "Order": {
+      "title": "Order",
+      "description": "Pedido de venda, comanda ou delivery da Amandita Sabores",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "orderNumber": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "estimatedDeliveryMinutes": { "type": "number" },
+        "fulfillmentType": { "type": "string", "enum": ["DELIVERY", "RETIRADA"] },
+        "customer": { "type": "object" },
+        "items": { "type": "array" },
+        "subtotal": { "type": "number" },
+        "deliveryFee": { "type": "number" },
+        "discount": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["PIX", "CARTAO_CREDITO", "CARTAO_DEBITO", "DINHEIRO"] },
+        "paymentStatus": { "type": "string", "enum": ["PENDENTE", "PAGO"] },
+        "status": { "type": "string", "enum": ["NOVO", "EM_PREPARO", "PRONTO", "EM_ROTA", "ENTREGUE", "CANCELADO"] },
+        "movements": { "type": "array" }
+      },
+      "required": ["id", "orderNumber", "createdAt", "updatedAt", "fulfillmentType", "totalAmount", "paymentMethod", "paymentStatus", "status"]
+    },
+    "MenuItem": {
+      "title": "MenuItem",
+      "description": "Item do cardápio Amandita Sabores",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "category": { "type": "string", "maxLength": 100 },
+        "price": { "type": "number" },
+        "costPrice": { "type": "number" },
+        "prepTimeMinutes": { "type": "number" },
+        "imageUrl": { "type": "string", "maxLength": 1000 },
+        "available": { "type": "boolean" },
+        "featured": { "type": "boolean" },
+        "tags": { "type": "array" },
+        "addons": { "type": "array" }
+      },
+      "required": ["id", "name", "category", "price", "prepTimeMinutes", "available"]
+    },
+    "RestaurantConfig": {
+      "title": "RestaurantConfig",
+      "description": "Configurações gerais do estabelecimento, taxas e chaves PIX",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 150 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "whatsapp": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 255 },
+        "city": { "type": "string", "maxLength": 100 },
+        "pixKey": { "type": "string", "maxLength": 128 },
+        "pixKeyType": { "type": "string" },
+        "pixReceiverName": { "type": "string", "maxLength": 100 },
+        "pixReceiverCity": { "type": "string", "maxLength": 50 },
+        "deliveryFeeBase": { "type": "number" },
+        "avgPrepTimeMinutes": { "type": "number" },
+        "avgDeliveryTimeMinutes": { "type": "number" },
+        "isOpen": { "type": "boolean" }
+      },
+      "required": ["name", "pixKey", "isOpen"]
+    },
+    "CashShift": {
+      "title": "CashShift",
+      "description": "Turno de caixa e movimentações financeiras da frente de vendas",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "openedAt": { "type": "string", "format": "date-time" },
+        "closedAt": { "type": "string" },
+        "status": { "type": "string", "enum": ["ABERTO", "FECHADO"] },
+        "openedBy": { "type": "string", "maxLength": 100 },
+        "closedBy": { "type": "string", "maxLength": 100 },
+        "initialBalance": { "type": "number" },
+        "movements": { "type": "array" },
+        "finalCalculatedBalance": { "type": "number" },
+        "finalCountedCash": { "type": "number" },
+        "difference": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 1000 }
+      },
+      "required": ["id", "openedAt", "status", "openedBy", "initialBalance", "movements"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil e permissões operacionais de funcionários e administradores",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 64 },
+        "email": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "role": { "type": "string", "enum": ["ADMINISTRADOR", "GERENTE", "CAIXA", "COZINHA", "ENTREGADOR"] },
+        "status": { "type": "string", "enum": ["ATIVO", "BLOQUEADO", "DESATIVADO"] },
+        "allowedModules": { "type": "array" },
+        "createdAt": { "type": "string" },
+        "lastLoginAt": { "type": "string" }
+      },
+      "required": ["id", "username", "email", "role"]
+    },
+    "AccessLog": {
+      "title": "AccessLog",
+      "description": "Registro de auditoria e segurança de acessos",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string" },
+        "username": { "type": "string", "maxLength": 64 },
+        "timestamp": { "type": "string" },
+        "action": { "type": "string" },
+        "details": { "type": "string", "maxLength": 500 },
+        "role": { "type": "string" }
+      },
+      "required": ["id", "username", "timestamp", "action"]
+    }
+  },
+  "firestore": {
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Coleção de pedidos do restaurante, comandas de balcão e delivery público"
+    },
+    "/menu_items/{itemId}": {
+      "schema": "MenuItem",
+      "description": "Cardápio público oficial com preços, disponibilidade e adicionais"
+    },
+    "/configs/{configId}": {
+      "schema": "RestaurantConfig",
+      "description": "Configurações institucionais, chave PIX e parâmetros de entrega"
+    },
+    "/cash_shifts/{shiftId}": {
+      "schema": "CashShift",
+      "description": "Turnos de caixa abertos e históricos de fechamento"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Cadastro de funcionários e módulos permitidos"
+    },
+    "/access_logs/{logId}": {
+      "schema": "AccessLog",
+      "description": "Trilha de auditoria e segurança de acessos"
+    }
+  }
+}

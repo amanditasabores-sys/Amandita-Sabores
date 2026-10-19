@@ -7,10 +7,16 @@ class SoundService {
   private isSoundEnabled: boolean = true;
 
   constructor() {
-    // Check localStorage preference
-    const saved = localStorage.getItem('gestaofood_sound_enabled');
-    if (saved !== null) {
-      this.isSoundEnabled = saved === 'true';
+    // Check localStorage preference safely
+    if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('gestaofood_sound_enabled');
+        if (saved !== null) {
+          this.isSoundEnabled = saved === 'true';
+        }
+      } catch {
+        // fallback
+      }
     }
   }
 
@@ -104,7 +110,7 @@ class SoundService {
     }
   }
 
-  private persistentInterval: number | null = null;
+  private persistentInterval: ReturnType<typeof setInterval> | null = null;
   private isAlertLooping: boolean = false;
 
   /**
@@ -120,11 +126,11 @@ class SoundService {
 
     // Clear any existing timer
     if (this.persistentInterval) {
-      window.clearInterval(this.persistentInterval);
+      clearInterval(this.persistentInterval);
     }
 
     // Set recurring timer
-    this.persistentInterval = window.setInterval(() => {
+    this.persistentInterval = setInterval(() => {
       if (this.isAlertLooping && this.isSoundEnabled) {
         this.playNewOrderAlert();
       }
@@ -137,7 +143,7 @@ class SoundService {
   public stopPersistentOrderAlert() {
     this.isAlertLooping = false;
     if (this.persistentInterval) {
-      window.clearInterval(this.persistentInterval);
+      clearInterval(this.persistentInterval);
       this.persistentInterval = null;
     }
   }

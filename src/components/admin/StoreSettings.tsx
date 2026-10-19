@@ -18,11 +18,15 @@ import {
   Clock, 
   DollarSign, 
   Sparkles,
-  AlertCircle
+  AlertCircle,
+  Flame,
+  Database
 } from 'lucide-react';
+import { FirebaseStatusModal } from './FirebaseStatusModal';
 
 export const StoreSettings: React.FC = () => {
   const [config, setConfig] = useState<RestaurantConfig>(() => store.getRestaurantConfig());
+  const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
   const [isSaved, setIsSaved] = useState(false);
 
   // PIX Test Simulation
@@ -98,12 +102,34 @@ export const StoreSettings: React.FC = () => {
         </button>
       </div>
 
-      {isSaved && (
-        <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-2xl text-xs font-semibold flex items-center gap-2 animate-in fade-in">
-          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-          <span>Configurações salvas com sucesso! A chave PIX e os dados da loja já estão ativos no cardápio e nas vendas.</span>
+      {/* FIREBASE CLOUD INTEGRATION CARD */}
+      <div className="bg-gradient-to-r from-[#1F100B] via-[#331C13] to-[#4A2E1F] text-white rounded-2xl p-5 border border-[#6B4B3E]/40 shadow-xs flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-3.5">
+          <div className="w-10 h-10 rounded-xl bg-[#FFCA28]/20 text-[#FFCA28] border border-[#FFCA28]/30 flex items-center justify-center font-bold">
+            <Flame className="w-6 h-6" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-black text-white">Banco de Dados em Nuvem: Cloud Firestore</h3>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-amber-500/20 text-[#FFCA28] border border-[#FFCA28]/30">
+                amandita-sabores
+              </span>
+            </div>
+            <p className="text-xs text-[#D9C7B8] mt-0.5">
+              Sincronização em tempo real entre PDV balcão, cozinha KDS, cardápio do cliente e entregadores.
+            </p>
+          </div>
         </div>
-      )}
+
+        <button
+          type="button"
+          onClick={() => setIsFirebaseModalOpen(true)}
+          className="px-4 py-2 bg-gradient-to-r from-[#C86D3B] to-[#721C24] hover:opacity-90 text-white font-bold rounded-xl text-xs flex items-center gap-2 shadow-xs transition cursor-pointer"
+        >
+          <Database className="w-4 h-4 text-[#FFCA28]" />
+          <span>Gerenciar Conexão & Migração</span>
+        </button>
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* SECTION 1: DADOS DO PIX (2 colunas) */}
@@ -359,6 +385,11 @@ export const StoreSettings: React.FC = () => {
           </div>
         </div>
       </div>
+
+      <FirebaseStatusModal
+        isOpen={isFirebaseModalOpen}
+        onClose={() => setIsFirebaseModalOpen(false)}
+      />
     </form>
   );
 };

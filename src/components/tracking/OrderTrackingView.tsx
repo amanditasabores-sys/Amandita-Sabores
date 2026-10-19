@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
-import { Order, OrderStatus } from '../../types';
+import { PublicOrderTracking, OrderStatus } from '../../types';
 import { formatCurrency, formatTime, getStatusDetails, getPaymentMethodLabel } from '../../utils/formatters';
+import { getPublicAppUrl } from '../../utils/url';
 import { 
   CheckCircle, 
   Clock, 
   MapPin, 
-  Phone, 
   ChefHat, 
   Bike, 
   PackageCheck, 
@@ -14,42 +14,101 @@ import {
   Copy, 
   Check, 
   ArrowLeft,
-  AlertTriangle
+  AlertTriangle,
+  Lock,
+  ShieldCheck
 } from 'lucide-react';
 
 interface OrderTrackingViewProps {
   orderId: string;
+  trackingCode?: string;
   onNavigateToMenu?: () => void;
 }
 
-export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, onNavigateToMenu }) => {
-  const [order, setOrder] = useState<Order | null>(null);
+export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ 
+  orderId, 
+  trackingCode, 
+  onNavigateToMenu 
+}) => {
+  const [order, setOrder] = useState<PublicOrderTracking | null>(null);
+  const [unauthorized, setUnauthorized] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const config = store.getRestaurantConfig();
 
-  const loadOrder = () => {
-    const found = store.getOrderById(orderId);
-    if (found) {
-      setOrder({ ...found });
-    }
-  };
-
   useEffect(() => {
-    loadOrder();
+    // Listen in real-time ONLY to this specific individual order document
+    const unsubscribe = store.subscribeToPublicOrderTracking(orderId, trackingCode, (tracking) => {
+      if (tracking) {
+        setOrder(tracking);
+        setUnauthorized(false);
+      } else {
+        const raw = store.getOrderById(orderId);
+        if (raw) {
+          setUnauthorized(true);
+        } else {
+          setUnauthorized(false);
+        }
+        setOrder(null);
+      }
+    });
 
     const handleUpdate = () => {
-      loadOrder();
+      const tracking = store.getPublicOrderTracking(orderId, trackingCode);
+      if (tracking) {
+        setOrder(tracking);
+        setUnauthorized(false);
+      }
     };
 
     window.addEventListener('gestaofood_state_changed', handleUpdate);
-    const interval = setInterval(loadOrder, 3000); // Polling backup
 
     return () => {
+      unsubscribe();
       window.removeEventListener('gestaofood_state_changed', handleUpdate);
-      clearInterval(interval);
     };
-  }, [orderId]);
+  }, [orderId, trackingCode]);
 
+  // Unauthorized Access Screen (Protects against ID guessing / PII snooping)
+  if (unauthorized) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-3xl shadow-sm border border-slate-200 max-w-md w-full text-center space-y-4">
+          <div className="w-14 h-14 rounded-2xl bg-amber-500/10 text-amber-700 flex items-center justify-center mx-auto border border-amber-500/20">
+            <Lock className="w-7 h-7" />
+          </div>
+          <h2 className="text-xl font-black text-slate-800">Acesso Restrito ao Pedido</h2>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Por proteção à privacidade e segurança de dados, o acompanhamento em tempo real exige o código oficial gerado no seu pedido ou autenticação de colaborador autorizado.
+          </p>
+          <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-[11px] text-slate-500 flex items-center gap-2 justify-center">
+            <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>Dados pessoais e telefones são protegidos.</span>
+          </div>
+          <div className="pt-2 flex flex-col gap-2">
+            {onNavigateToMenu && (
+              <button
+                onClick={onNavigateToMenu}
+                className="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold rounded-xl text-xs transition cursor-pointer"
+              >
+                Voltar ao Cardápio
+              </button>
+            )}
+            <a
+              href={`https://wa.me/${config.whatsapp}?text=${encodeURIComponent(`Olá! Gostaria de consultar o status do meu pedido.`)}`}
+              target="_blank"
+              rel="noreferrer"
+              className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5"
+            >
+              <MessageCircle className="w-3.5 h-3.5" />
+              <span>Falar com a Loja no WhatsApp</span>
+            </a>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Not Found Screen
   if (!order) {
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
@@ -57,12 +116,12 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
           <AlertTriangle className="w-12 h-12 text-amber-500 mx-auto mb-3" />
           <h2 className="text-xl font-bold text-slate-800">Pedido Não Encontrado</h2>
           <p className="text-sm text-slate-500 mt-2 mb-6">
-            Não localizamos o pedido com o identificador <span className="font-mono font-bold text-slate-700">{orderId}</span>.
+            Não localizamos o pedido com o identificador informado.
           </p>
           {onNavigateToMenu && (
             <button
               onClick={onNavigateToMenu}
-              className="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-semibold rounded-xl text-sm transition"
+              className="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-semibold rounded-xl text-sm transition cursor-pointer"
             >
               Ir para o Cardápio
             </button>
@@ -102,7 +161,7 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
       key: 'EM_ROTA',
       label: 'Saiu para Entrega',
       icon: <Bike className="w-4 h-4" />,
-      desc: order.deliveryPerson ? `Com ${order.deliveryPerson.name} a caminho do seu endereço` : 'A caminho do seu endereço',
+      desc: order.deliveryPerson ? `Com ${order.deliveryPerson.name} a caminho do seu destino` : 'A caminho do seu destino',
     },
     {
       key: 'ENTREGUE',
@@ -131,14 +190,14 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
   };
 
   const copyTrackingLink = () => {
-    const url = window.location.href;
+    const url = getPublicAppUrl('rastreio', order.id, order.trackingCode);
     navigator.clipboard.writeText(url);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
   };
 
   const openWhatsAppHelp = () => {
-    const text = encodeURIComponent(`Olá! Gostaria de informações sobre meu pedido ${order.orderNumber} em nome de ${order.customer.name}.`);
+    const text = encodeURIComponent(`Olá! Gostaria de informações sobre meu pedido ${order.orderNumber}.`);
     window.open(`https://wa.me/${config.whatsapp}?text=${text}`, '_blank');
   };
 
@@ -151,7 +210,7 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
             {onNavigateToMenu && (
               <button
                 onClick={onNavigateToMenu}
-                className="p-1.5 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 transition"
+                className="p-1.5 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
                 title="Voltar ao Cardápio"
               >
                 <ArrowLeft className="w-5 h-5" />
@@ -164,7 +223,7 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
           </div>
           <button
             onClick={copyTrackingLink}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded-lg transition"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded-lg transition cursor-pointer"
           >
             {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
             <span>{copiedLink ? 'Link Copiado!' : 'Copiar Link'}</span>
@@ -254,7 +313,7 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
           </div>
         </div>
 
-        {/* Motoboy / Entregador Info if dispatched */}
+        {/* Motoboy / Entregador Info if dispatched (PII protected) */}
         {order.deliveryPerson && (
           <div className="bg-white rounded-2xl p-5 shadow-sm border border-indigo-100 bg-gradient-to-r from-indigo-50/40 to-white">
             <div className="flex items-center justify-between">
@@ -265,16 +324,17 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
                 <div>
                   <span className="text-[11px] font-semibold text-indigo-700 uppercase tracking-wider">Entregador Responsável</span>
                   <p className="text-base font-bold text-slate-900">{order.deliveryPerson.name}</p>
-                  <p className="text-xs text-slate-500">{order.deliveryPerson.phone}</p>
+                  <p className="text-xs text-slate-500">A caminho com o seu pedido</p>
                 </div>
               </div>
-              <a
-                href={`tel:${order.deliveryPerson.phone.replace(/\D/g, '')}`}
-                className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+              <button
+                type="button"
+                onClick={openWhatsAppHelp}
+                className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
               >
-                <Phone className="w-3.5 h-3.5" />
-                <span>Ligar</span>
-              </a>
+                <MessageCircle className="w-3.5 h-3.5" />
+                <span>Mensagem</span>
+              </button>
             </div>
           </div>
         )}
@@ -334,7 +394,7 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
           </div>
         </div>
 
-        {/* Delivery Address Card */}
+        {/* Delivery Destination Card (PII Protected) */}
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5">
           <div className="flex items-start gap-3">
             <div className="w-8 h-8 rounded-lg bg-slate-100 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">
@@ -342,27 +402,20 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({ orderId, o
             </div>
             <div className="flex-1">
               <h4 className="font-bold text-slate-900 text-xs uppercase tracking-wider mb-1">
-                {order.fulfillmentType === 'RETIRADA' ? 'Local de Retirada' : 'Local da Entrega'}
+                {order.fulfillmentType === 'RETIRADA' ? 'Local de Retirada' : 'Destino da Entrega'}
               </h4>
-              {order.fulfillmentType === 'RETIRADA' || !order.customer.address ? (
+              {order.fulfillmentType === 'RETIRADA' ? (
                 <p className="text-sm font-semibold text-emerald-800">
                   Retirada no Balcão do Estabelecimento ({config.address} - {config.city})
                 </p>
               ) : (
                 <>
                   <p className="text-sm font-semibold text-slate-800">
-                    {order.customer.address.street}, {order.customer.address.number}
+                    {order.destinationSummary || 'Entrega em Domicílio'}
                   </p>
-                  <p className="text-xs text-slate-500">
-                    {order.customer.address.neighborhood}
-                    {order.customer.address.complement && ` · ${order.customer.address.complement}`}
-                    {` · ${order.customer.address.city}`}
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Endereço completo protegido por privacidade.
                   </p>
-                  {order.customer.address.reference && (
-                    <p className="text-xs text-amber-800 mt-1">
-                      Ponto de Ref.: {order.customer.address.reference}
-                    </p>
-                  )}
                 </>
               )}
             </div>

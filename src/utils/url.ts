@@ -38,11 +38,19 @@ export function getActiveBaseUrl(): string {
  * Builds a robust URL using both search parameter and hash fallback
  * so that any browser or webview correctly routes to the view without 404 or 403.
  */
-export function buildAppUrl(view: 'cardapio' | 'entregador' | 'rastreio' | 'admin', orderId?: string, overrideBase?: string): string {
+export function buildAppUrl(
+  view: 'cardapio' | 'entregador' | 'rastreio' | 'admin', 
+  orderId?: string, 
+  trackingCode?: string,
+  overrideBase?: string
+): string {
   const base = overrideBase ? overrideBase.replace(/\/$/, '') : getPublicBaseUrl();
   let url = `${base}/?view=${view}`;
   if (orderId) {
     url += `&pedido=${encodeURIComponent(orderId)}`;
+  }
+  if (trackingCode) {
+    url += `&tk=${encodeURIComponent(trackingCode)}`;
   }
   return url;
 }
@@ -50,13 +58,21 @@ export function buildAppUrl(view: 'cardapio' | 'entregador' | 'rastreio' | 'admi
 /**
  * Public URL generator for WhatsApp, QR Code, and share buttons.
  */
-export function getPublicAppUrl(view: 'cardapio' | 'entregador' | 'rastreio' | 'admin', orderId?: string): string {
-  return buildAppUrl(view, orderId, getPublicBaseUrl());
+export function getPublicAppUrl(
+  view: 'cardapio' | 'entregador' | 'rastreio' | 'admin', 
+  orderId?: string,
+  trackingCode?: string
+): string {
+  return buildAppUrl(view, orderId, trackingCode, getPublicBaseUrl());
 }
 
 /**
  * Local App URL generator.
  */
-export function getLocalAppUrl(view: 'cardapio' | 'entregador' | 'rastreio' | 'admin', orderId?: string): string {
-  return buildAppUrl(view, orderId, getActiveBaseUrl());
+export function getLocalAppUrl(
+  view: 'cardapio' | 'entregador' | 'rastreio' | 'admin', 
+  orderId?: string,
+  trackingCode?: string
+): string {
+  return buildAppUrl(view, orderId, trackingCode, getActiveBaseUrl());
 }

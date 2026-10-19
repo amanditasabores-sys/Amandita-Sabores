@@ -32,7 +32,7 @@ import {
 import { AmanditaLogo } from '../common/AmanditaLogo';
 
 interface CustomerMenuProps {
-  onNavigateToTracking?: (orderId: string) => void;
+  onNavigateToTracking?: (orderId: string, trackingCode?: string) => void;
   onNavigateToAdmin?: () => void;
 }
 
@@ -245,7 +245,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({ onNavigateToTracking
       }
     }
 
-    const trackingUrl = getPublicAppUrl('rastreio', order.id);
+    const trackingUrl = getPublicAppUrl('rastreio', order.id, order.trackingCode);
 
     // Generate WhatsApp text
     const itemsList = order.items
@@ -1101,9 +1101,10 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({ onNavigateToTracking
               <button
                 onClick={() => {
                   if (onNavigateToTracking) {
-                    onNavigateToTracking(createdOrderId);
+                    onNavigateToTracking(createdOrderId, createdOrder?.trackingCode);
                   } else {
-                    window.location.search = `?view=rastreio&pedido=${createdOrderId}`;
+                    const tkParam = createdOrder?.trackingCode ? `&tk=${encodeURIComponent(createdOrder.trackingCode)}` : '';
+                    window.location.search = `?view=rastreio&pedido=${createdOrderId}${tkParam}`;
                   }
                 }}
                 className="w-full py-3.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition cursor-pointer"
