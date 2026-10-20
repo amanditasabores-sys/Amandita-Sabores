@@ -23,6 +23,7 @@ import {
   testFirestoreConnection, 
   signInWithGoogle, 
   signInWithEmail,
+  createUserWithEmail,
   signOutFirebase,
   handleFirestoreError,
   formatFirebaseAuthError,
@@ -380,63 +381,70 @@ class StoreService {
   }
 
   /**
-   * Internal Staff Firestore listeners: Orders collection and Cash register shifts.
+  /**
+   * Internal Staff Firestore listeners: Orders collection, Cash register shifts, and Staff users.
    * STRICT SECURITY:
-   * 1. Rejects if in public customer portal (cardápio / rastreio público).
-   * 2. Rejects if user is not authenticated in Firebase Auth.
-   * 3. Confirms that the authenticated user possesses an authorized staff role.
+   * 1. Rejects if user is not authenticated in Firebase Auth.
+   * 2. Confirms that the authenticated user possesses an authorized staff role.
    * Never leaks internal operational order lists to unauthenticated visitors.
    */
   public async initStaffFirestoreSync(firebaseUser?: unknown): Promise<void> {
     if (!db || this.isStaffSyncActive) return;
 
-    // 1. Guard against public customer context (cardápio público ou rastreio)
-    if (this.isPublicCustomerContext()) {
-      console.info('[Firestore Security] Contexto público do cardápio/rastreio: sincronização de pedidos internos desativada.');
-      return;
-    }
-
-    // 2. Reject if no valid Firebase Auth session
+    // 1. Reject if no valid Firebase Auth session
     if (!auth?.currentUser) {
-      console.info('[Firestore Security] Listagem de pedidos restrita aos colaboradores autenticados no Firebase Auth.');
+      console.info('[Firestore Security] Listagem de pedidos e turnos restrita aos colaboradores autenticados no Firebase Auth.');
       return;
     }
 
-    // 3. Confirm that the authenticated user possesses an authorized staff role
+    // 2. Confirm that the authenticated user possesses an authorized staff role
     const confirmedRole = await this.verifyStaffRole(auth.currentUser);
     if (!confirmedRole) {
-      console.warn('[Firestore Security] Usuário autenticado no Firebase não possui confirmação de papel de colaborador autorizado para listar pedidos.');
+      console.warn('[Firestore Security] Usuário autenticado no Firebase não possui confirmação de papel de colaborador autorizado para sincronizar dados internos.');
       return;
     }
 
     try {
       this.isStaffSyncActive = true;
 
+      // Ensure catalog and store config exist in Firestore
+      this.ensureInitialDataSeededToFirestore().catch(() => {});
+
       // 1. Synchronize All Orders in Real Time (Staff only: Kitchen KDS, POS Balcão, Entregadores, Admin)
       const unsubOrders = onSnapshot(
         collection(db, 'orders'),
         (snapshot) => {
-          if (!snapshot.empty) {
-            const remoteOrders: Order[] = [];
-            snapshot.forEach((docSnap) => {
-              const data = docSnap.data() as Order;
-              remoteOrders.push(data);
-            });
+          const remoteOrders: Order[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as Order;
+            remoteOrders.push(data);
+          });
 
-            remoteOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          remoteOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-            const localOrders = this.getOrders();
-            const localIds = new Set(localOrders.map((o) => o.id));
-            const newIncoming = remoteOrders.filter((ro) => !localIds.has(ro.id) && ro.status === 'NOVO');
-            
-            if (newIncoming.length > 0) {
-              newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
-              soundService.startPersistentOrderAlert(3500);
-            }
-
-            localStorage.setItem('gf_orders', JSON.stringify(remoteOrders));
-            this.notify('FIRESTORE_ORDERS_SYNCED', { count: remoteOrders.length });
+          const localOrders = this.getOrders();
+          const localIds = new Set(localOrders.map((o) => o.id));
+          const newIncoming = remoteOrders.filter((ro) => !localIds.has(ro.id) && ro.status === 'NOVO');
+          
+          if (newIncoming.length > 0) {
+            newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
+            soundService.startPersistentOrderAlert(3500);
           }
+
+          if (remoteOrders.length > 0) {
+            const remoteSet = new Set(remoteOrders.map((o) => o.id));
+            const unsavedLocals = localOrders.filter((lo) => !remoteSet.has(lo.id));
+            const combined = [...remoteOrders, ...unsavedLocals];
+            combined.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            localStorage.setItem('gf_orders', JSON.stringify(combined));
+          } else if (localOrders.length > 0 && db) {
+            // Firestore orders was empty: seed existing local orders to Firestore
+            for (const lo of localOrders) {
+              setDoc(doc(db, 'orders', lo.id), this.cleanForFirestore(lo)).catch(() => {});
+            }
+          }
+
+          this.notify('FIRESTORE_ORDERS_SYNCED', { count: remoteOrders.length });
         },
         (error) => {
           console.warn('[Firestore Staff Sync] Aviso no listener de pedidos:', error.message);
@@ -447,19 +455,32 @@ class StoreService {
       );
       this.staffUnsubscribers.push(unsubOrders);
 
-      // 2. Synchronize Cash Register Shifts (Staff only)
+      // 2. Synchronize Cash Register Shifts in Real Time (Staff only)
       const unsubShifts = onSnapshot(
         collection(db, 'cash_shifts'),
         (snapshot) => {
-          if (!snapshot.empty) {
-            snapshot.forEach((docSnap) => {
-              const shift = docSnap.data() as CashRegisterShift;
-              if (shift.status === 'ABERTO') {
-                localStorage.setItem('gf_current_cash_shift', JSON.stringify(shift));
-              }
-            });
-            this.notify('CASH_SHIFT_UPDATED');
+          const shifts: CashRegisterShift[] = [];
+          snapshot.forEach((docSnap) => {
+            shifts.push(docSnap.data() as CashRegisterShift);
+          });
+
+          // Detect active open shift
+          const openShift = shifts.find((s) => s.status === 'ABERTO') || null;
+          if (openShift) {
+            localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
+          } else {
+            localStorage.removeItem('gf_current_cash_shift');
           }
+
+          // Detect closed shift history
+          const closedShifts = shifts
+            .filter((s) => s.status === 'FECHADO')
+            .sort((a, b) => new Date(b.closedAt || b.openedAt).getTime() - new Date(a.closedAt || a.openedAt).getTime());
+          if (closedShifts.length > 0) {
+            localStorage.setItem('gf_cash_shifts_history', JSON.stringify(closedShifts));
+          }
+
+          this.notify('CASH_SHIFT_UPDATED', openShift);
         },
         (error) => {
           console.warn('[Firestore Staff Sync] Cash shift notice:', error.message);
@@ -470,8 +491,67 @@ class StoreService {
       );
       this.staffUnsubscribers.push(unsubShifts);
 
+      // 3. Synchronize Staff Users in Real Time (Staff only)
+      const unsubUsers = onSnapshot(
+        collection(db, 'users'),
+        (snapshot) => {
+          if (!snapshot.empty) {
+            const remoteUsers: User[] = [];
+            snapshot.forEach((docSnap) => {
+              remoteUsers.push(docSnap.data() as User);
+            });
+
+            const localUsers = this.getUsers();
+            const merged = [...remoteUsers];
+            for (const lu of localUsers) {
+              if (!merged.some((ru) => ru.id === lu.id || ru.username.toLowerCase() === lu.username.toLowerCase())) {
+                merged.push(lu);
+              }
+            }
+
+            localStorage.setItem('gf_users', JSON.stringify(merged));
+            this.notify('USERS_UPDATED', { count: merged.length });
+          }
+        },
+        (error) => {
+          console.warn('[Firestore Staff Sync] Users listener notice:', error.message);
+          if (error.code === 'permission-denied') {
+            this.stopStaffFirestoreSync();
+          }
+        }
+      );
+      this.staffUnsubscribers.push(unsubUsers);
+
     } catch (err) {
       console.warn('[Firestore Staff Sync Setup Error]:', err);
+    }
+  }
+
+  /**
+   * Seeds initial menu items and restaurant config to Cloud Firestore
+   * if the collections are currently empty on the cloud database.
+   */
+  public async ensureInitialDataSeededToFirestore(): Promise<void> {
+    if (!db || !this.isFirebaseAuthStaff()) return;
+
+    try {
+      const menuSnap = await getDocs(collection(db, 'menu_items'));
+      if (menuSnap.empty) {
+        console.info('[Firestore] Populando cardápio inicial no Cloud Firestore (amandita-sabores)...');
+        const items = this.getMenuItems();
+        for (const item of items) {
+          await setDoc(doc(db, 'menu_items', item.id), item);
+        }
+      }
+
+      const configRef = doc(db, 'configs', 'restaurant');
+      const configSnap = await getDoc(configRef);
+      if (!configSnap.exists()) {
+        const config = this.getRestaurantConfig();
+        await setDoc(configRef, config);
+      }
+    } catch (err) {
+      console.warn('[Firestore Initial Seeding Notice]:', err);
     }
   }
 
@@ -955,28 +1035,24 @@ class StoreService {
     }
 
     try {
-      // If we have an effective high-entropy tracking code, listen ONLY to the sanitized public tracking document
-      if (effectiveTrackingCode) {
-        const unsub = onSnapshot(
-          doc(db, 'public_tracking', effectiveTrackingCode),
-          (docSnap) => {
-            if (docSnap.exists()) {
-              const trackingData = docSnap.data() as PublicOrderTracking;
-              callback(trackingData);
-            } else {
-              // Cloud doc not yet reached: deliver local sanitized tracking
-              callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
-            }
-          },
-          (error) => {
-            console.warn('[Firestore] Public order tracking notice (contingency fallback):', error.message);
+      // Listen directly to the order in Firestore; allowed under firestore.rules 'allow get: if isValidId(orderId)'
+      const unsub = onSnapshot(
+        doc(db, 'orders', orderId),
+        (docSnap) => {
+          if (docSnap.exists()) {
+            const rawOrder = docSnap.data() as Order;
+            const sanitized = this.buildPublicTrackingPayload(rawOrder);
+            callback(sanitized);
+          } else {
             callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
           }
-        );
-        return unsub;
-      }
-
-      return () => {};
+        },
+        (error) => {
+          console.warn('[Firestore] Realtime order tracking notice (contingency fallback):', error.message);
+          callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
+        }
+      );
+      return unsub;
     } catch {
       return () => {};
     }
@@ -1874,9 +1950,24 @@ class StoreService {
 
     // 2. If Firebase Authentication is active and initialized, attempt background cloud login
     if (isFirebaseReady() && auth) {
+      let fbUser: any = null;
       try {
-        const fbUser = await signInWithEmail(targetEmail, password);
-        if (fbUser) {
+        fbUser = await signInWithEmail(targetEmail, password);
+      } catch (fbErr: unknown) {
+        // If signIn fails (e.g. user does not exist in Firebase Auth yet), check if credentials match local staff
+        const passwords = this.getUserPasswords();
+        const storedPass = localCandidate ? (passwords[localCandidate.id] || '123456') : null;
+        if (localCandidate && storedPass && password.trim() === storedPass.trim()) {
+          try {
+            fbUser = await createUserWithEmail(targetEmail, password);
+          } catch (createErr: unknown) {
+            console.warn('[Firebase Auth Auto-Provision]:', createErr);
+          }
+        }
+      }
+
+      if (fbUser) {
+        try {
           let profile: User | null = null;
 
           if (db) {
@@ -1896,7 +1987,7 @@ class StoreService {
                 ...localCandidate,
                 id: fbUser.uid,
                 email: fbUser.email || targetEmail,
-                isEmailVerified: fbUser.emailVerified,
+                isEmailVerified: fbUser.emailVerified ?? true,
                 authProvider: 'firebase_email',
                 firebaseUid: fbUser.uid,
                 lastLoginAt: new Date().toISOString(),
@@ -1911,7 +2002,7 @@ class StoreService {
                 name: fbUser.displayName || 'Amanda Silveira (Admin)',
                 username: fbUser.email?.split('@')[0] || 'admin',
                 email: fbUser.email || targetEmail,
-                isEmailVerified: fbUser.emailVerified,
+                isEmailVerified: fbUser.emailVerified ?? true,
                 role: 'ADMINISTRADOR',
                 status: 'ATIVO',
                 allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
@@ -1949,21 +2040,21 @@ class StoreService {
               username: profile.username,
               role: profile.role,
               action: 'LOGIN_SUCESSO',
-              details: `Login efetuado com sucesso para @${profile.username} (${profile.role})`,
+              details: `Login efetuado com sucesso via Firebase Cloud para @${profile.username} (${profile.role})`,
             });
 
             await this.initStaffFirestoreSync(fbUser);
 
             return {
               success: true,
-              message: 'Login realizado com sucesso!',
+              message: 'Login realizado com sucesso e sincronizado com o Firebase!',
               user: profile,
               isCloudAuth: true,
             };
           }
+        } catch (err: unknown) {
+          console.warn('[Firebase Auth Login Flow Notice]:', err);
         }
-      } catch (fbErr: unknown) {
-        // Transparent fallback to internal credential validation
       }
     }
 

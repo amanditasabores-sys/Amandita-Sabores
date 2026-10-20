@@ -266,10 +266,9 @@ export default function App() {
                     <span>Entrar no Sistema</span>
                   </button>
                   <button
-                    onClick={() => {
-                      const admin = store.getUsers()[0];
-                      store.setCurrentUser(admin);
-                      setCurrentUser(admin);
+                    onClick={async () => {
+                      await store.login('admin', '123456');
+                      setCurrentUser(store.getCurrentUser());
                     }}
                     className="w-full py-2.5 bg-[#FAF7F2] hover:bg-[#F2EAE0] text-[#3D2314] font-bold rounded-xl text-xs transition border border-[#E8DFD5] cursor-pointer"
                   >

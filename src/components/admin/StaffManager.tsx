@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { User, UserRole, UserStatus, AppModule, UserAccessLog } from '../../types';
 import { formatDateTime } from '../../utils/formatters';
@@ -82,6 +82,12 @@ export const StaffManager: React.FC = () => {
     setUsers(store.getUsers());
     setAccessLogs(store.getAccessLogs());
   };
+
+  useEffect(() => {
+    const handleSync = () => reloadData();
+    window.addEventListener('gestaofood_state_changed', handleSync);
+    return () => window.removeEventListener('gestaofood_state_changed', handleSync);
+  }, []);
 
   const handleRoleChange = (role: UserRole) => {
     if (!isActorAdmin && role === 'ADMINISTRADOR') return;

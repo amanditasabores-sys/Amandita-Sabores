@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { store, MigrationSummary } from '../../services/store';
-import { FirebaseConfigState } from '../../services/firebase';
+import { FirebaseConfigState, saveCustomFirebaseConfig, clearCustomFirebaseConfig } from '../../services/firebase';
 import { 
   X, 
   Database, 
@@ -15,7 +15,10 @@ import {
   Check, 
   ShieldCheck, 
   Wifi, 
-  WifiOff 
+  WifiOff,
+  Key,
+  Save,
+  RotateCcw
 } from 'lucide-react';
 
 interface FirebaseStatusModalProps {
@@ -256,28 +259,111 @@ VITE_FIREBASE_APP_ID=1:630521361717:web:...`;
             )}
           </div>
 
-          {/* Credentials Guide Box */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-bold uppercase tracking-wider text-[#3D2314] flex items-center gap-1.5">
-                <ShieldCheck className="w-3.5 h-3.5 text-[#C86D3B]" />
-                <span>Credenciais do Aplicativo Web no Console Firebase</span>
-              </label>
-              <button
-                onClick={copyEnvToClipboard}
-                className="text-[11px] font-bold text-[#C86D3B] hover:text-[#B85D2A] flex items-center gap-1 cursor-pointer"
-              >
-                {copiedEnv ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                <span>{copiedEnv ? 'Copiado!' : 'Copiar Modelo .env'}</span>
-              </button>
+          {/* Credentials Guide Box & In-App Direct Configuration */}
+          <div className="space-y-4">
+            <div className="p-4 bg-[#F5EFE6] rounded-2xl border border-[#E8DFD5] space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold uppercase tracking-wider text-[#3D2314] flex items-center gap-1.5">
+                  <Key className="w-4 h-4 text-[#C86D3B]" />
+                  <span>Configuração Direta no Dispositivo (Sem Re-Deploy)</span>
+                </label>
+                {status.hasApiKey && (
+                  <button
+                    onClick={() => {
+                      if (window.confirm('Deseja limpar as credenciais salvas neste navegador?')) {
+                        clearCustomFirebaseConfig();
+                      }
+                    }}
+                    className="text-[11px] text-rose-600 hover:text-rose-800 font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Redefinir</span>
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-[#6B4B3E]">
+                Se o site na Vercel foi compilado antes de adicionar as variáveis de ambiente, insira a chave da Web API abaixo para conectar este dispositivo imediatamente ao Cloud Firestore (amandita-sabores):
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div>
+                  <label className="block text-[11px] font-bold text-[#3D2314] mb-1">
+                    VITE_FIREBASE_API_KEY (Web API Key):
+                  </label>
+                  <input
+                    type="password"
+                    id="input-custom-firebase-key"
+                    placeholder="AIzaSy..."
+                    defaultValue={status.hasApiKey ? '••••••••••••••••••••••••••••••••' : ''}
+                    className="w-full px-3 py-2 bg-white rounded-xl border border-[#D9C7B8] text-xs font-mono focus:outline-[#C86D3B]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-[#3D2314] mb-1">
+                    VITE_FIREBASE_APP_ID (App ID):
+                  </label>
+                  <input
+                    type="text"
+                    id="input-custom-firebase-appid"
+                    placeholder="1:630521361717:web:..."
+                    defaultValue={status.hasAppId ? '1:630521361717:web:...' : ''}
+                    className="w-full px-3 py-2 bg-white rounded-xl border border-[#D9C7B8] text-xs font-mono focus:outline-[#C86D3B]"
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end pt-1">
+                <button
+                  onClick={() => {
+                    const keyInput = (document.getElementById('input-custom-firebase-key') as HTMLInputElement)?.value?.trim();
+                    const appInput = (document.getElementById('input-custom-firebase-appid') as HTMLInputElement)?.value?.trim();
+                    if (!keyInput || keyInput.includes('••••')) {
+                      alert('Por favor, informe uma chave de API válida do Firebase (ex: AIzaSy...).');
+                      return;
+                    }
+                    saveCustomFirebaseConfig({
+                      apiKey: keyInput,
+                      appId: appInput || '1:630521361717:web:amanditasabores',
+                      projectId: 'amandita-sabores',
+                      authDomain: 'amandita-sabores.firebaseapp.com',
+                      storageBucket: 'amandita-sabores.appspot.com',
+                    });
+                  }}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Salvar e Conectar Este Dispositivo</span>
+                </button>
+              </div>
             </div>
 
-            <pre className="p-3 bg-[#1F100B] text-[#D9C7B8] rounded-2xl text-[11px] font-mono overflow-x-auto border border-[#4A2E1F] leading-relaxed">
-              {envTemplate}
-            </pre>
-            <p className="text-[11px] text-[#8C5E47] leading-relaxed">
-              Para obter os valores reais: Acesse o <strong>Firebase Console</strong> → Projeto <strong>Amandita (amandita-sabores)</strong> → Configurações do Projeto (ícone da engrenagem) → Seus Aplicativos (Web) → Copie o objeto <code>firebaseConfig</code> para o arquivo <code>.env</code>.
-            </p>
+            {/* Vercel Environment Variables Guide */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold uppercase tracking-wider text-[#3D2314] flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#C86D3B]" />
+                  <span>Configuração Permanente no Vercel (Recomendado para Produção)</span>
+                </label>
+                <button
+                  onClick={copyEnvToClipboard}
+                  className="text-[11px] font-bold text-[#C86D3B] hover:text-[#B85D2A] flex items-center gap-1 cursor-pointer"
+                >
+                  {copiedEnv ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                  <span>{copiedEnv ? 'Copiado!' : 'Copiar Variáveis'}</span>
+                </button>
+              </div>
+
+              <pre className="p-3 bg-[#1F100B] text-[#D9C7B8] rounded-2xl text-[11px] font-mono overflow-x-auto border border-[#4A2E1F] leading-relaxed">
+                {envTemplate}
+              </pre>
+              <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 text-[11px] leading-relaxed space-y-1">
+                <p className="font-bold">⚠️ Como ativar no Vercel para todos os dispositivos:</p>
+                <ol className="list-decimal pl-4 space-y-0.5">
+                  <li>Acesse o painel da <strong>Vercel</strong> → Seu projeto <strong>Amandita Sabores</strong>.</li>
+                  <li>Clique em <strong>Settings</strong> → <strong>Environment Variables</strong>.</li>
+                  <li>Adicione <code>VITE_FIREBASE_API_KEY</code> e <code>VITE_FIREBASE_APP_ID</code>.</li>
+                  <li><strong>Importante:</strong> Como o Vite embute variáveis <code>VITE_*</code> no momento da compilação do JavaScript, após salvar na Vercel acesse a aba <strong>Deployments</strong> e clique em <strong>Redeploy</strong> para gerar o novo pacote compilado com as credenciais.</li>
+                </ol>
+              </div>
+            </div>
           </div>
         </div>
 

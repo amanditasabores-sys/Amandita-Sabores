@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { store } from '../../services/store';
 import { MenuItem, Order, OrderItem, PaymentMethod, User, MenuItemAddon } from '../../types';
 import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel } from '../../utils/formatters';
@@ -52,6 +52,16 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
   const [orders, setOrders] = useState<Order[]>(() => store.getOrders());
   const [currentShift, setCurrentShift] = useState(() => store.getCurrentCashShift());
+
+  useEffect(() => {
+    const handleUpdate = () => {
+      setMenuItems(store.getMenuItems());
+      setOrders(store.getOrders());
+      setCurrentShift(store.getCurrentCashShift());
+    };
+    window.addEventListener('gestaofood_state_changed', handleUpdate);
+    return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
+  }, []);
 
   // Search & Categories
   const [searchQuery, setSearchQuery] = useState('');

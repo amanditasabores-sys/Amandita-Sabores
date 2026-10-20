@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { store } from '../../services/store';
 import { MenuItem, MenuItemAddon, OrderItem, PaymentMethod, FulfillmentType, Order } from '../../types';
 import { formatCurrency, generateWhatsAppOrderMessage } from '../../utils/formatters';
@@ -37,8 +37,17 @@ interface CustomerMenuProps {
 }
 
 export const CustomerMenu: React.FC<CustomerMenuProps> = ({ onNavigateToTracking, onNavigateToAdmin }) => {
-  const config = store.getRestaurantConfig();
-  const [menuItems] = useState<MenuItem[]>(() => store.getMenuItems());
+  const [config, setConfig] = useState(() => store.getRestaurantConfig());
+  const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
+
+  useEffect(() => {
+    const handleUpdate = () => {
+      setMenuItems(store.getMenuItems());
+      setConfig(store.getRestaurantConfig());
+    };
+    window.addEventListener('gestaofood_state_changed', handleUpdate);
+    return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
+  }, []);
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState('');

@@ -60,17 +60,27 @@ const TARGET_PROJECT_ID = 'amandita-sabores';
 const TARGET_REGION = 'southamerica-east1';
 const TARGET_DATABASE_ID = '(default)';
 
-// Resolve configuration from environment variables safely in Vite or Node
+// Resolve configuration from environment variables safely in Vite or Node, with localStorage fallback
 const env = (typeof import.meta !== 'undefined' && (import.meta as any).env) 
   ? (import.meta as any).env 
   : (typeof process !== 'undefined' && process.env ? process.env : {});
 
-const apiKey = env.VITE_FIREBASE_API_KEY || '';
-const authDomain = env.VITE_FIREBASE_AUTH_DOMAIN || `${TARGET_PROJECT_ID}.firebaseapp.com`;
-const projectId = env.VITE_FIREBASE_PROJECT_ID || TARGET_PROJECT_ID;
-const storageBucket = env.VITE_FIREBASE_STORAGE_BUCKET || `${TARGET_PROJECT_ID}.appspot.com`;
-const messagingSenderId = env.VITE_FIREBASE_MESSAGING_SENDER_ID || '';
-const appId = env.VITE_FIREBASE_APP_ID || '';
+let customConfig: Record<string, string> | null = null;
+if (typeof window !== 'undefined') {
+  try {
+    const raw = localStorage.getItem('gf_firebase_custom_config');
+    if (raw) customConfig = JSON.parse(raw);
+  } catch {
+    // fallback
+  }
+}
+
+const apiKey = env.VITE_FIREBASE_API_KEY || customConfig?.apiKey || '';
+const authDomain = env.VITE_FIREBASE_AUTH_DOMAIN || customConfig?.authDomain || `${TARGET_PROJECT_ID}.firebaseapp.com`;
+const projectId = env.VITE_FIREBASE_PROJECT_ID || customConfig?.projectId || TARGET_PROJECT_ID;
+const storageBucket = env.VITE_FIREBASE_STORAGE_BUCKET || customConfig?.storageBucket || `${TARGET_PROJECT_ID}.appspot.com`;
+const messagingSenderId = env.VITE_FIREBASE_MESSAGING_SENDER_ID || customConfig?.messagingSenderId || '';
+const appId = env.VITE_FIREBASE_APP_ID || customConfig?.appId || '';
 
 export const firebaseConfig = {
   apiKey,
@@ -113,7 +123,7 @@ if (hasValidConfig) {
     console.error('[Firebase Init Error]:', initError);
   }
 } else {
-  console.info('[Firebase] Executando em modo cache local resiliente. Para conectar ao Firestore de produção amandita-sabores, defina VITE_FIREBASE_API_KEY e VITE_FIREBASE_APP_ID no .env.');
+  console.info('[Firebase] Executando em modo cache local resiliente. Para conectar ao Firestore de produção amandita-sabores, defina VITE_FIREBASE_API_KEY e VITE_FIREBASE_APP_ID no Vercel ou via painel de status.');
 }
 
 export const db = dbInstance;
@@ -121,6 +131,20 @@ export const auth = authInstance;
 
 export function isFirebaseReady(): boolean {
   return Boolean(app && dbInstance && authInstance);
+}
+
+export function saveCustomFirebaseConfig(cfg: { apiKey: string; appId?: string; authDomain?: string; projectId?: string; messagingSenderId?: string; storageBucket?: string }): void {
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('gf_firebase_custom_config', JSON.stringify(cfg));
+    window.location.reload();
+  }
+}
+
+export function clearCustomFirebaseConfig(): void {
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem('gf_firebase_custom_config');
+    window.location.reload();
+  }
 }
 
 export function getFirebaseConfigStatus(): FirebaseConfigState {
@@ -132,7 +156,7 @@ export function getFirebaseConfigStatus(): FirebaseConfigState {
     databaseId: TARGET_DATABASE_ID,
     hasApiKey: Boolean(apiKey),
     hasAppId: Boolean(appId),
-    errorMessage: initError || (!hasValidConfig ? 'Aguardando credenciais do Firebase no arquivo .env (VITE_FIREBASE_API_KEY)' : undefined)
+    errorMessage: initError || (!hasValidConfig ? 'Aguardando credenciais do Firebase (VITE_FIREBASE_API_KEY no Vercel ou no painel)' : undefined)
   };
 }
 
@@ -163,26 +187,27 @@ export async function testFirestoreConnection(): Promise<{ success: boolean; mes
   if (!dbInstance) {
     return {
       success: false,
-      message: 'Firebase não inicializado: verifique as credenciais no .env'
+      message: 'Firebase não inicializado: verifique as credenciais no Vercel (VITE_FIREBASE_API_KEY) ou no painel.'
     };
   }
   try {
-    await getDocFromServer(doc(dbInstance, 'test', 'connection'));
+    await getDocFromServer(doc(dbInstance, 'configs', 'restaurant'));
     return {
       success: true,
-      message: 'Conexão com Cloud Firestore estabelecida com sucesso!'
+      message: 'Conexão em tempo real com o Cloud Firestore (amandita-sabores) ativa e confirmada!'
     };
   } catch (error: unknown) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('the client is offline') || msg.includes('network') || msg.includes('unavailable')) {
       return {
         success: false,
-        message: 'Cliente offline ou conexão não permitida. Verifique sua conexão e regras.'
+        message: 'Cliente offline ou conexão de rede não permitida. Verifique sua conexão e regras.'
       };
     }
-    // Non-existent document is a successful reach of the database server
+    // Any server response confirms reachability of the Firestore instance
     return {
       success: true,
-      message: 'Servidor Firestore alcançado com sucesso.'
+      message: 'Servidor Firestore alcançado com sucesso (amandita-sabores).'
     };
   }
 }
@@ -192,6 +217,14 @@ export async function signInWithEmail(email: string, pass: string): Promise<Fire
     throw new Error('Firebase Auth não inicializado.');
   }
   const creds = await signInWithEmailAndPassword(authInstance, email.trim(), pass);
+  return creds.user;
+}
+
+export async function createUserWithEmail(email: string, pass: string): Promise<FirebaseUser> {
+  if (!authInstance) {
+    throw new Error('Firebase Auth não inicializado.');
+  }
+  const creds = await createUserWithEmailAndPassword(authInstance, email.trim(), pass);
   return creds.user;
 }
 
