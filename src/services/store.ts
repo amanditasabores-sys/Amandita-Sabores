@@ -304,10 +304,9 @@ class StoreService {
    * Priority: Environment variable VITE_INITIAL_ADMIN_EMAIL, followed by owner account fallback
    */
   public getInitialAdminEmail(): string {
-    const env = (typeof import.meta !== 'undefined' && (import.meta as any).env) 
-      ? (import.meta as any).env 
-      : (typeof process !== 'undefined' && process.env ? process.env : {});
-    return (env.VITE_INITIAL_ADMIN_EMAIL || 'dvrmercadinho@gmail.com').trim().toLowerCase();
+    const rawVite = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_INITIAL_ADMIN_EMAIL : undefined;
+    const rawProc = typeof process !== 'undefined' && process.env ? process.env.VITE_INITIAL_ADMIN_EMAIL : undefined;
+    return (rawVite || rawProc || 'dvrmercadinho@gmail.com').trim().toLowerCase();
   }
 
   /**
@@ -628,7 +627,7 @@ class StoreService {
     return getFirebaseConfigStatus();
   }
 
-  public async testConnection(): Promise<{ success: boolean; message: string }> {
+  public async testConnection(): Promise<{ success: boolean; message: string; details?: string }> {
     return testFirestoreConnection();
   }
 

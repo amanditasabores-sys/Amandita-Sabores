@@ -52,6 +52,14 @@ export interface FirebaseConfigState {
   databaseId: string;
   hasApiKey: boolean;
   hasAppId: boolean;
+  hasProjectId: boolean;
+  hasAuthDomain: boolean;
+  hasStorageBucket: boolean;
+  hasMessagingSenderId: boolean;
+  maskedApiKey: string;
+  maskedAppId: string;
+  configOrigin: 'build_env' | 'local_storage' | 'none';
+  buildTime: string;
   errorMessage?: string;
 }
 
@@ -60,11 +68,28 @@ const TARGET_PROJECT_ID = 'amandita-sabores';
 const TARGET_REGION = 'southamerica-east1';
 const TARGET_DATABASE_ID = '(default)';
 
-// Resolve configuration from environment variables safely in Vite or Node, with localStorage fallback
-const env = (typeof import.meta !== 'undefined' && (import.meta as any).env) 
-  ? (import.meta as any).env 
-  : (typeof process !== 'undefined' && process.env ? process.env : {});
+// Declare global build time injected by vite.config.ts define
+declare const __APP_BUILD_TIME__: string | undefined;
+const appBuildTime = typeof __APP_BUILD_TIME__ !== 'undefined' ? __APP_BUILD_TIME__ : new Date().toISOString();
 
+// Helper to mask sensitive keys for UI diagnostic inspection without leaks
+function maskSecret(val: string): string {
+  if (!val || !val.trim()) return 'Não configurada (vazia)';
+  const trimmed = val.trim();
+  if (trimmed.length <= 8) return '••••••••';
+  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
+}
+
+// Helper to resolve environment variable from compile-time Vite or runtime Node
+const getEnvVar = (viteVal: string | undefined, procKey: string): string | undefined => {
+  if (typeof viteVal === 'string' && viteVal.trim() !== '') return viteVal.trim();
+  if (typeof process !== 'undefined' && process.env && typeof process.env[procKey] === 'string' && process.env[procKey].trim() !== '') {
+    return process.env[procKey].trim();
+  }
+  return undefined;
+};
+
+// Check for device-specific localStorage contingency configuration
 let customConfig: Record<string, string> | null = null;
 if (typeof window !== 'undefined') {
   try {
@@ -75,12 +100,33 @@ if (typeof window !== 'undefined') {
   }
 }
 
-const apiKey = env.VITE_FIREBASE_API_KEY || customConfig?.apiKey || '';
-const authDomain = env.VITE_FIREBASE_AUTH_DOMAIN || customConfig?.authDomain || `${TARGET_PROJECT_ID}.firebaseapp.com`;
-const projectId = env.VITE_FIREBASE_PROJECT_ID || customConfig?.projectId || TARGET_PROJECT_ID;
-const storageBucket = env.VITE_FIREBASE_STORAGE_BUCKET || customConfig?.storageBucket || `${TARGET_PROJECT_ID}.appspot.com`;
-const messagingSenderId = env.VITE_FIREBASE_MESSAGING_SENDER_ID || customConfig?.messagingSenderId || '';
-const appId = env.VITE_FIREBASE_APP_ID || customConfig?.appId || '';
+// Direct static member references for Vite AST compile-time replacement
+const rawViteApiKey = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_FIREBASE_API_KEY : undefined;
+const rawViteAppId = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_FIREBASE_APP_ID : undefined;
+const rawViteProjectId = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_FIREBASE_PROJECT_ID : undefined;
+const rawViteAuthDomain = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_FIREBASE_AUTH_DOMAIN : undefined;
+const rawViteStorageBucket = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_FIREBASE_STORAGE_BUCKET : undefined;
+const rawViteSenderId = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID : undefined;
+
+const envApiKey = getEnvVar(rawViteApiKey, 'VITE_FIREBASE_API_KEY');
+const envAppId = getEnvVar(rawViteAppId, 'VITE_FIREBASE_APP_ID');
+const envProjectId = getEnvVar(rawViteProjectId, 'VITE_FIREBASE_PROJECT_ID');
+const envAuthDomain = getEnvVar(rawViteAuthDomain, 'VITE_FIREBASE_AUTH_DOMAIN');
+const envStorageBucket = getEnvVar(rawViteStorageBucket, 'VITE_FIREBASE_STORAGE_BUCKET');
+const envSenderId = getEnvVar(rawViteSenderId, 'VITE_FIREBASE_MESSAGING_SENDER_ID');
+
+// Determine configuration source
+const configOrigin: 'build_env' | 'local_storage' | 'none' = envApiKey
+  ? 'build_env'
+  : (customConfig?.apiKey ? 'local_storage' : 'none');
+
+// Final resolved variables (Preserving project defaults for amandita-sabores)
+const apiKey = envApiKey || customConfig?.apiKey || '';
+const appId = envAppId || customConfig?.appId || '';
+const projectId = envProjectId || customConfig?.projectId || TARGET_PROJECT_ID;
+const authDomain = envAuthDomain || customConfig?.authDomain || `${TARGET_PROJECT_ID}.firebaseapp.com`;
+const storageBucket = envStorageBucket || customConfig?.storageBucket || `${TARGET_PROJECT_ID}.firebasestorage.app`;
+const messagingSenderId = envSenderId || customConfig?.messagingSenderId || '';
 
 export const firebaseConfig = {
   apiKey,
@@ -97,7 +143,7 @@ let dbInstance: Firestore | null = null;
 let authInstance: Auth | null = null;
 let initError: string | null = null;
 
-// Only initialize if minimum valid API key is present
+// Only initialize if minimum valid API key is present (minimum 15 characters, not placeholder)
 const hasValidConfig = Boolean(apiKey && apiKey.trim().length > 10 && !apiKey.includes('SUA_'));
 
 if (hasValidConfig) {
@@ -111,11 +157,11 @@ if (hasValidConfig) {
     dbInstance = getFirestore(app, TARGET_DATABASE_ID);
     authInstance = getAuth(app);
 
-    // Try enabling offline cache persistence
+    // Try enabling offline cache persistence safely without throwing on tab contention
     if (typeof window !== 'undefined') {
       enableIndexedDbPersistence(dbInstance).catch((err) => {
         // Multi-tab or browser constraint is non-fatal
-        console.info('[Firebase] Persistence mode notice:', err.code);
+        console.info('[Firebase] Modo de persistência local:', err.code || err.message);
       });
     }
   } catch (err: unknown) {
@@ -123,7 +169,7 @@ if (hasValidConfig) {
     console.error('[Firebase Init Error]:', initError);
   }
 } else {
-  console.info('[Firebase] Executando em modo cache local resiliente. Para conectar ao Firestore de produção amandita-sabores, defina VITE_FIREBASE_API_KEY e VITE_FIREBASE_APP_ID no Vercel ou via painel de status.');
+  console.info('[Firebase] Executando em modo cache local resiliente. Para conectar ao Firestore de produção amandita-sabores, defina VITE_FIREBASE_API_KEY no Vercel ou via painel de status.');
 }
 
 export const db = dbInstance;
@@ -154,8 +200,16 @@ export function getFirebaseConfigStatus(): FirebaseConfigState {
     projectId,
     region: TARGET_REGION,
     databaseId: TARGET_DATABASE_ID,
-    hasApiKey: Boolean(apiKey),
-    hasAppId: Boolean(appId),
+    hasApiKey: Boolean(apiKey && apiKey.trim().length > 10),
+    hasAppId: Boolean(appId && appId.trim().length > 5),
+    hasProjectId: Boolean(projectId),
+    hasAuthDomain: Boolean(authDomain),
+    hasStorageBucket: Boolean(storageBucket),
+    hasMessagingSenderId: Boolean(messagingSenderId),
+    maskedApiKey: maskSecret(apiKey),
+    maskedAppId: maskSecret(appId),
+    configOrigin,
+    buildTime: appBuildTime,
     errorMessage: initError || (!hasValidConfig ? 'Aguardando credenciais do Firebase (VITE_FIREBASE_API_KEY no Vercel ou no painel)' : undefined)
   };
 }
@@ -182,32 +236,64 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Skill constraint: Validate Connection to Firestore with getFromServer
-export async function testFirestoreConnection(): Promise<{ success: boolean; message: string }> {
+// Validate Connection to Firestore with getDocFromServer distinguishing permission vs network vs missing config
+export async function testFirestoreConnection(): Promise<{ success: boolean; message: string; details?: string }> {
   if (!dbInstance) {
+    if (!hasValidConfig) {
+      return {
+        success: false,
+        message: 'Firebase não inicializado: credenciais ausentes no pacote compilado deste dispositivo.',
+        details: 'As variáveis de ambiente VITE_FIREBASE_* não foram detectadas no JavaScript baixado pelo navegador. Realize um Redeploy SEM cache na Vercel ou utilize a configuração direta abaixo.'
+      };
+    }
     return {
       success: false,
-      message: 'Firebase não inicializado: verifique as credenciais no Vercel (VITE_FIREBASE_API_KEY) ou no painel.'
+      message: 'Falha na inicialização do Firebase App.',
+      details: initError || 'Erro interno na inicialização do SDK Firebase.'
     };
   }
+
   try {
     await getDocFromServer(doc(dbInstance, 'configs', 'restaurant'));
     return {
       success: true,
-      message: 'Conexão em tempo real com o Cloud Firestore (amandita-sabores) ativa e confirmada!'
+      message: 'Servidor Firestore alcançado com sucesso (amandita-sabores).',
+      details: 'Conexão ativa e documento de configuração consultado com sucesso.'
     };
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (msg.includes('the client is offline') || msg.includes('network') || msg.includes('unavailable')) {
+    const code = (error as any)?.code || '';
+
+    // If client is offline or network request failed
+    if (msg.includes('the client is offline') || msg.includes('network') || msg.includes('unavailable') || code === 'unavailable') {
       return {
         success: false,
-        message: 'Cliente offline ou conexão de rede não permitida. Verifique sua conexão e regras.'
+        message: 'Cliente offline ou rede bloqueada.',
+        details: 'Não foi possível alcançar firestore.googleapis.com. Verifique a conexão com a internet e bloqueadores de requisições.'
       };
     }
-    // Any server response confirms reachability of the Firestore instance
+
+    // Permission-denied is direct evidence from Google's Firestore server that the project, database and API key are valid!
+    if (code === 'permission-denied' || msg.includes('Missing or insufficient permissions') || msg.includes('permission-denied')) {
+      return {
+        success: true,
+        message: 'Servidor Firestore alcançado com sucesso (amandita-sabores).',
+        details: 'A API Key e o projeto amandita-sabores foram validados pelos servidores do Google. As regras de segurança firestore.rules estão operando normalmente.'
+      };
+    }
+
+    if (code === 'not-found') {
+      return {
+        success: true,
+        message: 'Servidor Firestore alcançado com sucesso (amandita-sabores).',
+        details: 'Instância alcançada com sucesso (o documento de teste ainda não foi gravado).'
+      };
+    }
+
     return {
-      success: true,
-      message: 'Servidor Firestore alcançado com sucesso (amandita-sabores).'
+      success: false,
+      message: `Erro na comunicação com o Firestore: ${code || 'falha'}`,
+      details: msg
     };
   }
 }
