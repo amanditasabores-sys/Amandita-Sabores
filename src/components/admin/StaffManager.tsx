@@ -103,6 +103,8 @@ export const StaffManager: React.FC = () => {
       setFormAllowedModules(['kds']);
     } else if (role === 'ENTREGADOR') {
       setFormAllowedModules(['entregas']);
+    } else if (role === 'ATENDENTE' || role === 'atendente') {
+      setFormAllowedModules(['pdv', 'kanban']);
     }
   };
 
@@ -620,7 +622,8 @@ export const StaffManager: React.FC = () => {
                   >
                     {isActorAdmin && <option value="ADMINISTRADOR">Administrador Geral</option>}
                     <option value="GERENTE">Gerente / Supervisor</option>
-                    <option value="CAIXA">Caixa / Atendente</option>
+                    <option value="ATENDENTE">Atendente (Balcão & Pedidos)</option>
+                    <option value="CAIXA">Operador de Caixa</option>
                     <option value="COZINHA">Produção / Cozinha (KDS)</option>
                     <option value="ENTREGADOR">Entregador (Motoboy)</option>
                   </select>

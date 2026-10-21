@@ -14,7 +14,8 @@ import {
   ChefHat,
   ShoppingBag,
   Bike,
-  Briefcase
+  Briefcase,
+  Store
 } from 'lucide-react';
 import { AmanditaLogo } from '../common/AmanditaLogo';
 
@@ -206,29 +207,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
 
               <button
                 type="button"
-                onClick={() => handleQuickFill('caixa')}
-                className="p-1.5 bg-[#F7F2EA] hover:bg-[#EFE6DC] border border-[#E8DFD5] rounded-xl text-left transition flex items-center gap-1.5 cursor-pointer"
-              >
-                <div className="w-5 h-5 rounded-md bg-emerald-500/20 text-emerald-800 flex items-center justify-center shrink-0">
-                  <ShoppingBag className="w-3 h-3" />
-                </div>
-                <div className="truncate">
-                  <p className="text-[11px] font-bold text-[#2C1810]">Caixa</p>
-                  <p className="text-[9px] text-slate-500">PDV</p>
-                </div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleQuickFill('cozinha')}
+                onClick={() => handleQuickFill('atendente')}
                 className="p-1.5 bg-[#F7F2EA] hover:bg-[#EFE6DC] border border-[#E8DFD5] rounded-xl text-left transition flex items-center gap-1.5 cursor-pointer"
               >
                 <div className="w-5 h-5 rounded-md bg-amber-500/20 text-amber-800 flex items-center justify-center shrink-0">
-                  <ChefHat className="w-3 h-3" />
+                  <Store className="w-3 h-3" />
                 </div>
                 <div className="truncate">
-                  <p className="text-[11px] font-bold text-[#2C1810]">Cozinha</p>
-                  <p className="text-[9px] text-slate-500">KDS</p>
+                  <p className="text-[11px] font-bold text-[#2C1810]">Atendente</p>
+                  <p className="text-[9px] text-slate-500">Balcão</p>
                 </div>
               </button>
 
@@ -243,6 +230,34 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
                 <div className="truncate">
                   <p className="text-[11px] font-bold text-[#2C1810]">Entregador</p>
                   <p className="text-[9px] text-slate-500">Rotas</p>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleQuickFill('cozinha')}
+                className="p-1.5 bg-[#F7F2EA] hover:bg-[#EFE6DC] border border-[#E8DFD5] rounded-xl text-left transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <div className="w-5 h-5 rounded-md bg-rose-500/20 text-rose-800 flex items-center justify-center shrink-0">
+                  <ChefHat className="w-3 h-3" />
+                </div>
+                <div className="truncate">
+                  <p className="text-[11px] font-bold text-[#2C1810]">Produção</p>
+                  <p className="text-[9px] text-slate-500">KDS</p>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleQuickFill('caixa')}
+                className="p-1.5 bg-[#F7F2EA] hover:bg-[#EFE6DC] border border-[#E8DFD5] rounded-xl text-left transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <div className="w-5 h-5 rounded-md bg-emerald-500/20 text-emerald-800 flex items-center justify-center shrink-0">
+                  <ShoppingBag className="w-3 h-3" />
+                </div>
+                <div className="truncate">
+                  <p className="text-[11px] font-bold text-[#2C1810]">Caixa</p>
+                  <p className="text-[9px] text-slate-500">Fechamento</p>
                 </div>
               </button>
 

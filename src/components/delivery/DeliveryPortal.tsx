@@ -15,21 +15,30 @@ import {
   Search, 
   X,
   UserCheck,
-  RotateCcw
+  RotateCcw,
+  LogOut
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import { User } from '../../types';
 
 interface DeliveryPortalProps {
   initialOrderId?: string;
   onNavigateToAdmin?: () => void;
+  currentUser?: User | null;
+  onLogout?: () => void;
 }
 
-export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({ initialOrderId, onNavigateToAdmin }) => {
+export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({ 
+  initialOrderId, 
+  onNavigateToAdmin,
+  currentUser,
+  onLogout
+}) => {
   const [driverName, setDriverName] = useState(() => {
-    return localStorage.getItem('gf_driver_name') || 'Carlos Motoboy';
+    return currentUser?.name || currentUser?.username || localStorage.getItem('gf_driver_name') || 'Rodrigo Motoboy';
   });
   const [driverPhone, setDriverPhone] = useState(() => {
-    return localStorage.getItem('gf_driver_phone') || '(11) 97771-2233';
+    return currentUser?.phone || localStorage.getItem('gf_driver_phone') || '(11) 97771-2233';
   });
   const [isEditingProfile, setIsEditingProfile] = useState(false);
 
@@ -227,10 +236,10 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({ initialOrderId, 
           </div>
 
           <div className="flex items-center gap-2">
-            {onNavigateToAdmin && (
+            {onNavigateToAdmin && (currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE' || !currentUser) && (
               <button
                 onClick={onNavigateToAdmin}
-                className="px-3 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition border border-slate-700"
+                className="px-3 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition border border-slate-700 cursor-pointer"
                 title="Voltar ao Painel Administrativo"
               >
                 <span>Painel ADM</span>
@@ -251,6 +260,17 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({ initialOrderId, 
               <QrCode className="w-4 h-4" />
               <span>{isScannerOpen ? 'Fechar Scanner' : 'Ler QR Code'}</span>
             </button>
+
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="flex items-center gap-1.5 px-3 py-2 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 hover:text-white rounded-xl text-xs font-bold transition border border-rose-500/30 cursor-pointer"
+                title="Sair do Portal do Entregador"
+              >
+                <LogOut className="w-4 h-4" />
+                <span>Sair</span>
+              </button>
+            )}
           </div>
         </div>
       </header>

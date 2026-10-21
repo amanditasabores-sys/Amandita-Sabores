@@ -5,6 +5,9 @@ import { AdminDashboard } from './components/admin/AdminDashboard';
 import { CustomerMenu } from './components/menu/CustomerMenu';
 import { DeliveryPortal } from './components/delivery/DeliveryPortal';
 import { OrderTrackingView } from './components/tracking/OrderTrackingView';
+import { KitchenScreen } from './components/staff/KitchenScreen';
+import { CashierScreen } from './components/staff/CashierScreen';
+import { AttendantScreen } from './components/staff/AttendantScreen';
 import { AuthModal } from './components/auth/AuthModal';
 import { 
   ShieldCheck, 
@@ -12,26 +15,73 @@ import {
   Bike, 
   MapPin, 
   RotateCcw, 
-  ChevronDown, 
-  ChevronUp, 
   LogIn, 
-  ExternalLink,
-  Flame 
+  Flame,
+  ChefHat,
+  Vault,
+  Store,
+  ShieldAlert,
+  X,
+  Lock,
+  Sparkles
 } from 'lucide-react';
 import { ConfirmModal } from './components/common/ConfirmModal';
 import { FirebaseStatusModal } from './components/admin/FirebaseStatusModal';
+
+export type AppView = 'admin' | 'cardapio' | 'entregador' | 'producao' | 'caixa' | 'atendente' | 'rastreio';
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(() => store.getCurrentUser());
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
-  const [isViewBarCollapsed, setIsViewBarCollapsed] = useState(false);
+  const [securityNotice, setSecurityNotice] = useState<string | null>(null);
 
   // Current view detection from URL query parameters
-  const [currentView, setCurrentView] = useState<'admin' | 'cardapio' | 'entregador' | 'rastreio'>('admin');
+  const [currentView, setCurrentView] = useState<AppView>(() => {
+    const user = store.getCurrentUser();
+    if (user) {
+      const role = user.role?.toUpperCase();
+      if (role === 'ENTREGADOR') return 'entregador';
+      if (role === 'COZINHA') return 'producao';
+      if (role === 'CAIXA') return 'caixa';
+      if (role === 'ATENDENTE') return 'atendente';
+      return 'admin';
+    }
+    return 'cardapio';
+  });
+
   const [selectedOrderId, setSelectedOrderId] = useState<string>('ord-1002');
   const [selectedTrackingCode, setSelectedTrackingCode] = useState<string>('');
+
+  const getDefaultViewForRole = (role?: string): AppView => {
+    const norm = role?.toUpperCase();
+    if (norm === 'ENTREGADOR') return 'entregador';
+    if (norm === 'COZINHA') return 'producao';
+    if (norm === 'CAIXA') return 'caixa';
+    if (norm === 'ATENDENTE') return 'atendente';
+    return 'admin';
+  };
+
+  const isViewAllowedForUser = (view: AppView, user: User | null): boolean => {
+    // Public customer views
+    if (view === 'cardapio' || view === 'rastreio') return true;
+
+    // Unauthenticated visitors: only 'cardapio', 'rastreio' or 'admin' (which renders staff login)
+    if (!user) return view === 'admin';
+
+    const role = user.role?.toUpperCase();
+    if (role === 'ADMINISTRADOR' || role === 'GERENTE' || user.username === 'admin') {
+      return true; // Full access across all modules
+    }
+
+    if (role === 'ENTREGADOR') return view === 'entregador';
+    if (role === 'COZINHA') return view === 'producao';
+    if (role === 'CAIXA') return view === 'caixa';
+    if (role === 'ATENDENTE') return view === 'atendente';
+
+    return false;
+  };
 
   const updateViewFromUrl = () => {
     const search = window.location.search;
@@ -39,7 +89,7 @@ export default function App() {
     const pathname = window.location.pathname.toLowerCase();
     const params = new URLSearchParams(search);
 
-    let viewParam = params.get('view');
+    let viewParam = params.get('view') as AppView | null;
     let orderParam = params.get('pedido');
     let tkParam = params.get('tk') || params.get('token');
 
@@ -47,6 +97,9 @@ export default function App() {
     if (!viewParam && hash) {
       if (hash.includes('cardapio')) viewParam = 'cardapio';
       else if (hash.includes('entregador')) viewParam = 'entregador';
+      else if (hash.includes('producao') || hash.includes('kds') || hash.includes('cozinha')) viewParam = 'producao';
+      else if (hash.includes('caixa')) viewParam = 'caixa';
+      else if (hash.includes('atendente') || hash.includes('pdv')) viewParam = 'atendente';
       else if (hash.includes('rastreio')) viewParam = 'rastreio';
       else if (hash.includes('admin')) viewParam = 'admin';
 
@@ -62,12 +115,37 @@ export default function App() {
     if (!viewParam && pathname) {
       if (pathname.includes('cardapio')) viewParam = 'cardapio';
       else if (pathname.includes('entregador')) viewParam = 'entregador';
+      else if (pathname.includes('producao') || pathname.includes('kds') || pathname.includes('cozinha')) viewParam = 'producao';
+      else if (pathname.includes('caixa')) viewParam = 'caixa';
+      else if (pathname.includes('atendente')) viewParam = 'atendente';
       else if (pathname.includes('rastreio')) viewParam = 'rastreio';
+      else if (pathname.includes('admin')) viewParam = 'admin';
     }
 
-    if (viewParam === 'cardapio' || viewParam === 'entregador' || viewParam === 'rastreio' || viewParam === 'admin') {
-      setCurrentView(viewParam as typeof currentView);
+    const activeUser = store.getCurrentUser();
+    const validViews: AppView[] = ['admin', 'cardapio', 'entregador', 'producao', 'caixa', 'atendente', 'rastreio'];
+
+    if (viewParam && validViews.includes(viewParam)) {
+      if (isViewAllowedForUser(viewParam, activeUser)) {
+        setCurrentView(viewParam);
+      } else if (activeUser) {
+        // Enforce strict RBAC: redirect user directly to their authorized profile view
+        const targetView = getDefaultViewForRole(activeUser.role);
+        setCurrentView(targetView);
+        setSecurityNotice(`Acesso não autorizado: seu perfil de ${activeUser.role} foi direcionado à sua tela exclusiva.`);
+        const url = new URL(window.location.href);
+        url.searchParams.set('view', targetView);
+        window.history.replaceState({}, '', url.toString());
+      } else {
+        // Unauthenticated visitor trying to access internal staff area
+        setCurrentView('admin');
+      }
+    } else if (activeUser) {
+      setCurrentView(getDefaultViewForRole(activeUser.role));
+    } else {
+      setCurrentView('cardapio');
     }
+
     if (orderParam) {
       setSelectedOrderId(orderParam);
     }
@@ -79,16 +157,12 @@ export default function App() {
   useEffect(() => {
     updateViewFromUrl();
 
-    const handlePopState = () => {
-      updateViewFromUrl();
-    };
-
-    const handleHashChange = () => {
-      updateViewFromUrl();
-    };
+    const handlePopState = () => updateViewFromUrl();
+    const handleHashChange = () => updateViewFromUrl();
 
     const handleStateChanged = () => {
-      setCurrentUser(store.getCurrentUser());
+      const updatedUser = store.getCurrentUser();
+      setCurrentUser(updatedUser);
     };
 
     window.addEventListener('popstate', handlePopState);
@@ -103,10 +177,20 @@ export default function App() {
   }, []);
 
   const navigateTo = (
-    view: 'admin' | 'cardapio' | 'entregador' | 'rastreio', 
+    view: AppView, 
     orderId?: string,
     trackingCode?: string
   ) => {
+    const activeUser = store.getCurrentUser();
+    if (!isViewAllowedForUser(view, activeUser)) {
+      if (activeUser) {
+        const allowed = getDefaultViewForRole(activeUser.role);
+        setCurrentView(allowed);
+        setSecurityNotice(`Acesso negado: seu perfil de ${activeUser.role} não possui permissão para acessar este módulo.`);
+        return;
+      }
+    }
+
     setCurrentView(view);
     if (orderId) {
       setSelectedOrderId(orderId);
@@ -134,6 +218,7 @@ export default function App() {
   const handleLogout = () => {
     store.logout();
     setCurrentUser(null);
+    navigateTo('cardapio');
   };
 
   const handleResetSampleData = () => {
@@ -146,99 +231,180 @@ export default function App() {
     window.location.reload();
   };
 
+  // Only Administrator or Gerente can see the global preview assistant toolbar
+  const isGlobalToolbarVisible = Boolean(
+    currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin')
+  );
+
   return (
     <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] font-sans">
-      {/* GLOBAL VIEW SWITCHER / PREVIEW ASSISTANT TOOLBAR */}
-      <aside aria-label="Seletor de Ambiente" className="sticky top-0 z-50 bg-[#1F100B] text-white border-b border-[#4A2E1F] shadow-md">
-        <div className="max-w-7xl mx-auto px-4 py-1.5 flex items-center justify-between text-xs">
-          <div className="flex items-center gap-2">
-            <span className="font-black tracking-wider text-[#E89255] font-serif text-[12px] flex items-center gap-1.5">
-              <span>AMANDITA SABORES</span>
-            </span>
-            <span className="text-[#6B4B3E] hidden sm:inline">|</span>
-            <span className="text-[#D9C7B8] hidden sm:inline text-[11px]">Navegação Rápida:</span>
+      {/* GLOBAL VIEW SWITCHER / PREVIEW ASSISTANT TOOLBAR (RESTRICTED TO ADMINISTRATOR ONLY) */}
+      {isGlobalToolbarVisible && (
+        <aside aria-label="Seletor de Ambiente" className="sticky top-0 z-50 bg-[#1F100B] text-white border-b border-[#4A2E1F] shadow-md">
+          <div className="max-w-7xl mx-auto px-4 py-1.5 flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2">
+              <span className="font-black tracking-wider text-[#E89255] font-serif text-[12px] flex items-center gap-1.5">
+                <span>AMANDITA SABORES</span>
+              </span>
+              <span className="text-[#6B4B3E] hidden sm:inline">|</span>
+              <span className="text-[#D9C7B8] hidden sm:inline text-[11px]">Navegação Rápida (Admin):</span>
+            </div>
+
+            <div className="flex items-center gap-1 sm:gap-2">
+              {/* 1. Admin */}
+              <button
+                onClick={() => navigateTo('admin')}
+                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                  currentView === 'admin'
+                    ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
+                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                }`}
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>Painel Admin</span>
+              </button>
+
+              {/* 2. Customer Menu */}
+              <button
+                onClick={() => navigateTo('cardapio')}
+                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                  currentView === 'cardapio'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                }`}
+              >
+                <UtensilsCrossed className="w-3.5 h-3.5" />
+                <span>Cardápio</span>
+              </button>
+
+              {/* 3. Atendente */}
+              <button
+                onClick={() => navigateTo('atendente')}
+                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                  currentView === 'atendente'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                }`}
+              >
+                <Store className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">Atendente</span>
+              </button>
+
+              {/* 4. Cozinha */}
+              <button
+                onClick={() => navigateTo('producao')}
+                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                  currentView === 'producao'
+                    ? 'bg-rose-700 text-white shadow-xs'
+                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                }`}
+              >
+                <ChefHat className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">Cozinha</span>
+              </button>
+
+              {/* 5. Caixa */}
+              <button
+                onClick={() => navigateTo('caixa')}
+                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                  currentView === 'caixa'
+                    ? 'bg-emerald-700 text-white shadow-xs'
+                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                }`}
+              >
+                <Vault className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">Caixa</span>
+              </button>
+
+              {/* 6. Entregador */}
+              <button
+                onClick={() => navigateTo('entregador')}
+                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                  currentView === 'entregador'
+                    ? 'bg-[#C86D3B] text-white shadow-xs'
+                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                }`}
+              >
+                <Bike className="w-3.5 h-3.5" />
+                <span>Entregas</span>
+              </button>
+
+              {/* 7. Firebase Cloud Status */}
+              <button
+                onClick={() => setIsFirebaseModalOpen(true)}
+                title="Status do Cloud Firestore & Migração de Dados"
+                className="px-2 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer bg-amber-500/20 text-[#FFCA28] hover:bg-amber-500/30 border border-[#FFCA28]/40"
+              >
+                <Flame className="w-3.5 h-3.5 text-[#FFCA28]" />
+                <span className="hidden sm:inline">Firebase</span>
+              </button>
+
+              {/* Reset data */}
+              <button
+                onClick={handleResetSampleData}
+                title="Restaurar dados iniciais da Amandita Sabores"
+                className="p-1 text-[#D9C7B8] hover:text-white hover:bg-white/10 rounded-lg ml-1 cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
+        </aside>
+      )}
 
-          <div className="flex items-center gap-1 sm:gap-2">
-            {/* 1. Admin */}
-            <button
-              onClick={() => navigateTo('admin')}
-              className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
-                currentView === 'admin'
-                  ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
-                  : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
-              }`}
-            >
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>Painel Admin & PDV</span>
-            </button>
+      {/* VIEW 1: CLIENT PUBLIC MENU */}
+      {currentView === 'cardapio' && (
+        <CustomerMenu
+          onNavigateToTracking={(orderId, trackingCode) => navigateTo('rastreio', orderId, trackingCode)}
+          onNavigateToAdmin={() => navigateTo('admin')}
+          onOpenStaffLogin={() => setIsAuthModalOpen(true)}
+        />
+      )}
 
-            {/* 2. Customer Menu */}
-            <button
-              onClick={() => navigateTo('cardapio')}
-              className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
-                currentView === 'cardapio'
-                  ? 'bg-emerald-600 text-white shadow-xs'
-                  : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
-              }`}
-            >
-              <UtensilsCrossed className="w-3.5 h-3.5" />
-              <span>Cardápio WhatsApp</span>
-            </button>
+      {/* VIEW 2: CLIENT ORDER TRACKING */}
+      {currentView === 'rastreio' && (
+        <OrderTrackingView
+          orderId={selectedOrderId}
+          trackingCode={selectedTrackingCode}
+          onNavigateToMenu={() => navigateTo('cardapio')}
+        />
+      )}
 
-            {/* 3. Driver Portal */}
-            <button
-              onClick={() => navigateTo('entregador')}
-              className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
-                currentView === 'entregador'
-                  ? 'bg-[#C86D3B] text-white shadow-xs'
-                  : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
-              }`}
-            >
-              <Bike className="w-3.5 h-3.5" />
-              <span>Portal Entregador</span>
-            </button>
+      {/* VIEW 3: ATENDENTE (BALCÃO & GESTÃO DE PEDIDOS) */}
+      {currentView === 'atendente' && (
+        <AttendantScreen
+          currentUser={currentUser}
+          onLogout={handleLogout}
+        />
+      )}
 
-            {/* 4. Tracking */}
-            <button
-              onClick={() => {
-                const targetId = selectedOrderId || 'ord-1002';
-                const targetOrder = store.getOrderById(targetId);
-                navigateTo('rastreio', targetId, targetOrder?.trackingCode || selectedTrackingCode);
-              }}
-              className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
-                currentView === 'rastreio'
-                  ? 'bg-purple-600 text-white shadow-xs'
-                  : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
-              }`}
-            >
-              <MapPin className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Rastreio Pedido</span>
-            </button>
+      {/* VIEW 4: PRODUÇÃO & COZINHA (KDS) */}
+      {currentView === 'producao' && (
+        <KitchenScreen
+          currentUser={currentUser}
+          onLogout={handleLogout}
+        />
+      )}
 
-            {/* Firebase Cloud Status & Migration */}
-            <button
-              onClick={() => setIsFirebaseModalOpen(true)}
-              title="Status do Cloud Firestore & Migração de Dados"
-              className="px-2 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer bg-amber-500/20 text-[#FFCA28] hover:bg-amber-500/30 border border-[#FFCA28]/40"
-            >
-              <Flame className="w-3.5 h-3.5 text-[#FFCA28]" />
-              <span className="hidden sm:inline">Firebase</span>
-            </button>
+      {/* VIEW 5: CAIXA (FLUXO DE CAIXA & FECHAMENTO) */}
+      {currentView === 'caixa' && (
+        <CashierScreen
+          currentUser={currentUser}
+          onLogout={handleLogout}
+        />
+      )}
 
-            {/* Reset data */}
-            <button
-              onClick={handleResetSampleData}
-              title="Restaurar dados iniciais da Amandita Sabores"
-              className="p-1 text-[#D9C7B8] hover:text-white hover:bg-white/10 rounded-lg ml-1 cursor-pointer"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-      </aside>
+      {/* VIEW 6: PORTAL DO ENTREGADOR */}
+      {currentView === 'entregador' && (
+        <DeliveryPortal
+          initialOrderId={selectedOrderId}
+          currentUser={currentUser}
+          onLogout={handleLogout}
+          onNavigateToAdmin={() => navigateTo('admin')}
+        />
+      )}
 
-      {/* VIEW 1: ADMIN PANEL */}
+      {/* VIEW 7: PAINEL ADMINISTRATIVO (ADMIN OU LOGIN DE FUNCIONÁRIO) */}
       {currentView === 'admin' && (
         <>
           {currentUser ? (
@@ -255,7 +421,7 @@ export default function App() {
                 </div>
                 <h2 className="text-2xl font-black text-[#2C1810]">Acesso do Colaborador</h2>
                 <p className="text-xs text-[#8C5E47] mt-2 mb-6">
-                  Área restrita da Amandita Sabores. Faça login com seu usuário e senha autorizados pelo Administrador.
+                  Área restrita da Amandita Sabores. Faça login com seu usuário e senha autorizados pelo Administrador para ser direcionado à sua tela de trabalho.
                 </p>
                 <div className="space-y-3">
                   <button
@@ -267,12 +433,21 @@ export default function App() {
                   </button>
                   <button
                     onClick={async () => {
-                      await store.login('admin', '123456');
-                      setCurrentUser(store.getCurrentUser());
+                      const res = await store.login('admin', '123456');
+                      if (res.user) {
+                        setCurrentUser(res.user);
+                        navigateTo(getDefaultViewForRole(res.user.role));
+                      }
                     }}
                     className="w-full py-2.5 bg-[#FAF7F2] hover:bg-[#F2EAE0] text-[#3D2314] font-bold rounded-xl text-xs transition border border-[#E8DFD5] cursor-pointer"
                   >
                     ⚡ Entrar Imediatamente como Administrador (Demo)
+                  </button>
+                  <button
+                    onClick={() => navigateTo('cardapio')}
+                    className="w-full py-2 text-xs font-semibold text-[#8C5E47] hover:text-[#2C1810] transition cursor-pointer"
+                  >
+                    ← Voltar ao Cardápio Digital Público
                   </button>
                 </div>
               </div>
@@ -281,29 +456,18 @@ export default function App() {
         </>
       )}
 
-      {/* VIEW 2: CUSTOMER DIGITAL MENU (WHATSAPP ACCESS) */}
-      {currentView === 'cardapio' && (
-        <CustomerMenu
-          onNavigateToTracking={(orderId, trackingCode) => navigateTo('rastreio', orderId, trackingCode)}
-          onNavigateToAdmin={() => navigateTo('admin')}
-        />
-      )}
-
-      {/* VIEW 3: DELIVERY DRIVER PORTAL */}
-      {currentView === 'entregador' && (
-        <DeliveryPortal
-          initialOrderId={selectedOrderId}
-          onNavigateToAdmin={() => navigateTo('admin')}
-        />
-      )}
-
-      {/* VIEW 4: CLIENT ORDER TRACKING VIEW */}
-      {currentView === 'rastreio' && (
-        <OrderTrackingView
-          orderId={selectedOrderId}
-          trackingCode={selectedTrackingCode}
-          onNavigateToMenu={() => navigateTo('cardapio')}
-        />
+      {/* SECURITY ACCESS NOTICE TOAST */}
+      {securityNotice && (
+        <div className="fixed bottom-6 right-6 z-50 bg-[#2C1810] text-[#FAF7F2] p-4 rounded-2xl shadow-2xl border border-amber-500/40 flex items-center gap-3 text-xs max-w-md animate-in slide-in-from-bottom">
+          <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0" />
+          <span className="font-medium flex-1">{securityNotice}</span>
+          <button
+            onClick={() => setSecurityNotice(null)}
+            className="text-[#D9C7B8] hover:text-white p-1"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
       )}
 
       {/* FIREBASE STATUS & MIGRATION MODAL */}
@@ -319,6 +483,7 @@ export default function App() {
         onSuccess={(user) => {
           setCurrentUser(user);
           setIsAuthModalOpen(false);
+          navigateTo(getDefaultViewForRole(user.role));
         }}
       />
 

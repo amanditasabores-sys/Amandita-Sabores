@@ -27,16 +27,22 @@ import {
   Bike,
   Store as StoreIcon,
   AlertCircle,
-  Building2
+  Building2,
+  Lock
 } from 'lucide-react';
 import { AmanditaLogo } from '../common/AmanditaLogo';
 
 interface CustomerMenuProps {
   onNavigateToTracking?: (orderId: string, trackingCode?: string) => void;
   onNavigateToAdmin?: () => void;
+  onOpenStaffLogin?: () => void;
 }
 
-export const CustomerMenu: React.FC<CustomerMenuProps> = ({ onNavigateToTracking, onNavigateToAdmin }) => {
+export const CustomerMenu: React.FC<CustomerMenuProps> = ({ 
+  onNavigateToTracking, 
+  onNavigateToAdmin,
+  onOpenStaffLogin 
+}) => {
   const [config, setConfig] = useState(() => store.getRestaurantConfig());
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
 
@@ -307,7 +313,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({ onNavigateToTracking
           </div>
 
           <div className="flex items-center gap-2">
-            {onNavigateToAdmin && (
+            {onNavigateToAdmin && (store.getCurrentUser()?.role === 'ADMINISTRADOR' || store.getCurrentUser()?.role === 'GERENTE') && (
               <button
                 onClick={onNavigateToAdmin}
                 className="p-2.5 bg-white/10 hover:bg-white/20 text-[#D9C7B8] hover:text-white rounded-xl transition text-xs font-semibold flex items-center gap-1.5 border border-white/10 cursor-pointer"
@@ -532,6 +538,23 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({ onNavigateToTracking
           </div>
         )}
       </main>
+
+      {/* Customer Footer with Subtle Staff Access */}
+      <footer className="mt-16 py-8 border-t border-[#E8DFD5] text-center text-xs text-[#8C5E47] space-y-2">
+        <p className="font-bold text-[#2C1810]">Amandita Sabores — Cuscuz Gourmet, Tapiocas & Café Especial</p>
+        <p>{config.address} · {config.phone}</p>
+        <div className="pt-2">
+          {onOpenStaffLogin && (
+            <button
+              onClick={onOpenStaffLogin}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold text-[#8C5E47] hover:text-[#C86D3B] hover:bg-[#F2EAE0] transition cursor-pointer"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Acesso de Colaboradores</span>
+            </button>
+          )}
+        </div>
+      </footer>
 
       {/* Floating Bottom Cart Bar */}
       {cart.length > 0 && !isCartOpen && (

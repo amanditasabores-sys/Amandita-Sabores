@@ -18,6 +18,7 @@ export type UserRole =
   | 'CAIXA' 
   | 'COZINHA' 
   | 'ENTREGADOR'
+  | 'ATENDENTE'
   | 'admin'
   | 'gerente'
   | 'atendente';

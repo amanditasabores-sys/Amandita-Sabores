@@ -479,6 +479,17 @@ export const INITIAL_USERS: User[] = [
     allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'relatorios', 'menu', 'qrcodes'],
     createdAt: new Date(Date.now() - 12 * 86400000).toISOString(),
   },
+  {
+    id: 'user-atendente',
+    name: 'Fernanda Lima (Atendimento & Balcão)',
+    username: 'atendente',
+    email: 'atendente@amanditasabores.com.br',
+    isEmailVerified: true,
+    role: 'ATENDENTE',
+    status: 'ATIVO',
+    allowedModules: ['pdv', 'kanban'],
+    createdAt: new Date(Date.now() - 8 * 86400000).toISOString(),
+  },
 ];
 
 export const INITIAL_ORDERS: Order[] = [

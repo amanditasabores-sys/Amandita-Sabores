@@ -178,6 +178,7 @@ class StoreService {
           'user-cozinha': '123456',
           'user-entregador': '123456',
           'user-gerente': '123456',
+          'user-atendente': '123456',
         };
         localStorage.setItem('gf_user_passwords', JSON.stringify(defaultPasswords));
       }
@@ -251,7 +252,51 @@ class StoreService {
   public isAuthorizedStaffRole(role?: string | null): boolean {
     if (!role) return false;
     const normalized = role.toUpperCase();
-    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ENTREGADOR'].includes(normalized);
+    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ENTREGADOR', 'ATENDENTE'].includes(normalized);
+  }
+
+  /**
+   * Specific role permission verifiers to enforce RBAC rules across store operations
+   */
+  public canUserManageMenu(): boolean {
+    const user = this.getCurrentUser();
+    if (!user) return false;
+    const role = user.role?.toUpperCase();
+    if (role === 'ADMINISTRADOR' || user.username === 'admin') return true;
+    if (role === 'GERENTE' && user.allowedModules?.includes('menu')) return true;
+    return false;
+  }
+
+  public canUserManageUsers(): boolean {
+    const user = this.getCurrentUser();
+    if (!user) return false;
+    const role = user.role?.toUpperCase();
+    return role === 'ADMINISTRADOR' || user.username === 'admin';
+  }
+
+  public canUserManageCash(): boolean {
+    const user = this.getCurrentUser();
+    if (!user) return false;
+    const role = user.role?.toUpperCase();
+    if (role === 'ADMINISTRADOR' || user.username === 'admin' || role === 'GERENTE') return true;
+    if (role === 'CAIXA') return true;
+    return Boolean(user.allowedModules && user.allowedModules.includes('caixa'));
+  }
+
+  public canUserUpdateOrderStatus(user: User | null, targetStatus: OrderStatus): boolean {
+    if (!user) return false;
+    const role = user.role?.toUpperCase();
+    if (role === 'ADMINISTRADOR' || user.username === 'admin' || role === 'GERENTE') return true;
+    if (role === 'COZINHA') {
+      return targetStatus === 'EM_PREPARO' || targetStatus === 'PRONTO';
+    }
+    if (role === 'ENTREGADOR') {
+      return targetStatus === 'EM_ROTA' || targetStatus === 'ENTREGUE';
+    }
+    if (role === 'ATENDENTE' || role === 'CAIXA') {
+      return true;
+    }
+    return true;
   }
 
   /**
@@ -410,6 +455,13 @@ class StoreService {
       // Ensure catalog and store config exist in Firestore
       this.ensureInitialDataSeededToFirestore().catch(() => {});
 
+      const currentLocalUser = this.getCurrentUser();
+      const role = currentLocalUser?.role?.toUpperCase();
+      const allowedModules = currentLocalUser?.allowedModules || [];
+
+      const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA' || allowedModules.includes('caixa');
+      const canAccessUsers = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('usuarios');
+
       // 1. Synchronize All Orders in Real Time (Staff only: Kitchen KDS, POS Balcão, Entregadores, Admin)
       const unsubOrders = onSnapshot(
         collection(db, 'orders'),
@@ -455,72 +507,76 @@ class StoreService {
       );
       this.staffUnsubscribers.push(unsubOrders);
 
-      // 2. Synchronize Cash Register Shifts in Real Time (Staff only)
-      const unsubShifts = onSnapshot(
-        collection(db, 'cash_shifts'),
-        (snapshot) => {
-          const shifts: CashRegisterShift[] = [];
-          snapshot.forEach((docSnap) => {
-            shifts.push(docSnap.data() as CashRegisterShift);
-          });
-
-          // Detect active open shift
-          const openShift = shifts.find((s) => s.status === 'ABERTO') || null;
-          if (openShift) {
-            localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
-          } else {
-            localStorage.removeItem('gf_current_cash_shift');
-          }
-
-          // Detect closed shift history
-          const closedShifts = shifts
-            .filter((s) => s.status === 'FECHADO')
-            .sort((a, b) => new Date(b.closedAt || b.openedAt).getTime() - new Date(a.closedAt || a.openedAt).getTime());
-          if (closedShifts.length > 0) {
-            localStorage.setItem('gf_cash_shifts_history', JSON.stringify(closedShifts));
-          }
-
-          this.notify('CASH_SHIFT_UPDATED', openShift);
-        },
-        (error) => {
-          console.warn('[Firestore Staff Sync] Cash shift notice:', error.message);
-          if (error.code === 'permission-denied') {
-            this.stopStaffFirestoreSync();
-          }
-        }
-      );
-      this.staffUnsubscribers.push(unsubShifts);
-
-      // 3. Synchronize Staff Users in Real Time (Staff only)
-      const unsubUsers = onSnapshot(
-        collection(db, 'users'),
-        (snapshot) => {
-          if (!snapshot.empty) {
-            const remoteUsers: User[] = [];
+      // 2. Synchronize Cash Register Shifts in Real Time (Restricted to roles authorized for cash)
+      if (canAccessCash) {
+        const unsubShifts = onSnapshot(
+          collection(db, 'cash_shifts'),
+          (snapshot) => {
+            const shifts: CashRegisterShift[] = [];
             snapshot.forEach((docSnap) => {
-              remoteUsers.push(docSnap.data() as User);
+              shifts.push(docSnap.data() as CashRegisterShift);
             });
 
-            const localUsers = this.getUsers();
-            const merged = [...remoteUsers];
-            for (const lu of localUsers) {
-              if (!merged.some((ru) => ru.id === lu.id || ru.username.toLowerCase() === lu.username.toLowerCase())) {
-                merged.push(lu);
-              }
+            // Detect active open shift
+            const openShift = shifts.find((s) => s.status === 'ABERTO') || null;
+            if (openShift) {
+              localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
+            } else {
+              localStorage.removeItem('gf_current_cash_shift');
             }
 
-            localStorage.setItem('gf_users', JSON.stringify(merged));
-            this.notify('USERS_UPDATED', { count: merged.length });
+            // Detect closed shift history
+            const closedShifts = shifts
+              .filter((s) => s.status === 'FECHADO')
+              .sort((a, b) => new Date(b.closedAt || b.openedAt).getTime() - new Date(a.closedAt || a.openedAt).getTime());
+            if (closedShifts.length > 0) {
+              localStorage.setItem('gf_cash_shifts_history', JSON.stringify(closedShifts));
+            }
+
+            this.notify('CASH_SHIFT_UPDATED', openShift);
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Cash shift notice:', error.message);
+            if (error.code === 'permission-denied') {
+              this.stopStaffFirestoreSync();
+            }
           }
-        },
-        (error) => {
-          console.warn('[Firestore Staff Sync] Users listener notice:', error.message);
-          if (error.code === 'permission-denied') {
-            this.stopStaffFirestoreSync();
+        );
+        this.staffUnsubscribers.push(unsubShifts);
+      }
+
+      // 3. Synchronize Staff Users in Real Time (Restricted to Administrator & Management)
+      if (canAccessUsers) {
+        const unsubUsers = onSnapshot(
+          collection(db, 'users'),
+          (snapshot) => {
+            if (!snapshot.empty) {
+              const remoteUsers: User[] = [];
+              snapshot.forEach((docSnap) => {
+                remoteUsers.push(docSnap.data() as User);
+              });
+
+              const localUsers = this.getUsers();
+              const merged = [...remoteUsers];
+              for (const lu of localUsers) {
+                if (!merged.some((ru) => ru.id === lu.id || ru.username.toLowerCase() === lu.username.toLowerCase())) {
+                  merged.push(lu);
+                }
+              }
+
+              localStorage.setItem('gf_users', JSON.stringify(merged));
+              this.notify('USERS_UPDATED', { count: merged.length });
+            }
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Users listener notice:', error.message);
+            if (error.code === 'permission-denied') {
+              this.stopStaffFirestoreSync();
+            }
           }
-        }
-      );
-      this.staffUnsubscribers.push(unsubUsers);
+        );
+        this.staffUnsubscribers.push(unsubUsers);
+      }
 
     } catch (err) {
       console.warn('[Firestore Staff Sync Setup Error]:', err);
@@ -740,6 +796,11 @@ class StoreService {
   }
 
   public saveMenuItem(item: MenuItem): void {
+    if (!this.canUserManageMenu()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para gerenciar o cardápio.');
+      return;
+    }
+
     const items = this.getMenuItems();
     const index = items.findIndex((i) => i.id === item.id);
     if (index >= 0) {
@@ -759,6 +820,11 @@ class StoreService {
   }
 
   public deleteMenuItem(id: string): void {
+    if (!this.canUserManageMenu()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para excluir itens do cardápio.');
+      return;
+    }
+
     const items = this.getMenuItems().filter((i) => i.id !== id);
     localStorage.setItem('gf_menu_items', JSON.stringify(items));
     this.notify('MENU_UPDATED', { id });
@@ -1104,6 +1170,12 @@ class StoreService {
   }
 
   public updateOrderStatus(orderId: string, newStatus: OrderStatus, author: string, notes?: string): Order | null {
+    const currentUser = this.getCurrentUser();
+    if (currentUser && !this.canUserUpdateOrderStatus(currentUser, newStatus)) {
+      console.warn(`[Security Guard] Usuário @${currentUser.username} (${currentUser.role}) não possui permissão para avançar pedido para ${newStatus}.`);
+      return null;
+    }
+
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
     if (!order) return null;
@@ -1329,7 +1401,12 @@ class StoreService {
     }
   }
 
-  public openCashRegister(initialBalance: number, openedBy: string): CashRegisterShift {
+  public openCashRegister(initialBalance: number, openedBy: string): CashRegisterShift | null {
+    if (!this.canUserManageCash()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para abrir o caixa.');
+      return null;
+    }
+
     const newShift: CashRegisterShift = {
       id: `shift-${Date.now()}`,
       openedAt: new Date().toISOString(),
@@ -1343,6 +1420,11 @@ class StoreService {
   }
 
   public closeCashRegister(countedCash: number, closedBy: string, notes?: string): CashRegisterShift | null {
+    if (!this.canUserManageCash()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para fechar o caixa.');
+      return null;
+    }
+
     const shift = this.getCurrentCashShift();
     if (!shift || shift.status !== 'ABERTO') return null;
 
@@ -1393,6 +1475,11 @@ class StoreService {
     paymentMethod: PaymentMethod = 'DINHEIRO',
     employeeName?: string
   ): CashMovement | null {
+    if (!this.canUserManageCash()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para movimentações de caixa.');
+      return null;
+    }
+
     const shift = this.getCurrentCashShift();
     if (!shift || shift.status !== 'ABERTO') return null;
 
@@ -1413,6 +1500,11 @@ class StoreService {
   }
 
   public deleteCashMovement(movementId: string): boolean {
+    if (!this.canUserManageCash()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para excluir movimentações do caixa.');
+      return false;
+    }
+
     const shift = this.getCurrentCashShift();
     if (!shift || shift.status !== 'ABERTO') return false;
 
@@ -1475,10 +1567,14 @@ class StoreService {
   }
 
   public setCurrentUser(user: User | null): void {
-    if (user) {
-      localStorage.setItem('gf_current_user', JSON.stringify(user));
-    } else {
-      localStorage.removeItem('gf_current_user');
+    try {
+      if (user) {
+        localStorage.setItem('gf_current_user', JSON.stringify(user));
+      } else {
+        localStorage.removeItem('gf_current_user');
+      }
+    } catch {
+      // Fallback
     }
     this.notify('AUTH_CHANGED', user);
   }
