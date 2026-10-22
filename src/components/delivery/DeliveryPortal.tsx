@@ -151,9 +151,9 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
   };
 
   // Status transitions
-  const handleStartDelivery = () => {
+  const handleStartDelivery = async () => {
     if (!activeOrder) return;
-    const updated = store.updateOrderStatus(
+    const updated = await store.updateOrderStatusAsync(
       activeOrder.id,
       'EM_ROTA',
       `Entregador ${driverName}`,
@@ -170,9 +170,9 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
     }
   };
 
-  const handleCompleteDelivery = () => {
+  const handleCompleteDelivery = async () => {
     if (!activeOrder) return;
-    const updated = store.updateOrderStatus(
+    const updated = await store.updateOrderStatusAsync(
       activeOrder.id,
       'ENTREGUE',
       `Entregador ${driverName}`,

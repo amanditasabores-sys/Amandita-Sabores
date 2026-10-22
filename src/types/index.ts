@@ -158,6 +158,7 @@ export interface Order {
   cancelledBy?: string;
   movements: OrderMovementLog[];
   trackingCode?: string; // Código de alta entropia para rastreamento seguro público
+  _cloudSyncStatus?: 'SYNCED' | 'PENDING' | 'ERROR';
 }
 
 export interface PublicOrderTracking {

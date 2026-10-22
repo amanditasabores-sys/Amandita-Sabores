@@ -176,6 +176,16 @@ export default function App() {
     };
   }, []);
 
+  // Ensure real-time Firestore synchronization whenever staff is active or viewing staff screens
+  useEffect(() => {
+    const isStaffView = ['admin', 'atendente', 'producao', 'caixa', 'entregador'].includes(currentView);
+    if (currentUser && isStaffView) {
+      store.ensureFirebaseAuthForStaff().then(() => {
+        store.initStaffFirestoreSync();
+      }).catch(() => {});
+    }
+  }, [currentUser, currentView]);
+
   const navigateTo = (
     view: AppView, 
     orderId?: string,

@@ -1,0 +1,6 @@
+{
+  "summary":  "Plano detalhado para correção da sincronização em tempo real entre celular e computador no sistema Amandita Sabores, abordando fluxo de dados no Firestore, tratamento de erros de permissão, fila resiliente de sincronização e preservação de segurança e identidade visual.",
+  "updatedAt":  "2026-10-22T09:37:18.464248090Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

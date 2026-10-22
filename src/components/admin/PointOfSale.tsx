@@ -256,7 +256,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   };
 
   // Submit sale with idempotency lock
-  const handleFinalizeSale = () => {
+  const handleFinalizeSale = async () => {
     if (cart.length === 0 || isSubmitting) return;
 
     if (paymentMethod === 'DINHEIRO') {
@@ -295,7 +295,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         };
       }
 
-      const newOrder = store.createOrder({
+      const syncResult = await store.createOrderAsync({
         fulfillmentType,
         customer: {
           name: customerName.trim() || (fulfillmentType === 'RETIRADA' ? 'Cliente Balcão' : 'Cliente Entrega'),
@@ -314,6 +314,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         status: 'EM_PREPARO', // Direct to kitchen
         estimatedDeliveryMinutes: fulfillmentType === 'RETIRADA' ? 15 : config.avgDeliveryTimeMinutes,
       });
+      const newOrder = syncResult.order;
 
       // Record automatically into active cash register shift if open
       const shift = store.getCurrentCashShift();

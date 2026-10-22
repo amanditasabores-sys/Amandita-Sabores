@@ -28,7 +28,9 @@ import {
   Store as StoreIcon,
   AlertCircle,
   Building2,
-  Lock
+  Lock,
+  UploadCloud,
+  Wifi
 } from 'lucide-react';
 import { AmanditaLogo } from '../common/AmanditaLogo';
 
@@ -46,14 +48,26 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [config, setConfig] = useState(() => store.getRestaurantConfig());
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
 
+  // Placed order success state
+  const [createdOrder, setCreatedOrder] = useState<Order | null>(null);
+  const [createdOrderId, setCreatedOrderId] = useState<string | null>(null);
+  const [createdOrderNumber, setCreatedOrderNumber] = useState<string>('');
+  const [whatsappShareUrl, setWhatsappShareUrl] = useState<string>('');
+  const [pixQrDataUrl, setPixQrDataUrl] = useState<string>('');
+  const [copiedPixCode, setCopiedPixCode] = useState(false);
+
   useEffect(() => {
     const handleUpdate = () => {
       setMenuItems(store.getMenuItems());
       setConfig(store.getRestaurantConfig());
+      if (createdOrderId) {
+        const fresh = store.getOrderById(createdOrderId);
+        if (fresh) setCreatedOrder(fresh);
+      }
     };
     window.addEventListener('gestaofood_state_changed', handleUpdate);
     return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
-  }, []);
+  }, [createdOrderId]);
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState('');
@@ -91,14 +105,6 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [orderNotes, setOrderNotes] = useState('');
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('PIX');
   const [paymentChangeFor, setPaymentChangeFor] = useState('');
-  
-  // Placed order success state
-  const [createdOrder, setCreatedOrder] = useState<Order | null>(null);
-  const [createdOrderId, setCreatedOrderId] = useState<string | null>(null);
-  const [createdOrderNumber, setCreatedOrderNumber] = useState<string>('');
-  const [whatsappShareUrl, setWhatsappShareUrl] = useState<string>('');
-  const [pixQrDataUrl, setPixQrDataUrl] = useState<string>('');
-  const [copiedPixCode, setCopiedPixCode] = useState(false);
 
   // Categories list
   const categories = useMemo(() => {
@@ -230,7 +236,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       };
     }
 
-    const order = store.createOrder({
+    const syncRes = await store.createOrderAsync({
       estimatedDeliveryMinutes: isRetirada ? config.avgPrepTimeMinutes : config.avgPrepTimeMinutes + config.avgDeliveryTimeMinutes,
       fulfillmentType,
       customer: {
@@ -249,6 +255,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       paymentStatus: paymentMethod === 'PIX' ? 'PAGO' : 'PENDENTE',
       status: 'NOVO',
     });
+    const order = syncRes.order;
 
     // If order has PIX code, generate QR Code data URL
     if (order.paymentMethod === 'PIX' && order.pixCode) {
@@ -1041,6 +1048,26 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   ? 'Pedido registrado para retirada no balcão do restaurante.'
                   : 'Pedido registrado e enviado para a nossa cozinha!'}
               </p>
+
+              {/* Status da transmissão para a nuvem em tempo real */}
+              <div className="mt-2.5 flex items-center justify-center">
+                {createdOrder?._cloudSyncStatus === 'SYNCED' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Confirmado e Sincronizado na Nuvem</span>
+                  </span>
+                ) : createdOrder?._cloudSyncStatus === 'PENDING' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                    <UploadCloud className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
+                    <span>Gravado no Aparelho · Transmitindo à Cozinha...</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-300">
+                    <Wifi className="w-3.5 h-3.5 text-slate-500" />
+                    <span>Salvo em Cache Seguro (Offline)</span>
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* SE O PAGAMENTO FOR PIX: EXIBE QR CODE COM VALOR EXATO */}

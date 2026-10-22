@@ -16,9 +16,10 @@ import {
   Phone, 
   ExternalLink, 
   QrCode, 
-  X,
   AlertCircle,
-  Trash2
+  Trash2,
+  UploadCloud,
+  X
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
 
@@ -81,8 +82,8 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     },
   ];
 
-  const handleAdvanceStatus = (order: Order, nextStatus: OrderStatus) => {
-    store.updateOrderStatus(order.id, nextStatus, 'Painel Administrativo', `Avançado para ${nextStatus}`);
+  const handleAdvanceStatus = async (order: Order, nextStatus: OrderStatus) => {
+    await store.updateOrderStatusAsync(order.id, nextStatus, 'Painel Administrativo', `Avançado para ${nextStatus}`);
     onOrderUpdated();
     if (selectedOrderForModal && selectedOrderForModal.id === order.id) {
       setSelectedOrderForModal(store.getOrderById(order.id) || null);
@@ -140,9 +141,24 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                         onClick={() => setSelectedOrderForModal(order)}
                       >
                         <div className="flex items-center justify-between mb-1.5">
-                          <span className="font-extrabold text-sm text-slate-900 font-mono">
-                            {order.orderNumber}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-extrabold text-sm text-slate-900 font-mono">
+                              {order.orderNumber}
+                            </span>
+                            {order._cloudSyncStatus === 'PENDING' ? (
+                              <span title="Salvo no dispositivo · Transmitindo para a Nuvem Firestore..." className="inline-flex text-amber-500">
+                                <UploadCloud className="w-3.5 h-3.5 animate-pulse" />
+                              </span>
+                            ) : order._cloudSyncStatus === 'ERROR' ? (
+                              <span title="Salvo em contingência local" className="inline-flex text-rose-500">
+                                <AlertCircle className="w-3.5 h-3.5" />
+                              </span>
+                            ) : (
+                              <span title="Sincronizado na Nuvem (Cloud Firestore)" className="inline-flex text-emerald-600">
+                                <CheckCircle className="w-3 h-3 opacity-80" />
+                              </span>
+                            )}
+                          </div>
                           <span className="text-[11px] text-slate-400 flex items-center gap-1">
                             <Clock className="w-3 h-3" />
                             {elapsedMin}m atrás

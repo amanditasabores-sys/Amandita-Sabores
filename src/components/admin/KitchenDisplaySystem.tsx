@@ -29,13 +29,13 @@ export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orde
     setCheckedItems((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const handleStartPrep = (order: Order) => {
-    store.updateOrderStatus(order.id, 'EM_PREPARO', 'Cozinha / KDS', 'Iniciado preparo na cozinha');
+  const handleStartPrep = async (order: Order) => {
+    await store.updateOrderStatusAsync(order.id, 'EM_PREPARO', 'Cozinha / KDS', 'Iniciado preparo na cozinha');
     onOrderUpdated();
   };
 
-  const handleFinishPrep = (order: Order) => {
-    store.updateOrderStatus(order.id, 'PRONTO', 'Cozinha / KDS', 'Finalizado preparo dos pratos, pronto para embalar e entregar');
+  const handleFinishPrep = async (order: Order) => {
+    await store.updateOrderStatusAsync(order.id, 'PRONTO', 'Cozinha / KDS', 'Finalizado preparo dos pratos, pronto para embalar e entregar');
     onOrderUpdated();
   };
 

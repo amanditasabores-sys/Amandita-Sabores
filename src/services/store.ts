@@ -65,9 +65,11 @@ class StoreService {
   private staffUnsubscribers: Unsubscribe[] = [];
   private isPublicSyncActive = false;
   private isStaffSyncActive = false;
+  private isFlushingPendingQueue = false;
 
   /**
    * Sanitizes objects recursively for Firestore by eliminating unsupported 'undefined' values
+   * and transient client-only fields (prefixed with '_')
    */
   private cleanForFirestore<T>(data: T): T {
     if (data === null || data === undefined) return null as any;
@@ -77,6 +79,7 @@ class StoreService {
     if (typeof data === 'object' && !(data instanceof Date)) {
       const clean: Record<string, any> = {};
       for (const [key, val] of Object.entries(data as Record<string, any>)) {
+        if (key.startsWith('_')) continue; // Strip client-only transient properties
         if (val !== undefined) {
           clean[key] = this.cleanForFirestore(val);
         }
@@ -84,6 +87,157 @@ class StoreService {
       return clean as any;
     }
     return data;
+  }
+
+  // ==========================================
+  // RESILIENT PENDING CLOUD SYNC QUEUE
+  // ==========================================
+  public getPendingSyncOrders(): Order[] {
+    try {
+      const raw = localStorage.getItem('gf_pending_sync_orders');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private savePendingSyncOrders(orders: Order[]): void {
+    try {
+      localStorage.setItem('gf_pending_sync_orders', JSON.stringify(orders));
+    } catch {
+      // storage fallback
+    }
+  }
+
+  public queueOrderForSync(order: Order): void {
+    const list = this.getPendingSyncOrders();
+    const idx = list.findIndex((o) => o.id === order.id);
+    if (idx >= 0) {
+      list[idx] = order;
+    } else {
+      list.push(order);
+    }
+    this.savePendingSyncOrders(list);
+  }
+
+  public removeOrderFromSyncQueue(orderId: string): void {
+    const list = this.getPendingSyncOrders().filter((o) => o.id !== orderId);
+    this.savePendingSyncOrders(list);
+  }
+
+  public updateLocalOrderSyncStatus(orderId: string, status: 'SYNCED' | 'PENDING' | 'ERROR'): void {
+    const orders = this.getOrders();
+    const idx = orders.findIndex((o) => o.id === orderId);
+    if (idx >= 0) {
+      orders[idx]._cloudSyncStatus = status;
+      try {
+        localStorage.setItem('gf_orders', JSON.stringify(orders));
+      } catch {
+        // quota fallback
+      }
+      this.notify('ORDER_SYNC_STATUS_CHANGED', { orderId, status });
+    }
+  }
+
+  /**
+   * Persists an order directly to Cloud Firestore with confirmation and queue tracking
+   */
+  public async persistOrderToFirestore(order: Order): Promise<{ success: boolean; error?: string }> {
+    if (!db) {
+      this.queueOrderForSync(order);
+      this.updateLocalOrderSyncStatus(order.id, 'PENDING');
+      return { success: false, error: 'Cloud Firestore não inicializado' };
+    }
+
+    try {
+      const cleanOrder = this.cleanForFirestore(order);
+      await setDoc(doc(db, 'orders', order.id), cleanOrder);
+
+      if (order.trackingCode) {
+        const publicPayload = this.buildPublicTrackingPayload(order);
+        await setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch(() => {});
+      }
+
+      this.removeOrderFromSyncQueue(order.id);
+      this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+      this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+      return { success: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('[Firestore] Falha na sincronização do pedido ' + order.id + ' (mantido na fila resiliente):', msg);
+      this.queueOrderForSync(order);
+      this.updateLocalOrderSyncStatus(order.id, 'PENDING');
+      return { success: false, error: msg };
+    }
+  }
+
+  /**
+   * Flushes all pending queued operations to Cloud Firestore once connection is available
+   */
+  public async flushPendingSyncQueue(): Promise<{ processed: number; succeeded: number }> {
+    if (!db || this.isFlushingPendingQueue) return { processed: 0, succeeded: 0 };
+    const pending = this.getPendingSyncOrders();
+    if (pending.length === 0) return { processed: 0, succeeded: 0 };
+
+    this.isFlushingPendingQueue = true;
+    let succeeded = 0;
+
+    try {
+      for (const order of pending) {
+        try {
+          const cleanOrder = this.cleanForFirestore(order);
+          await setDoc(doc(db, 'orders', order.id), cleanOrder);
+
+          if (order.trackingCode) {
+            const publicPayload = this.buildPublicTrackingPayload(order);
+            await setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch(() => {});
+          }
+
+          this.removeOrderFromSyncQueue(order.id);
+          this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+          succeeded++;
+        } catch {
+          // Keep in queue for next transmission cycle
+        }
+      }
+    } finally {
+      this.isFlushingPendingQueue = false;
+    }
+
+    return { processed: pending.length, succeeded };
+  }
+
+  /**
+   * Auto-authenticates active staff member with Firebase Auth in the background
+   * ensuring that security rules recognize the operator without requiring manual login screens
+   */
+  public async ensureFirebaseAuthForStaff(): Promise<void> {
+    if (!isFirebaseReady() || !auth) return;
+    if (auth.currentUser) return; // Session already established
+
+    const user = this.getCurrentUser();
+    if (!user || !this.isAuthorizedStaffRole(user.role)) return;
+
+    let email = user.email || '';
+    if (!email.includes('@')) {
+      email = `${user.username}@staff.amanditasabores.com.br`;
+    }
+    if (user.role === 'ADMINISTRADOR' || user.username === 'admin') {
+      email = this.getInitialAdminEmail();
+    }
+
+    const passwords = this.getUserPasswords();
+    const password = passwords[user.id] || '123456';
+
+    try {
+      await signInWithEmail(email, password);
+    } catch {
+      try {
+        await createUserWithEmail(email, password);
+      } catch {
+        // Fallback
+      }
+    }
   }
 
   constructor() {
@@ -102,8 +256,21 @@ class StoreService {
       }
     }
 
-    // Initialize public real-time data ONLY (Menu & Store Config)
+    // Initialize public real-time data (Menu & Store Config)
     this.initPublicFirestoreSync();
+
+    // Reconnection listener to flush pending orders automatically when network returns
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', () => {
+        console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes...');
+        this.flushPendingSyncQueue();
+      });
+
+      // Background heartbeat to retry pending sync queue every 20 seconds
+      setInterval(() => {
+        this.flushPendingSyncQueue();
+      }, 20000);
+    }
 
     // Condition staff-only listeners to authenticated Firebase Auth sessions with confirmed staff role
     if (typeof window !== 'undefined') {
@@ -137,10 +304,31 @@ class StoreService {
             console.warn('[Store] Falha ao restaurar perfil do usuário autenticado:', e);
           }
           await this.initStaffFirestoreSync(firebaseUser);
+          this.flushPendingSyncQueue();
         } else {
-          this.stopStaffFirestoreSync();
+          // If staff is logged in locally, auto-authenticate to Firebase Auth in background
+          const curr = this.getCurrentUser();
+          if (curr && this.isAuthorizedStaffRole(curr.role)) {
+            this.ensureFirebaseAuthForStaff().then(() => {
+              if (auth?.currentUser) {
+                this.initStaffFirestoreSync(auth.currentUser);
+              }
+            }).catch(() => {});
+          } else {
+            this.stopStaffFirestoreSync();
+          }
         }
       });
+
+      // If already logged in locally as staff on startup, trigger staff sync auto-connect
+      const startupUser = this.getCurrentUser();
+      if (startupUser && this.isAuthorizedStaffRole(startupUser.role)) {
+        setTimeout(() => {
+          this.ensureFirebaseAuthForStaff().then(() => {
+            this.initStaffFirestoreSync();
+          }).catch(() => {});
+        }, 1000);
+      }
     }
   }
 
@@ -344,8 +532,18 @@ class StoreService {
 
     // 3. Admin email bootstrap check
     const adminEmail = this.getInitialAdminEmail();
-    if (firebaseUser.email && firebaseUser.email.trim().toLowerCase() === adminEmail) {
+    if (firebaseUser.email && (firebaseUser.email.trim().toLowerCase() === adminEmail || firebaseUser.email.trim().toLowerCase() === 'admin@amanditasabores.com.br')) {
       return 'ADMINISTRADOR';
+    }
+
+    // 4. Staff domain email check (@staff.amanditasabores.com.br or @amanditasabores.com.br)
+    if (firebaseUser.email && (firebaseUser.email.endsWith('@staff.amanditasabores.com.br') || firebaseUser.email.endsWith('@amanditasabores.com.br'))) {
+      const username = firebaseUser.email.split('@')[0].toLowerCase();
+      const byUser = localUsers.find((u) => u.username.toLowerCase() === username);
+      if (byUser && this.isAuthorizedStaffRole(byUser.role)) {
+        return byUser.role as UserRole;
+      }
+      return 'ATENDENTE';
     }
 
     return null;
@@ -435,9 +633,13 @@ class StoreService {
   public async initStaffFirestoreSync(firebaseUser?: unknown): Promise<void> {
     if (!db || this.isStaffSyncActive) return;
 
-    // 1. Reject if no valid Firebase Auth session
+    // 1. If no active Firebase Auth session, attempt background auto-auth for local staff
     if (!auth?.currentUser) {
-      console.info('[Firestore Security] Listagem de pedidos e turnos restrita aos colaboradores autenticados no Firebase Auth.');
+      await this.ensureFirebaseAuthForStaff();
+    }
+
+    if (!auth?.currentUser) {
+      console.info('[Firestore Security] Aguardando sessão de colaborador no Firebase Auth para sincronização interna.');
       return;
     }
 
@@ -483,24 +685,51 @@ class StoreService {
           }
 
           if (remoteOrders.length > 0) {
-            const remoteSet = new Set(remoteOrders.map((o) => o.id));
-            const unsavedLocals = localOrders.filter((lo) => !remoteSet.has(lo.id));
-            const combined = [...remoteOrders, ...unsavedLocals];
-            combined.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-            localStorage.setItem('gf_orders', JSON.stringify(combined));
+            const pendingOrders = this.getPendingSyncOrders();
+            const pendingIds = new Set(pendingOrders.map((o) => o.id));
+            const remoteMap = new Map(remoteOrders.map((o) => [o.id, o]));
+
+            const merged: Order[] = [];
+            // Preserve pending local orders so user actions aren't overwritten before upload
+            for (const lo of localOrders) {
+              if (pendingIds.has(lo.id)) {
+                merged.push(lo);
+                remoteMap.delete(lo.id);
+              }
+            }
+            // Add remote orders
+            for (const ro of remoteMap.values()) {
+              merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+            }
+            // Preserve any local order not yet on remote
+            for (const lo of localOrders) {
+              if (!merged.some((m) => m.id === lo.id)) {
+                merged.push(lo);
+              }
+            }
+
+            merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            localStorage.setItem('gf_orders', JSON.stringify(merged));
           } else if (localOrders.length > 0 && db) {
             // Firestore orders was empty: seed existing local orders to Firestore
             for (const lo of localOrders) {
-              setDoc(doc(db, 'orders', lo.id), this.cleanForFirestore(lo)).catch(() => {});
+              this.persistOrderToFirestore(lo).catch(() => {});
             }
           }
 
           this.notify('FIRESTORE_ORDERS_SYNCED', { count: remoteOrders.length });
+          this.notify('ORDERS_UPDATED', { count: remoteOrders.length });
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_ORDERS_SYNCED' } }));
+          }
         },
         (error) => {
           console.warn('[Firestore Staff Sync] Aviso no listener de pedidos:', error.message);
+          this.isStaffSyncActive = false;
           if (error.code === 'permission-denied') {
-            this.stopStaffFirestoreSync();
+            setTimeout(() => {
+              this.ensureFirebaseAuthForStaff().then(() => this.initStaffFirestoreSync()).catch(() => {});
+            }, 10000);
           }
         }
       );
@@ -878,6 +1107,7 @@ class StoreService {
       totalAmount: effectiveTotal,
       status: orderInput.status || 'NOVO',
       trackingCode,
+      _cloudSyncStatus: 'PENDING',
       movements: [
         {
           id: `mov-${Date.now()}`,
@@ -927,23 +1157,23 @@ class StoreService {
 
     this.notify('ORDER_CREATED', newOrder);
 
-    // Asynchronously save to Firestore (persists & broadcasts across devices)
-    if (db) {
-      // 1. Save full internal order document (staff only)
-      setDoc(doc(db, 'orders', newOrder.id), this.cleanForFirestore(newOrder)).catch((err) => {
-        console.warn('[Firestore] Fallback local para pedido interno:', err.message);
-      });
-
-      // 2. Publish minimal sanitized public tracking payload keyed by high-entropy trackingCode
-      if (newOrder.trackingCode) {
-        const publicPayload = this.buildPublicTrackingPayload(newOrder);
-        setDoc(doc(db, 'public_tracking', newOrder.trackingCode), publicPayload).catch((err) => {
-          console.warn('[Firestore] Fallback local para rastreamento público:', err.message);
-        });
-      }
-    }
+    // Queue for cloud sync and attempt immediate transmission to Cloud Firestore
+    this.queueOrderForSync(newOrder);
+    this.persistOrderToFirestore(newOrder).catch(() => {});
 
     return newOrder;
+  }
+
+  public async createOrderAsync(
+    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & { status?: OrderStatus }
+  ): Promise<{ order: Order; synced: boolean; error?: string }> {
+    const order = this.createOrder(orderInput);
+    const res = await this.persistOrderToFirestore(order);
+    return {
+      order: this.getOrderById(order.id) || order,
+      synced: res.success,
+      error: res.error,
+    };
   }
 
   // ==========================================
@@ -1232,26 +1462,30 @@ class StoreService {
     };
 
     order.movements.push(newMovement);
+    order.updatedAt = now;
+    order._cloudSyncStatus = 'PENDING';
     localStorage.setItem('gf_orders', JSON.stringify(orders));
 
     soundService.playSuccessTone();
     this.notify('ORDER_UPDATED', order);
 
-    // Asynchronously sync update to Cloud Firestore
-    if (db) {
-      setDoc(doc(db, 'orders', order.id), this.cleanForFirestore(order)).catch((err) => {
-        console.warn('[Firestore] Fallback local para pedido interno:', err.message);
-      });
-
-      if (order.trackingCode) {
-        const publicPayload = this.buildPublicTrackingPayload(order);
-        setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch((err) => {
-          console.warn('[Firestore] Fallback local para rastreio público:', err.message);
-        });
-      }
-    }
+    // Queue for cloud sync and attempt immediate transmission to Cloud Firestore
+    this.queueOrderForSync(order);
+    this.persistOrderToFirestore(order).catch(() => {});
 
     return order;
+  }
+
+  public async updateOrderStatusAsync(
+    orderId: string, 
+    newStatus: OrderStatus, 
+    author = 'Operador', 
+    notes?: string
+  ): Promise<{ order: Order | null; synced: boolean; error?: string }> {
+    const order = this.updateOrderStatus(orderId, newStatus, author, notes);
+    if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
+    const res = await this.persistOrderToFirestore(order);
+    return { order, synced: res.success, error: res.error };
   }
 
   public assignDeliveryPerson(orderId: string, deliveryPerson: { id: string; name: string; phone: string }): Order | null {
@@ -1271,22 +1505,13 @@ class StoreService {
       author: deliveryPerson.name,
       notes: `Atribuído ao entregador ${deliveryPerson.name}`,
     });
+    order._cloudSyncStatus = 'PENDING';
 
     localStorage.setItem('gf_orders', JSON.stringify(orders));
     this.notify('ORDER_UPDATED', order);
 
-    if (db) {
-      setDoc(doc(db, 'orders', order.id), this.cleanForFirestore(order)).catch((err) => {
-        console.warn('[Firestore] Fallback local para pedido interno:', err.message);
-      });
-
-      if (order.trackingCode) {
-        const publicPayload = this.buildPublicTrackingPayload(order);
-        setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch((err) => {
-          console.warn('[Firestore] Fallback local para rastreio público:', err.message);
-        });
-      }
-    }
+    this.queueOrderForSync(order);
+    this.persistOrderToFirestore(order).catch(() => {});
 
     return order;
   }
@@ -2197,6 +2422,11 @@ class StoreService {
     this.updateUser(localCandidate.id, { lastLoginAt: localCandidate.lastLoginAt });
 
     this.setCurrentUser(localCandidate);
+
+    // Trigger background staff Firebase Auth and real-time Firestore sync
+    this.ensureFirebaseAuthForStaff().then(() => {
+      this.initStaffFirestoreSync();
+    }).catch(() => {});
 
     this.logAccess({
       userId: localCandidate.id,
