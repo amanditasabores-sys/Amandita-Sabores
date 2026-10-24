@@ -273,12 +273,12 @@ export async function testFirestoreConnection(): Promise<{ success: boolean; mes
       };
     }
 
-    // Permission-denied is direct evidence from Google's Firestore server that the project, database and API key are valid!
+    // Permission-denied means Google reached the database, but rules in Firebase Console reject operations
     if (code === 'permission-denied' || msg.includes('Missing or insufficient permissions') || msg.includes('permission-denied')) {
       return {
-        success: true,
-        message: 'Servidor Firestore alcançado com sucesso (amandita-sabores).',
-        details: 'A API Key e o projeto amandita-sabores foram validados pelos servidores do Google. As regras de segurança firestore.rules estão operando normalmente.'
+        success: false,
+        message: 'Acesso Rejeitado pelas Regras do Firebase (Permission Denied).',
+        details: 'O servidor do Google (amandita-sabores) foi alcançado com sucesso, mas as regras ativas no Console do Firebase (aba Rules) estão bloqueando as operações. Publique o conteúdo do arquivo firestore.rules no Console do Firebase para liberar a sincronização.'
       };
     }
 

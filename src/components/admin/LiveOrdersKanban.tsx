@@ -153,9 +153,13 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                               <span title="Salvo em contingência local" className="inline-flex text-rose-500">
                                 <AlertCircle className="w-3.5 h-3.5" />
                               </span>
-                            ) : (
+                            ) : order._cloudSyncStatus === 'SYNCED' ? (
                               <span title="Sincronizado na Nuvem (Cloud Firestore)" className="inline-flex text-emerald-600">
                                 <CheckCircle className="w-3 h-3 opacity-80" />
+                              </span>
+                            ) : (
+                              <span title="Salvo em armazenamento local deste dispositivo" className="inline-flex text-slate-400">
+                                <Clock className="w-3 h-3 opacity-50" />
                               </span>
                             )}
                           </div>

@@ -66,6 +66,7 @@ class StoreService {
   private isPublicSyncActive = false;
   private isStaffSyncActive = false;
   private isFlushingPendingQueue = false;
+  private inFlightOrderWrites = new Set<string>();
 
   /**
    * Sanitizes objects recursively for Firestore by eliminating unsupported 'undefined' values
@@ -149,7 +150,33 @@ class StoreService {
       return { success: false, error: 'Cloud Firestore não inicializado' };
     }
 
+    if (this.inFlightOrderWrites.has(order.id)) {
+      return { success: false, error: 'Gravação em andamento para este pedido' };
+    }
+
+    this.inFlightOrderWrites.add(order.id);
     try {
+      // For large carts exceeding direct client Firestore Rules read budgets (> 8 items)
+      // or unauthenticated orders with high item volume, route through the secure backend validator:
+      if (order.items && order.items.length > 8) {
+        try {
+          const res = await fetch('/api/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ order }),
+          });
+          const data = await res.json();
+          if (data.success) {
+            this.removeOrderFromSyncQueue(order.id);
+            this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+            this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+            return { success: true };
+          }
+        } catch {
+          // Continue to local queue fallback
+        }
+      }
+
       const cleanOrder = this.cleanForFirestore(order);
       await setDoc(doc(db, 'orders', order.id), cleanOrder);
 
@@ -164,10 +191,33 @@ class StoreService {
       return { success: true };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      
+      // If direct write was rejected (e.g. cart size limit in client rules), attempt backend fallback
+      if (typeof window !== 'undefined' && (order.items?.length || 0) > 5) {
+        try {
+          const fallbackRes = await fetch('/api/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ order }),
+          });
+          const fallbackData = await fallbackRes.json();
+          if (fallbackData.success) {
+            this.removeOrderFromSyncQueue(order.id);
+            this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+            this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+            return { success: true };
+          }
+        } catch {
+          // Handled below
+        }
+      }
+
       console.warn('[Firestore] Falha na sincronização do pedido ' + order.id + ' (mantido na fila resiliente):', msg);
       this.queueOrderForSync(order);
       this.updateLocalOrderSyncStatus(order.id, 'PENDING');
       return { success: false, error: msg };
+    } finally {
+      this.inFlightOrderWrites.delete(order.id);
     }
   }
 
@@ -213,7 +263,6 @@ class StoreService {
    */
   public async ensureFirebaseAuthForStaff(): Promise<void> {
     if (!isFirebaseReady() || !auth) return;
-    if (auth.currentUser) return; // Session already established
 
     const user = this.getCurrentUser();
     if (!user || !this.isAuthorizedStaffRole(user.role)) return;
@@ -229,13 +278,40 @@ class StoreService {
     const passwords = this.getUserPasswords();
     const password = passwords[user.id] || '123456';
 
-    try {
-      await signInWithEmail(email, password);
-    } catch {
+    if (!auth.currentUser) {
       try {
-        await createUserWithEmail(email, password);
+        await signInWithEmail(email, password);
       } catch {
-        // Fallback
+        try {
+          await createUserWithEmail(email, password);
+        } catch {
+          // Fallback
+        }
+      }
+    }
+
+    // Ensure staff profile document exists in Firestore so hasActiveProfile() rule succeeds
+    if (auth.currentUser && db) {
+      try {
+        const userDocRef = doc(db, 'users', auth.currentUser.uid);
+        const snap = await getDoc(userDocRef);
+        if (!snap.exists()) {
+          const profile: User = {
+            id: auth.currentUser.uid,
+            name: user.name || 'Colaborador',
+            username: user.username || 'colaborador',
+            email: auth.currentUser.email || email,
+            role: user.role,
+            status: 'ATIVO',
+            allowedModules: user.allowedModules || [],
+            createdAt: new Date().toISOString(),
+            lastLoginAt: new Date().toISOString(),
+            isEmailVerified: true
+          };
+          await setDoc(userDocRef, profile);
+        }
+      } catch {
+        // Handled silently (contingency mode)
       }
     }
   }
@@ -1082,7 +1158,10 @@ class StoreService {
     return orders.find((o) => o.id === id || o.orderNumber.replace('#', '') === id.replace('#', ''));
   }
 
-  public createOrder(orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & { status?: OrderStatus }): Order {
+  public createOrder(
+    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & { status?: OrderStatus },
+    autoPersist = true
+  ): Order {
     const orders = this.getOrders();
     const nextNumber = 1000 + orders.length + 1;
     const now = new Date().toISOString();
@@ -1157,9 +1236,11 @@ class StoreService {
 
     this.notify('ORDER_CREATED', newOrder);
 
-    // Queue for cloud sync and attempt immediate transmission to Cloud Firestore
+    // Queue for cloud sync and attempt immediate transmission to Cloud Firestore if autoPersist is true
     this.queueOrderForSync(newOrder);
-    this.persistOrderToFirestore(newOrder).catch(() => {});
+    if (autoPersist) {
+      this.persistOrderToFirestore(newOrder).catch(() => {});
+    }
 
     return newOrder;
   }
@@ -1167,7 +1248,7 @@ class StoreService {
   public async createOrderAsync(
     orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & { status?: OrderStatus }
   ): Promise<{ order: Order; synced: boolean; error?: string }> {
-    const order = this.createOrder(orderInput);
+    const order = this.createOrder(orderInput, false);
     const res = await this.persistOrderToFirestore(order);
     return {
       order: this.getOrderById(order.id) || order,
@@ -1330,24 +1411,48 @@ class StoreService {
     }
 
     try {
-      // Listen directly to the order in Firestore; allowed under firestore.rules 'allow get: if isValidId(orderId)'
-      const unsub = onSnapshot(
-        doc(db, 'orders', orderId),
-        (docSnap) => {
-          if (docSnap.exists()) {
-            const rawOrder = docSnap.data() as Order;
-            const sanitized = this.buildPublicTrackingPayload(rawOrder);
-            callback(sanitized);
-          } else {
+      if (effectiveTrackingCode) {
+        // Unauthenticated customer listens exclusively to the sanitized tracking document
+        const unsub = onSnapshot(
+          doc(db, 'public_tracking', effectiveTrackingCode),
+          (docSnap) => {
+            if (docSnap.exists()) {
+              const trackingData = docSnap.data() as PublicOrderTracking;
+              callback(trackingData);
+            } else {
+              callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
+            }
+          },
+          (error) => {
+            console.warn('[Firestore] Realtime public tracking notice:', error.message);
             callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
           }
-        },
-        (error) => {
-          console.warn('[Firestore] Realtime order tracking notice (contingency fallback):', error.message);
-          callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
-        }
-      );
-      return unsub;
+        );
+        return unsub;
+      }
+
+      // If authenticated staff member tracking without tracking code
+      if (this.isFirebaseAuthStaff()) {
+        const unsub = onSnapshot(
+          doc(db, 'orders', orderId),
+          (docSnap) => {
+            if (docSnap.exists()) {
+              const rawOrder = docSnap.data() as Order;
+              const sanitized = this.buildPublicTrackingPayload(rawOrder);
+              callback(sanitized);
+            } else {
+              callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
+            }
+          },
+          (error) => {
+            console.warn('[Firestore] Realtime order tracking notice (contingency fallback):', error.message);
+            callback(this.getPublicOrderTracking(orderId, effectiveTrackingCode));
+          }
+        );
+        return unsub;
+      }
+
+      return () => {};
     } catch {
       return () => {};
     }

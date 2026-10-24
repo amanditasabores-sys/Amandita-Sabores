@@ -1483,6 +1483,20 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               <p className="text-xs text-[#8C5E47]">
                 Valor: <strong className="text-[#721C24]">{formatCurrency(completedOrder.totalAmount)}</strong> ({getPaymentMethodLabel(completedOrder.paymentMethod)})
               </p>
+
+              <div className="mt-2.5 flex items-center justify-center">
+                {completedOrder._cloudSyncStatus === 'SYNCED' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Sincronizado no Cloud Firestore</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                    <Clock className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
+                    <span>Salvo no Caixa · Fila de Sincronização Ativa</span>
+                  </span>
+                )}
+              </div>
             </div>
 
             <p className="text-xs text-slate-600 bg-[#FAF7F2] p-3 rounded-xl border border-[#E8DFD5]">

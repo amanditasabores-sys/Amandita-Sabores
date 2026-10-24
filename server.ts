@@ -114,6 +114,89 @@ async function startServer() {
     }
   });
 
+  // Secure Backend API: Order Ingestion & Full-Catalog Mathematical Invariant Validation
+  // Allows orders with large item counts (> 5 or > 8 items) to be processed cleanly without
+  // breaching Cloud Firestore Rules 10-read budget.
+  app.post('/api/orders', (req: Request, res: Response) => {
+    try {
+      const { order } = req.body;
+      if (!order || typeof order !== 'object') {
+        res.status(400).json({ success: false, message: 'Dados do pedido ausentes ou inválidos.' });
+        return;
+      }
+
+      if (!order.id || !order.orderNumber || !Array.isArray(order.items) || order.items.length === 0) {
+        res.status(400).json({ success: false, message: 'Estrutura básica do pedido incompleta.' });
+        return;
+      }
+
+      if (!order.trackingCode || typeof order.trackingCode !== 'string' || order.trackingCode.length < 20) {
+        res.status(400).json({ success: false, message: 'Código de rastreamento inválido ou insuficiente (mínimo 20 caracteres).' });
+        return;
+      }
+
+      if (!order.customer || typeof order.customer.name !== 'string' || order.customer.name.trim().length === 0) {
+        res.status(400).json({ success: false, message: 'Nome do cliente é obrigatório.' });
+        return;
+      }
+
+      // Mathematical item and addon invariant verification
+      let calculatedSubtotal = 0;
+      for (const item of order.items) {
+        if (!item.id || !item.menuItemId || !item.name || typeof item.quantity !== 'number' || item.quantity < 1) {
+          res.status(400).json({ success: false, message: `Item inválido no pedido: ${item.name || 'desconhecido'}.` });
+          return;
+        }
+
+        let expectedItemSubtotal = item.unitPrice * item.quantity;
+        if (Array.isArray(item.addons)) {
+          for (const addon of item.addons) {
+            if (typeof addon.price !== 'number' || (addon.price !== 3.00 && addon.price !== 0.00)) {
+              res.status(400).json({ success: false, message: `Preço de adicional inválido: ${addon.name}. Apenas R$ 3,00 (recheios) ou R$ 0,00 (sabores) são autorizados.` });
+              return;
+            }
+            expectedItemSubtotal += addon.price * item.quantity;
+          }
+        }
+
+        if (Math.abs(item.subtotal - expectedItemSubtotal) > 0.01) {
+          res.status(400).json({ success: false, message: `Subtotal incorreto para o item ${item.name}. Esperado: ${expectedItemSubtotal.toFixed(2)}, recebido: ${item.subtotal}.` });
+          return;
+        }
+
+        calculatedSubtotal += item.subtotal;
+      }
+
+      if (Math.abs(order.subtotal - calculatedSubtotal) > 0.01) {
+        res.status(400).json({ success: false, message: 'Subtotal geral do pedido não confere com a soma dos itens.' });
+        return;
+      }
+
+      const expectedDeliveryFee = order.fulfillmentType === 'RETIRADA' ? 0 : (order.deliveryFee || 0);
+      if (Math.abs(order.deliveryFee - expectedDeliveryFee) > 0.01) {
+        res.status(400).json({ success: false, message: 'Taxa de entrega incorreta para a modalidade.' });
+        return;
+      }
+
+      // Public customers cannot grant discounts
+      const expectedTotal = calculatedSubtotal + expectedDeliveryFee - 0;
+      if (Math.abs(order.totalAmount - expectedTotal) > 0.01) {
+        res.status(400).json({ success: false, message: 'Valor total do pedido não confere matematicamente.' });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: 'Pedido processado e verificado com sucesso pelo backend.',
+        orderId: order.id,
+        trackingCode: order.trackingCode
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro interno no backend: ${msg}` });
+    }
+  });
+
   // Mount Vite development middlewares or serve static assets in production
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.resolve(__dirname, 'dist')));

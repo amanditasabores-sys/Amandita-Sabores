@@ -182,7 +182,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     const subtotal = (unitPrice + addonsCost) * modalQuantity;
 
     const newOrderItem: OrderItem = {
-      id: `cart-${Date.now()}-${Math.random()}`,
+      id: `cart-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
       menuItemId: selectedItemForModal.id,
       name: selectedItemForModal.name,
       quantity: modalQuantity,
@@ -252,7 +252,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       totalAmount: cartTotal,
       paymentMethod,
       paymentChangeFor: paymentMethod === 'DINHEIRO' && paymentChangeFor ? parseFloat(paymentChangeFor) : undefined,
-      paymentStatus: paymentMethod === 'PIX' ? 'PAGO' : 'PENDENTE',
+      paymentStatus: 'PENDENTE',
       status: 'NOVO',
     });
     const order = syncRes.order;
