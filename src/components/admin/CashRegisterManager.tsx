@@ -20,7 +20,8 @@ import {
   Clock, 
   X,
   FileText,
-  UserCheck
+  UserCheck,
+  Pencil
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
 
@@ -41,6 +42,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
 
   // Deletion modal state (replaces window.confirm)
   const [confirmDeleteMov, setConfirmDeleteMov] = useState<{ id: string; desc: string; amount: number } | null>(null);
+
+  // Edit / Adjust Drawer Balance state
+  const [isAdjustModalOpen, setIsAdjustModalOpen] = useState(false);
+  const [adjustDrawerNewValue, setAdjustDrawerNewValue] = useState('');
+  const [adjustDrawerReason, setAdjustDrawerReason] = useState('');
+  const [adjustToast, setAdjustToast] = useState<string | null>(null);
 
   // Open shift form
   const [initialBalanceInput, setInitialBalanceInput] = useState('150.00');
@@ -80,6 +87,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
         totalSangrias: 0,
         totalSuprimentos: 0,
         totalVales: 0,
+        totalAjustes: 0,
         expectedCashInDrawer: 0,
         totalRevenue: 0,
       };
@@ -91,6 +99,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
     let totalSangrias = 0;
     let totalSuprimentos = 0;
     let totalVales = 0;
+    let totalAjustes = 0;
 
     currentShift.movements.forEach((m) => {
       if (m.type === 'VENDA') {
@@ -103,10 +112,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
         totalSuprimentos += m.amount;
       } else if (m.type === 'VALE') {
         totalVales += m.amount;
+      } else if (m.type === 'AJUSTE') {
+        totalAjustes += m.amount;
       }
     });
 
-    const expectedCashInDrawer = currentShift.initialBalance + cashSales + totalSuprimentos - totalSangrias - totalVales;
+    const expectedCashInDrawer = currentShift.initialBalance + cashSales + totalSuprimentos - totalSangrias - totalVales + totalAjustes;
     const totalRevenue = cashSales + pixSales + cardSales;
 
     return {
@@ -117,10 +128,29 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
       totalSangrias,
       totalSuprimentos,
       totalVales,
+      totalAjustes,
       expectedCashInDrawer,
       totalRevenue,
     };
   }, [currentShift]);
+
+  // Adjust Drawer Balance handler
+  const handleSaveAdjustDrawer = (e: React.FormEvent) => {
+    e.preventDefault();
+    const parsed = parseFloat(adjustDrawerNewValue);
+    if (isNaN(parsed) || parsed < 0) {
+      alert('Por favor, informe um valor válido para o saldo da gaveta.');
+      return;
+    }
+
+    const mov = store.adjustDrawerBalance(parsed, adjustDrawerReason, openedByInput || 'admin');
+    if (mov) {
+      setAdjustToast(`Saldo da gaveta atualizado com sucesso para ${formatCurrency(parsed)}!`);
+      setTimeout(() => setAdjustToast(null), 3500);
+      reloadData();
+    }
+    setIsAdjustModalOpen(false);
+  };
 
   // Open Cash Register
   const handleOpenShift = (e: React.FormEvent) => {
@@ -270,6 +300,19 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
         </div>
       </div>
 
+      {/* Toast Feedback for Drawer Adjustment */}
+      {adjustToast && (
+        <div className="p-3 bg-emerald-50 border border-emerald-300 rounded-xl text-xs font-bold text-emerald-800 flex items-center justify-between animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{adjustToast}</span>
+          </div>
+          <button onClick={() => setAdjustToast(null)} className="text-emerald-700 hover:text-emerald-950 p-1">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* When Shift is Open: Summary KPI Cards */}
       {currentShift?.status === 'ABERTO' && (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3">
@@ -309,10 +352,40 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
             <span className="text-[10px] text-purple-600">Funcionários</span>
           </div>
 
-          <div className="bg-amber-50 p-3.5 rounded-2xl border-2 border-amber-300 shadow-xs">
-            <span className="text-[10px] font-black text-amber-900 uppercase tracking-wider block">Gaveta Esperada</span>
-            <p className="text-lg font-black text-amber-950 mt-1">{formatCurrency(metrics.expectedCashInDrawer)}</p>
-            <span className="text-[10px] font-bold text-amber-800">Saldo atual</span>
+          <div className="bg-amber-50 p-3.5 rounded-2xl border-2 border-amber-300 shadow-xs flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-black text-amber-900 uppercase tracking-wider block">Gaveta</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAdjustDrawerNewValue(metrics.expectedCashInDrawer.toFixed(2));
+                    setAdjustDrawerReason('');
+                    setIsAdjustModalOpen(true);
+                  }}
+                  className="px-1.5 py-0.5 text-amber-900 hover:text-amber-950 bg-amber-200/50 hover:bg-amber-200 rounded-md transition flex items-center gap-1 text-[10px] font-bold cursor-pointer"
+                  title="Editar saldo da gaveta"
+                >
+                  <Pencil className="w-2.5 h-2.5 text-amber-900" />
+                  <span>Editar</span>
+                </button>
+              </div>
+              <p className="text-lg font-black text-amber-950 mt-1">{formatCurrency(metrics.expectedCashInDrawer)}</p>
+            </div>
+            <div className="flex items-center justify-between mt-1">
+              <span className="text-[10px] font-bold text-amber-800">Saldo atual</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setAdjustDrawerNewValue(metrics.expectedCashInDrawer.toFixed(2));
+                  setAdjustDrawerReason('');
+                  setIsAdjustModalOpen(true);
+                }}
+                className="text-[10px] font-semibold text-amber-800 hover:text-amber-950 hover:underline cursor-pointer"
+              >
+                Ajustar valor
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -349,9 +422,10 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {currentShift.movements.slice().reverse().map((mov) => {
-                    const isPositive = mov.type === 'VENDA' || mov.type === 'SUPRIMENTO';
+                    const isPositive = mov.type === 'VENDA' || mov.type === 'SUPRIMENTO' || (mov.type === 'AJUSTE' && mov.amount >= 0);
                     const isSangria = mov.type === 'SANGRIA';
                     const isVale = mov.type === 'VALE';
+                    const isAjuste = mov.type === 'AJUSTE';
 
                     return (
                       <tr key={mov.id} className="hover:bg-slate-50/80 transition">
@@ -366,9 +440,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                               ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                               : mov.type === 'VALE'
                               ? 'bg-purple-50 text-purple-700 border border-purple-200'
+                              : mov.type === 'AJUSTE'
+                              ? 'bg-amber-50 text-amber-800 border border-amber-300'
                               : 'bg-rose-50 text-rose-700 border border-rose-200'
                           }`}>
-                            {mov.type === 'VENDA' ? 'Venda' : mov.type === 'SUPRIMENTO' ? 'Suprimento (Entrada)' : mov.type === 'VALE' ? 'Vale Funcionário' : 'Sangria (Retirada)'}
+                            {mov.type === 'VENDA' ? 'Venda' : mov.type === 'SUPRIMENTO' ? 'Suprimento (Entrada)' : mov.type === 'VALE' ? 'Vale Funcionário' : mov.type === 'AJUSTE' ? 'Ajuste de Gaveta' : 'Sangria (Retirada)'}
                           </span>
                         </td>
                         <td className="py-3 px-2 text-slate-800 font-medium">
@@ -386,9 +462,13 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                           {mov.paymentMethod ? getPaymentMethodLabel(mov.paymentMethod) : 'Dinheiro'}
                         </td>
                         <td className={`py-3 px-2 text-right font-mono font-bold whitespace-nowrap ${
-                          isPositive ? 'text-emerald-700' : isVale ? 'text-purple-700' : 'text-rose-600'
+                          isAjuste
+                            ? mov.amount >= 0 ? 'text-emerald-700' : 'text-rose-600'
+                            : isPositive ? 'text-emerald-700' : isVale ? 'text-purple-700' : 'text-rose-600'
                         }`}>
-                          {isPositive ? '+' : '-'}{formatCurrency(mov.amount)}
+                          {isAjuste
+                            ? mov.amount >= 0 ? `+${formatCurrency(mov.amount)}` : `-${formatCurrency(Math.abs(mov.amount))}`
+                            : `${isPositive ? '+' : '-'}${formatCurrency(Math.abs(mov.amount))}`}
                         </td>
                         <td className="py-3 px-2 text-slate-500 whitespace-nowrap">
                           {mov.author}
@@ -437,8 +517,8 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                   <th className="py-3 px-2">Fechamento</th>
                   <th className="py-3 px-2">Operador</th>
                   <th className="py-3 px-2 text-right">Fundo Inicial</th>
-                  <th className="py-3 px-2 text-right">Total Esperado</th>
-                  <th className="py-3 px-2 text-right">Contado Gaveta</th>
+                  <th className="py-3 px-2 text-right">Gaveta</th>
+                  <th className="py-3 px-2 text-right">Contado</th>
                   <th className="py-3 px-2 text-right">Diferença</th>
                   <th className="py-3 px-2 text-center">Visualizar</th>
                 </tr>
@@ -594,8 +674,16 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <span>Vales a funcionários:</span>
                 <span className="font-mono font-semibold text-purple-700">-{formatCurrency(metrics.totalVales)}</span>
               </div>
+              {metrics.totalAjustes !== 0 && (
+                <div className="flex justify-between">
+                  <span>Ajustes manuais da gaveta:</span>
+                  <span className={`font-mono font-semibold ${metrics.totalAjustes > 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                    {metrics.totalAjustes > 0 ? '+' : ''}{formatCurrency(metrics.totalAjustes)}
+                  </span>
+                </div>
+              )}
               <div className="flex justify-between pt-2 border-t border-slate-200 font-bold text-slate-900 text-sm">
-                <span>Dinheiro Esperado na Gaveta:</span>
+                <span>Gaveta:</span>
                 <span className="text-amber-800">{formatCurrency(metrics.expectedCashInDrawer)}</span>
               </div>
               <div className="flex justify-between text-[11px] text-slate-400 pt-1">
@@ -638,7 +726,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  Observações de Fechamento (opcional)
+                  Observações de Fechamento
                 </label>
                 <textarea
                   rows={2}
@@ -839,7 +927,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 )}
                 <p><strong>Fundo Inicial:</strong> {formatCurrency(selectedHistoryShift.initialBalance)}</p>
                 <p><strong>Total em Dinheiro Contado:</strong> {formatCurrency(selectedHistoryShift.finalCountedCash || 0)}</p>
-                <p><strong>Saldo Calculado:</strong> {formatCurrency(selectedHistoryShift.finalCalculatedBalance || 0)}</p>
+                <p><strong>Gaveta:</strong> {formatCurrency(selectedHistoryShift.finalCalculatedBalance || 0)}</p>
                 <p className="font-bold">
                   <strong>Diferença:</strong> {formatCurrency(selectedHistoryShift.difference || 0)}
                 </p>
@@ -855,10 +943,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                     <div key={m.id} className="p-2.5 flex justify-between items-center">
                       <div>
                         <span className="font-bold text-slate-900">{m.description}</span>
-                        <span className="text-[10px] text-slate-400 block">{formatTime(m.timestamp)} · {m.type}</span>
+                        <span className="text-[10px] text-slate-400 block">{formatTime(m.timestamp)} · {m.type === 'AJUSTE' ? 'Ajuste de Gaveta' : m.type}</span>
                       </div>
-                      <span className={`font-mono font-bold ${m.type === 'SANGRIA' ? 'text-rose-600' : 'text-emerald-700'}`}>
-                        {m.type === 'SANGRIA' ? '-' : '+'}{formatCurrency(m.amount)}
+                      <span className={`font-mono font-bold ${m.type === 'SANGRIA' || (m.type === 'AJUSTE' && m.amount < 0) ? 'text-rose-600' : 'text-emerald-700'}`}>
+                        {m.type === 'AJUSTE' 
+                          ? (m.amount >= 0 ? `+${formatCurrency(m.amount)}` : `-${formatCurrency(Math.abs(m.amount))}`)
+                          : `${m.type === 'SANGRIA' ? '-' : '+'}${formatCurrency(m.amount)}`}
                       </span>
                     </div>
                   ))}
@@ -874,6 +964,103 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 Fechar
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: EDITAR / AJUSTAR SALDO DA GAVETA */}
+      {isAdjustModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-5 sm:p-6 space-y-4 shadow-2xl border border-slate-200 animate-in fade-in">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-amber-100 text-amber-900 flex items-center justify-center shrink-0">
+                  <Pencil className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-sm">Editar Saldo da Gaveta</h3>
+                  <p className="text-[11px] text-slate-500">Ajuste o valor físico disponível em caixa</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAdjustModalOpen(false)}
+                className="text-slate-400 hover:text-slate-700 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs flex justify-between items-center">
+              <span className="text-amber-900 font-medium">Saldo atual da Gaveta:</span>
+              <strong className="text-amber-950 font-black text-sm">{formatCurrency(metrics.expectedCashInDrawer)}</strong>
+            </div>
+
+            <form onSubmit={handleSaveAdjustDrawer} className="space-y-3.5 text-xs">
+              <div>
+                <label className="font-bold text-slate-800 block mb-1">
+                  Novo Saldo da Gaveta (R$) *
+                </label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 font-bold text-slate-400">R$</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    required
+                    value={adjustDrawerNewValue}
+                    onChange={(e) => setAdjustDrawerNewValue(e.target.value)}
+                    placeholder="0.00"
+                    autoFocus
+                    className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-base font-extrabold text-slate-900 focus:ring-2 focus:ring-amber-500"
+                  />
+                </div>
+                {adjustDrawerNewValue !== '' && !isNaN(parseFloat(adjustDrawerNewValue)) && (
+                  <div className="mt-1.5 flex items-center justify-between text-[11px] font-semibold">
+                    <span className="text-slate-500">Diferença de ajuste:</span>
+                    {(() => {
+                      const diff = parseFloat(adjustDrawerNewValue) - metrics.expectedCashInDrawer;
+                      if (Math.abs(diff) < 0.009) {
+                        return <span className="text-slate-500 font-bold">Sem alteração</span>;
+                      } else if (diff > 0) {
+                        return <span className="text-emerald-700 font-bold">+ {formatCurrency(diff)} (Acréscimo)</span>;
+                      } else {
+                        return <span className="text-rose-600 font-bold">- {formatCurrency(Math.abs(diff))} (Redução)</span>;
+                      }
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="font-semibold text-slate-700 block mb-1">
+                  Motivo / Justificativa do Ajuste
+                </label>
+                <input
+                  type="text"
+                  value={adjustDrawerReason}
+                  onChange={(e) => setAdjustDrawerReason(e.target.value)}
+                  placeholder="Ex: Acerto de moedas, recontagem física, conferência"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"
+                />
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsAdjustModalOpen(false)}
+                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-xl font-bold transition shadow-xs cursor-pointer"
+                >
+                  Salvar Novo Saldo
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

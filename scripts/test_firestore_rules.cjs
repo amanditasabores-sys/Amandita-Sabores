@@ -160,7 +160,7 @@ class FirestoreRuleEngine {
 
   areStaffItemsValid(items) {
     if (!Array.isArray(items) || items.length < 1 || items.length > 50) return false;
-    const checkCount = Math.min(items.length, 5);
+    const checkCount = Math.min(items.length, 8);
     for (let i = 0; i < checkCount; i++) {
       if (!this.isValidOrderItemStructure(items[i])) return false;
     }

@@ -213,21 +213,21 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
     <div className="min-h-screen bg-slate-900 text-slate-100 pb-16">
       {/* Top Header */}
       <header className="bg-slate-950/80 backdrop-blur border-b border-slate-800 sticky top-0 z-30">
-        <div className="max-w-xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold">
-              <Bike className="w-5 h-5" />
+        <div className="max-w-xl mx-auto px-3 sm:px-4 py-2.5 sm:py-3 flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold shrink-0">
+              <Bike className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
-            <div>
-              <h1 className="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
-                Portal do Entregador
-                <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono">ONLINE</span>
+            <div className="min-w-0">
+              <h1 className="text-xs sm:text-sm font-bold tracking-tight text-white flex items-center gap-1.5 truncate">
+                <span className="truncate">Portal do Entregador</span>
+                <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono shrink-0">ONLINE</span>
               </h1>
-              <p className="text-xs text-slate-400 flex items-center gap-1">
-                <span>{driverName}</span>
+              <p className="text-[11px] sm:text-xs text-slate-400 flex items-center gap-1 truncate">
+                <span className="truncate">{driverName}</span>
                 <button
                   onClick={() => setIsEditingProfile(true)}
-                  className="text-amber-400 hover:underline text-[11px] ml-1"
+                  className="text-amber-400 hover:underline text-[11px] ml-1 shrink-0"
                 >
                   (Alterar)
                 </button>
@@ -235,14 +235,15 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {onNavigateToAdmin && (currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE' || !currentUser) && (
               <button
                 onClick={onNavigateToAdmin}
-                className="px-3 py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition border border-slate-700 cursor-pointer"
+                className="px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition border border-slate-700 cursor-pointer"
                 title="Voltar ao Painel Administrativo"
               >
-                <span>Painel ADM</span>
+                <span className="hidden sm:inline">Painel ADM</span>
+                <span className="sm:hidden">ADM</span>
               </button>
             )}
 
@@ -255,20 +256,20 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                   startCamera();
                 }
               }}
-              className="flex items-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-xl text-xs font-bold transition shadow-md shadow-amber-500/10 cursor-pointer"
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 sm:py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-xl text-xs font-bold transition shadow-md shadow-amber-500/10 cursor-pointer"
             >
               <QrCode className="w-4 h-4" />
-              <span>{isScannerOpen ? 'Fechar Scanner' : 'Ler QR Code'}</span>
+              <span>{isScannerOpen ? 'Fechar' : 'QR Code'}</span>
             </button>
 
             {onLogout && (
               <button
                 onClick={onLogout}
-                className="flex items-center gap-1.5 px-3 py-2 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 hover:text-white rounded-xl text-xs font-bold transition border border-rose-500/30 cursor-pointer"
+                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 sm:py-2 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 hover:text-white rounded-xl text-xs font-bold transition border border-rose-500/30 cursor-pointer"
                 title="Sair do Portal do Entregador"
               >
                 <LogOut className="w-4 h-4" />
-                <span>Sair</span>
+                <span className="hidden sm:inline">Sair</span>
               </button>
             )}
           </div>
@@ -678,20 +679,20 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                     onClick={() => handleSelectOrder(ord)}
                     className="bg-slate-800 hover:bg-slate-750 border border-slate-700 hover:border-amber-500/50 rounded-2xl p-4 transition cursor-pointer shadow-sm group"
                   >
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <div className="flex items-center gap-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-base font-extrabold text-white">{ord.orderNumber}</span>
-                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0 ${
                             ord.status === 'EM_ROTA' ? 'bg-indigo-500/20 text-indigo-400' : 'bg-amber-500/20 text-amber-400'
                           }`}>
                             {ord.status === 'EM_ROTA' ? 'Em Rota' : 'Pronto p/ Entrega'}
                           </span>
                         </div>
-                        <p className="text-sm font-semibold text-slate-200 mt-1">{ord.customer.name}</p>
+                        <p className="text-sm font-semibold text-slate-200 mt-1 truncate">{ord.customer.name}</p>
                         <p className="text-xs text-slate-400 flex items-center gap-1 mt-0.5">
-                          <MapPin className="w-3.5 h-3.5 text-amber-400" />
-                          <span>
+                          <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          <span className="truncate">
                             {ord.customer.address 
                               ? `${ord.customer.address.street}, ${ord.customer.address.number} · ${ord.customer.address.neighborhood}`
                               : 'Retirada no Balcão'}
@@ -699,7 +700,7 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                         </p>
                       </div>
 
-                      <div className="text-right">
+                      <div className="text-right shrink-0">
                         <span className="text-sm font-bold text-amber-400">{formatCurrency(ord.totalAmount)}</span>
                         <p className="text-[11px] text-slate-400">{getPaymentMethodLabel(ord.paymentMethod)}</p>
                         <span className="inline-block mt-2 text-xs font-semibold text-amber-400 group-hover:translate-x-0.5 transition-transform">

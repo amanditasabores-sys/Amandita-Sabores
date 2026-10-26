@@ -247,37 +247,38 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] font-sans">
+    <div className="min-h-screen w-full max-w-full bg-[#FAF7F2] text-[#2C1810] font-sans">
       {/* GLOBAL VIEW SWITCHER / PREVIEW ASSISTANT TOOLBAR (RESTRICTED TO ADMINISTRATOR ONLY) */}
       {isGlobalToolbarVisible && (
-        <aside aria-label="Seletor de Ambiente" className="sticky top-0 z-50 bg-[#1F100B] text-white border-b border-[#4A2E1F] shadow-md">
-          <div className="max-w-7xl mx-auto px-4 py-1.5 flex items-center justify-between text-xs">
-            <div className="flex items-center gap-2">
-              <span className="font-black tracking-wider text-[#E89255] font-serif text-[12px] flex items-center gap-1.5">
-                <span>AMANDITA SABORES</span>
+        <aside aria-label="Seletor de Ambiente" className="sticky top-0 z-50 w-full max-w-full bg-[#1F100B] text-white border-b border-[#4A2E1F] shadow-md overflow-hidden">
+          <div className="w-full max-w-7xl mx-auto px-2.5 sm:px-4 py-1.5 flex items-center justify-between gap-1.5 sm:gap-3 text-xs">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="font-black tracking-wider text-[#E89255] font-serif text-[11px] sm:text-[12px] flex items-center gap-1">
+                <span>AMANDITA</span>
+                <span className="hidden xs:inline">SABORES</span>
               </span>
-              <span className="text-[#6B4B3E] hidden sm:inline">|</span>
-              <span className="text-[#D9C7B8] hidden sm:inline text-[11px]">Navegação Rápida (Admin):</span>
+              <span className="text-[#6B4B3E] hidden md:inline">|</span>
+              <span className="text-[#D9C7B8] hidden md:inline text-[11px]">Navegação Rápida (Admin):</span>
             </div>
 
-            <div className="flex items-center gap-1 sm:gap-2">
+            <div className="flex items-center gap-1 sm:gap-2 overflow-x-auto scrollbar-none py-0.5 min-w-0 flex-1 justify-end">
               {/* 1. Admin */}
               <button
                 onClick={() => navigateTo('admin')}
-                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'admin'
                     ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
                     : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
                 }`}
               >
                 <ShieldCheck className="w-3.5 h-3.5" />
-                <span>Painel Admin</span>
+                <span><span className="hidden sm:inline">Painel </span>Admin</span>
               </button>
 
               {/* 2. Customer Menu */}
               <button
                 onClick={() => navigateTo('cardapio')}
-                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'cardapio'
                     ? 'bg-emerald-600 text-white shadow-xs'
                     : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
@@ -290,7 +291,7 @@ export default function App() {
               {/* 3. Atendente */}
               <button
                 onClick={() => navigateTo('atendente')}
-                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'atendente'
                     ? 'bg-amber-600 text-white shadow-xs'
                     : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
@@ -303,7 +304,7 @@ export default function App() {
               {/* 4. Cozinha */}
               <button
                 onClick={() => navigateTo('producao')}
-                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'producao'
                     ? 'bg-rose-700 text-white shadow-xs'
                     : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
@@ -316,7 +317,7 @@ export default function App() {
               {/* 5. Caixa */}
               <button
                 onClick={() => navigateTo('caixa')}
-                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'caixa'
                     ? 'bg-emerald-700 text-white shadow-xs'
                     : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
@@ -329,7 +330,7 @@ export default function App() {
               {/* 6. Entregador */}
               <button
                 onClick={() => navigateTo('entregador')}
-                className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'entregador'
                     ? 'bg-[#C86D3B] text-white shadow-xs'
                     : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
@@ -343,7 +344,7 @@ export default function App() {
               <button
                 onClick={() => setIsFirebaseModalOpen(true)}
                 title="Status do Cloud Firestore & Migração de Dados"
-                className="px-2 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] cursor-pointer bg-amber-500/20 text-[#FFCA28] hover:bg-amber-500/30 border border-[#FFCA28]/40"
+                className="px-2 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer bg-amber-500/20 text-[#FFCA28] hover:bg-amber-500/30 border border-[#FFCA28]/40"
               >
                 <Flame className="w-3.5 h-3.5 text-[#FFCA28]" />
                 <span className="hidden sm:inline">Firebase</span>
@@ -353,7 +354,7 @@ export default function App() {
               <button
                 onClick={handleResetSampleData}
                 title="Restaurar dados iniciais da Amandita Sabores"
-                className="p-1 text-[#D9C7B8] hover:text-white hover:bg-white/10 rounded-lg ml-1 cursor-pointer"
+                className="p-1 text-[#D9C7B8] hover:text-white hover:bg-white/10 rounded-lg ml-0.5 shrink-0 cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
               </button>

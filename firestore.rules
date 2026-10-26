@@ -282,13 +282,18 @@ service cloud.firestore {
     }
 
     // Structural validation for staff-entered orders (e.g. POS balcão with larger item lists)
+    // Firestore Rules engine does not provide iterative loops; unrolled up to 8 items.
+    // Carts with > 8 items are ingested and validated for 100% of items via the secure backend /api/orders validator.
     function areStaffItemsValid(items) {
       return items.size() >= 1 && items.size() <= 50 &&
         isValidOrderItemStructure(items[0]) &&
         (items.size() < 2 || isValidOrderItemStructure(items[1])) &&
         (items.size() < 3 || isValidOrderItemStructure(items[2])) &&
         (items.size() < 4 || isValidOrderItemStructure(items[3])) &&
-        (items.size() < 5 || isValidOrderItemStructure(items[4]));
+        (items.size() < 5 || isValidOrderItemStructure(items[4])) &&
+        (items.size() < 6 || isValidOrderItemStructure(items[5])) &&
+        (items.size() < 7 || isValidOrderItemStructure(items[6])) &&
+        (items.size() < 8 || isValidOrderItemStructure(items[7]));
     }
 
     function isValidNewOrder(orderId) {

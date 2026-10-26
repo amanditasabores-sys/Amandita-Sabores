@@ -298,41 +298,41 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] pb-28">
+    <div className="min-h-screen w-full max-w-full bg-[#FAF7F2] text-[#2C1810] pb-28">
       {/* Restaurant Header Banner */}
-      <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-lg sticky top-0 z-30 border-b border-[#C86D3B]/20">
-        <div className="max-w-4xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <AmanditaLogo variant="icon" size="md" theme="dark" />
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-black text-base tracking-tight text-white">{config.name}</h1>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+      <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-lg sticky top-0 z-30 border-b border-[#C86D3B]/20 w-full max-w-full">
+        <div className="w-full max-w-4xl mx-auto px-3 sm:px-4 py-3 flex items-center justify-between gap-2 min-w-0">
+          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
+            <AmanditaLogo variant="icon" size="md" theme="dark" className="shrink-0" />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="font-black text-sm sm:text-base tracking-tight text-white truncate max-w-[170px] sm:max-w-none">{config.name}</h1>
+                <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shrink-0">
                   ABERTO
                 </span>
               </div>
-              <p className="text-xs text-[#D9C7B8] flex items-center gap-2">
-                <span>{config.address}</span>
-                <span>·</span>
-                <span className="text-amber-300">Preparo ~{config.avgPrepTimeMinutes} min</span>
+              <p className="text-[11px] sm:text-xs text-[#D9C7B8] flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5">
+                <span className="truncate max-w-[150px] sm:max-w-none">{config.address}</span>
+                <span className="hidden sm:inline">·</span>
+                <span className="text-amber-300 shrink-0">Preparo ~{config.avgPrepTimeMinutes} min</span>
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {onNavigateToAdmin && (store.getCurrentUser()?.role === 'ADMINISTRADOR' || store.getCurrentUser()?.role === 'GERENTE') && (
               <button
                 onClick={onNavigateToAdmin}
-                className="p-2.5 bg-white/10 hover:bg-white/20 text-[#D9C7B8] hover:text-white rounded-xl transition text-xs font-semibold flex items-center gap-1.5 border border-white/10 cursor-pointer"
+                className="p-2 sm:p-2.5 bg-white/10 hover:bg-white/20 text-[#D9C7B8] hover:text-white rounded-xl transition text-xs font-semibold flex items-center gap-1 sm:gap-1.5 border border-white/10 cursor-pointer"
                 title="Voltar ao Painel Administrativo"
               >
-                <span>Painel ADM</span>
+                <span>Painel<span className="hidden sm:inline"> ADM</span></span>
               </button>
             )}
 
             <button
               onClick={() => setIsCartOpen(true)}
-              className="relative p-2.5 bg-gradient-to-r from-[#C86D3B] to-[#721C24] hover:opacity-95 text-white rounded-xl transition font-bold text-xs flex items-center gap-2 shadow-sm cursor-pointer"
+              className="relative p-2 sm:p-2.5 bg-gradient-to-r from-[#C86D3B] to-[#721C24] hover:opacity-95 text-white rounded-xl transition font-bold text-xs flex items-center gap-1.5 sm:gap-2 shadow-sm cursor-pointer"
             >
               <ShoppingBag className="w-4 h-4" />
               <span className="hidden sm:inline">Carrinho</span>
@@ -437,13 +437,13 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         </div>
 
         {/* Category Filter Horizontal Slider */}
-        <div className="bg-slate-900 border-t border-slate-800/80">
-          <div className="max-w-4xl mx-auto px-4 py-2 overflow-x-auto flex items-center gap-2 scrollbar-none">
+        <div className="bg-slate-900 border-t border-slate-800/80 w-full max-w-full overflow-hidden">
+          <div className="w-full max-w-4xl mx-auto px-3 sm:px-4 py-2 overflow-x-auto flex items-center gap-2 scrollbar-none">
             {categories.map((cat) => (
               <button
                 key={cat}
                 onClick={() => setSelectedCategory(cat)}
-                className={`whitespace-nowrap px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
+                className={`whitespace-nowrap px-3.5 py-1.5 rounded-lg text-xs font-semibold shrink-0 transition ${
                   selectedCategory === cat
                     ? 'bg-white text-slate-950 shadow'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
@@ -457,20 +457,20 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       </header>
 
       {/* Main Menu Grid */}
-      <main className="max-w-4xl mx-auto px-4 pt-5">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-sm font-bold text-slate-600 uppercase tracking-wider">
+      <main className="w-full max-w-4xl mx-auto px-3 sm:px-4 pt-5">
+        <div className="flex items-center justify-between gap-2 mb-4">
+          <h2 className="text-xs sm:text-sm font-bold text-slate-600 uppercase tracking-wider truncate">
             {selectedCategory === 'TODAS' ? 'Cardápio Completo' : selectedCategory} ({filteredItems.length})
           </h2>
           {searchQuery && (
-            <span className="text-xs text-slate-500">
-              Resultados para: <strong className="text-slate-800">"{searchQuery}"</strong>
+            <span className="text-[11px] sm:text-xs text-slate-500 truncate shrink-0">
+              Busca: <strong className="text-slate-800">"{searchQuery}"</strong>
             </span>
           )}
         </div>
 
         {filteredItems.length === 0 ? (
-          <div className="bg-white rounded-2xl p-12 text-center border border-slate-200">
+          <div className="bg-white rounded-2xl p-8 sm:p-12 text-center border border-slate-200">
             <Search className="w-10 h-10 text-slate-300 mx-auto mb-2" />
             <h3 className="font-bold text-slate-800 text-base">Nenhum item encontrado</h3>
             <p className="text-xs text-slate-500 mt-1 mb-4">
@@ -484,24 +484,24 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
             </button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
             {filteredItems.map((item) => (
               <div
                 key={item.id}
                 onClick={() => handleOpenItemModal(item)}
-                className="bg-white rounded-2xl border border-slate-200 hover:border-amber-400/80 shadow-xs hover:shadow-md transition-all p-4 flex flex-col justify-between cursor-pointer group"
+                className="bg-white rounded-2xl border border-slate-200 hover:border-amber-400/80 shadow-xs hover:shadow-md transition-all p-3 sm:p-4 flex flex-col justify-between cursor-pointer group min-w-0"
               >
-                <div className="flex gap-4">
-                  <div className="flex-1">
+                <div className="flex gap-3 sm:gap-4 min-w-0">
+                  <div className="flex-1 min-w-0">
                     {/* Tags */}
                     {item.tags && item.tags.length > 0 && (
-                      <div className="flex items-center gap-1.5 text-[11px] text-amber-700 font-semibold mb-1">
-                        {item.featured && <Sparkles className="w-3 h-3 text-amber-500" />}
-                        <span>{item.tags.join(' · ')}</span>
+                      <div className="flex items-center gap-1.5 text-[10px] sm:text-[11px] text-amber-700 font-semibold mb-1 min-w-0">
+                        {item.featured && <Sparkles className="w-3 h-3 text-amber-500 shrink-0" />}
+                        <span className="truncate">{item.tags.join(' · ')}</span>
                       </div>
                     )}
 
-                    <h3 className="text-base font-bold text-slate-900 group-hover:text-amber-800 transition-colors">
+                    <h3 className="text-sm sm:text-base font-bold text-slate-900 group-hover:text-amber-800 transition-colors truncate">
                       {item.name}
                     </h3>
                     <p className="text-xs text-slate-500 line-clamp-2 mt-1 leading-relaxed">
@@ -510,7 +510,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   </div>
 
                   {item.imageUrl && (
-                    <div className="w-24 h-24 rounded-xl overflow-hidden shrink-0 bg-slate-100 relative">
+                    <div className="w-20 h-20 sm:w-24 sm:h-24 rounded-xl overflow-hidden shrink-0 bg-slate-100 relative">
                       <img
                         src={item.imageUrl}
                         alt={item.name}
@@ -521,12 +521,12 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   )}
                 </div>
 
-                <div className="flex items-center justify-between mt-4 pt-3 border-t border-slate-100">
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-lg font-extrabold text-slate-900">
+                <div className="flex items-center justify-between gap-2 mt-3 sm:mt-4 pt-2.5 sm:pt-3 border-t border-slate-100 min-w-0">
+                  <div className="flex items-baseline gap-1.5 sm:gap-2 shrink-0">
+                    <span className="text-base sm:text-lg font-extrabold text-slate-900">
                       {formatCurrency(item.price)}
                     </span>
-                    <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                    <span className="text-[10px] sm:text-[11px] text-slate-400 flex items-center gap-1">
                       <Clock className="w-3 h-3" />
                       ~{item.prepTimeMinutes}m
                     </span>
@@ -589,7 +589,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       {/* ITEM CUSTOMIZATION MODAL */}
       {selectedItemForModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
-          <div className="bg-white rounded-t-3xl sm:rounded-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-6 space-y-4 shadow-2xl">
+          <div className="bg-white rounded-t-3xl sm:rounded-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-4 sm:p-6 space-y-4 shadow-2xl">
             <div className="flex justify-between items-start">
               <div>
                 <h3 className="text-lg font-extrabold text-slate-900">{selectedItemForModal.name}</h3>
@@ -609,7 +609,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
             {selectedItemForModal.addons && selectedItemForModal.addons.length > 0 && (
               <div className="space-y-2 pt-2 border-t border-slate-100">
                 <span className="text-xs font-bold text-slate-800 block">
-                  Turbine seu prato (Opcional):
+                  Turbine seu prato:
                 </span>
                 <div className="space-y-1.5">
                   {selectedItemForModal.addons.map((addon) => {
@@ -687,7 +687,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       {/* CART & CHECKOUT DRAWER */}
       {isCartOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="bg-white rounded-t-3xl sm:rounded-2xl max-w-lg w-full max-h-[92vh] overflow-y-auto p-6 space-y-5 shadow-2xl">
+          <div className="bg-white rounded-t-3xl sm:rounded-2xl max-w-lg w-full max-h-[92vh] overflow-y-auto p-4 sm:p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div className="flex items-center gap-2">
                 <ShoppingBag className="w-5 h-5 text-amber-600" />
@@ -797,16 +797,16 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   </div>
                 </div>
 
-                {/* Customer Information (Tudo Opcional) */}
+                {/* Customer Information */}
                 <div className="space-y-3 pt-2">
                   <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
                     <User className="w-3.5 h-3.5" />
-                    Seus Dados de Contato (Opcional)
+                    Seus Dados de Contato
                   </h4>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     <div>
-                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">Seu Nome (Opcional)</label>
+                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">Nome</label>
                       <input
                         type="text"
                         value={customerName}
@@ -816,7 +816,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                       />
                     </div>
                     <div>
-                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">WhatsApp / Telefone (Opcional)</label>
+                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">WhatsApp / Telefone</label>
                       <input
                         type="tel"
                         value={customerPhone}
@@ -833,14 +833,14 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   <div className="space-y-3 pt-2">
                     <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
                       <Bike className="w-3.5 h-3.5 text-amber-600" />
-                      Local de Entrega (Tudo Opcional)
+                      Local de Entrega
                     </h4>
 
                     {/* Condomínio Buttons */}
                     <div>
                       <label className="text-[11px] font-semibold text-slate-700 block mb-1.5 flex items-center gap-1">
                         <Building2 className="w-3.5 h-3.5 text-amber-600" />
-                        <span>Selecione seu Condomínio (Opcional):</span>
+                        <span>Selecione seu Condomínio:</span>
                       </label>
                       <div className="grid grid-cols-3 gap-2">
                         <button
@@ -894,7 +894,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                     {/* Bloco e Apartamento */}
                     <div className="grid grid-cols-2 gap-2">
                       <div>
-                        <label className="text-[11px] font-semibold text-slate-600 block mb-1">Bloco (Opcional)</label>
+                        <label className="text-[11px] font-semibold text-slate-600 block mb-1">Bloco</label>
                         <input
                           type="text"
                           value={bloco}
@@ -904,7 +904,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="text-[11px] font-semibold text-slate-600 block mb-1">Apartamento / Ap (Opcional)</label>
+                        <label className="text-[11px] font-semibold text-slate-600 block mb-1">Apartamento / Ap</label>
                         <input
                           type="text"
                           value={apto}
@@ -916,7 +916,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                     </div>
 
                     <div>
-                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">Ponto de Referência / Complemento (Opcional)</label>
+                      <label className="text-[11px] font-semibold text-slate-600 block mb-1">Ponto de Referência / Complemento</label>
                       <input
                         type="text"
                         value={reference}
@@ -937,14 +937,14 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                       Local de retirada: <strong>{config.address} - {config.city}</strong>
                     </p>
                     <p className="text-[11px] text-emerald-700 font-semibold">
-                      ✓ Apenas seu nome e WhatsApp (opcionais). Nenhum endereço necessário!
+                      ✓ Apenas seu nome e WhatsApp. Nenhum endereço necessário!
                     </p>
                   </div>
                 )}
 
                 {/* Observações do Pedido */}
                 <div>
-                  <label className="text-[11px] font-semibold text-slate-600 block mb-1">Observações do Pedido (opcional)</label>
+                  <label className="text-[11px] font-semibold text-slate-600 block mb-1">Observações do Pedido</label>
                   <input
                     type="text"
                     value={orderNotes}

@@ -370,7 +370,7 @@ export const QrCodeManager: React.FC<QrCodeManagerProps> = ({ onNavigateToView }
             </div>
 
             {/* Smartphone Case Frame */}
-            <div className="w-[390px] h-[740px] bg-slate-950 rounded-[44px] p-3 shadow-2xl border-4 border-slate-700 relative overflow-hidden flex flex-col">
+            <div className="w-[min(390px,calc(100vw-32px))] max-w-full h-[min(740px,calc(100vh-100px))] bg-slate-950 rounded-[36px] sm:rounded-[44px] p-2.5 sm:p-3 shadow-2xl border-4 border-slate-700 relative overflow-hidden flex flex-col">
               {/* Dynamic Island / Speaker notch */}
               <div className="w-28 h-4 bg-slate-900 rounded-full mx-auto mb-2 shrink-0 flex items-center justify-center">
                 <div className="w-3 h-3 rounded-full bg-slate-800 mr-2" />

@@ -156,24 +156,44 @@ class StoreService {
 
     this.inFlightOrderWrites.add(order.id);
     try {
+      // Build auth headers if staff user is logged in
+      let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (auth?.currentUser) {
+        try {
+          const idToken = await auth.currentUser.getIdToken();
+          if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+        } catch {
+          // fallback
+        }
+      }
+
       // For large carts exceeding direct client Firestore Rules read budgets (> 8 items)
       // or unauthenticated orders with high item volume, route through the secure backend validator:
       if (order.items && order.items.length > 8) {
         try {
           const res = await fetch('/api/orders', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: authHeaders,
             body: JSON.stringify({ order }),
           });
           const data = await res.json();
-          if (data.success) {
+          if (res.ok && data.success) {
             this.removeOrderFromSyncQueue(order.id);
             this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
             this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
             return { success: true };
+          } else {
+            const errorMsg = data.message || `Erro ${res.status} no backend`;
+            console.warn('[Firestore] Backend recusou persistência do pedido ' + order.id + ':', errorMsg);
+            this.queueOrderForSync(order);
+            this.updateLocalOrderSyncStatus(order.id, 'PENDING');
+            return { success: false, error: errorMsg };
           }
-        } catch {
-          // Continue to local queue fallback
+        } catch (fetchErr: unknown) {
+          const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+          this.queueOrderForSync(order);
+          this.updateLocalOrderSyncStatus(order.id, 'PENDING');
+          return { success: false, error: msg };
         }
       }
 
@@ -195,17 +215,29 @@ class StoreService {
       // If direct write was rejected (e.g. cart size limit in client rules), attempt backend fallback
       if (typeof window !== 'undefined' && (order.items?.length || 0) > 5) {
         try {
+          let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (auth?.currentUser) {
+            try {
+              const idToken = await auth.currentUser.getIdToken();
+              if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+            } catch {
+              // fallback
+            }
+          }
+
           const fallbackRes = await fetch('/api/orders', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: authHeaders,
             body: JSON.stringify({ order }),
           });
           const fallbackData = await fallbackRes.json();
-          if (fallbackData.success) {
+          if (fallbackRes.ok && fallbackData.success) {
             this.removeOrderFromSyncQueue(order.id);
             this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
             this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
             return { success: true };
+          } else {
+            console.warn('[Firestore] Backend fallback não persistiu o pedido ' + order.id + ':', fallbackData.message);
           }
         } catch {
           // Handled below
@@ -1208,8 +1240,9 @@ class StoreService {
         try {
           newOrder.pixCode = generatePixCopiaECola({
             pixKey: cfg.pixKey,
+            keyType: cfg.pixKeyType,
             receiverName: cfg.pixReceiverName || cfg.name,
-            receiverCity: cfg.pixReceiverCity || 'SAO PAULO',
+            receiverCity: cfg.pixReceiverCity || 'CAMPINA GRANDE',
             amount: newOrder.totalAmount,
             txId: newOrder.orderNumber.replace(/[^a-zA-Z0-9]/g, ''),
             description: `Pedido ${newOrder.orderNumber}`
@@ -1766,6 +1799,8 @@ class StoreService {
         expectedCashInDrawer -= m.amount;
       } else if (m.type === 'VENDA' && m.paymentMethod === 'DINHEIRO') {
         expectedCashInDrawer += m.amount;
+      } else if (m.type === 'AJUSTE') {
+        expectedCashInDrawer += m.amount;
       }
     });
 
@@ -1821,6 +1856,49 @@ class StoreService {
       description: description.trim(),
       employeeName: employeeName?.trim() || undefined,
       author,
+    };
+
+    shift.movements.push(movement);
+    this.saveCurrentCashShift(shift);
+    return movement;
+  }
+
+  public adjustDrawerBalance(newBalance: number, reason: string, author: string): CashMovement | null {
+    if (!this.canUserManageCash()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para ajustar saldo do caixa.');
+      return null;
+    }
+
+    const shift = this.getCurrentCashShift();
+    if (!shift || shift.status !== 'ABERTO') return null;
+
+    let currentDrawer = shift.initialBalance;
+    shift.movements.forEach((m: CashMovement) => {
+      if (m.type === 'SUPRIMENTO') {
+        currentDrawer += m.amount;
+      } else if (m.type === 'SANGRIA' || m.type === 'VALE') {
+        currentDrawer -= m.amount;
+      } else if (m.type === 'VENDA' && m.paymentMethod === 'DINHEIRO') {
+        currentDrawer += m.amount;
+      } else if (m.type === 'AJUSTE') {
+        currentDrawer += m.amount;
+      }
+    });
+
+    const diff = Number((newBalance - currentDrawer).toFixed(2));
+    if (diff === 0) return null;
+
+    const diffFormatted = diff > 0 ? `+R$ ${diff.toFixed(2)}` : `-R$ ${Math.abs(diff).toFixed(2)}`;
+    const movement: CashMovement = {
+      id: `cash-mov-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      type: 'AJUSTE',
+      amount: diff,
+      paymentMethod: 'DINHEIRO',
+      description: reason?.trim() 
+        ? `Ajuste manual de saldo da gaveta (${diffFormatted}): ${reason.trim()}` 
+        : `Ajuste manual de saldo da gaveta (${diffFormatted})`,
+      author: author?.trim() || 'admin',
     };
 
     shift.movements.push(movement);

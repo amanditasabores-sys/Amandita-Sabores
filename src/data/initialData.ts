@@ -1,4 +1,4 @@
-import { MenuItem, RestaurantConfig, User, Order, MenuItemAddon } from '../types';
+import { MenuItem, RestaurantConfig, User, Order, MenuItemAddon } from '../types/index';
 
 // Oficial additions as shown in the cardápio image:
 // "ADICIONAIS - R$ 3,00: Escolha qualquer um dos recheios abaixo:

@@ -446,7 +446,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
-                  Nome (Opcional)
+                  Nome
                 </label>
                 <input
                   type="text"
@@ -459,7 +459,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
               <div>
                 <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
-                  Telefone (Opcional)
+                  Telefone
                 </label>
                 <input
                   type="text"
@@ -472,18 +472,18 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             </div>
             <div className="text-[11px] text-emerald-800 bg-emerald-50/80 border border-emerald-200/60 rounded-xl px-2.5 py-1.5 flex items-center gap-1.5">
               <Store className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-              <span>Retirada: Apenas nome e telefone (opcionais).</span>
+              <span>Retirada: Apenas nome e telefone.</span>
             </div>
           </div>
         )}
 
-        {/* OPÇÃO ENTREGA: Nome, Telefone, Condomínio (Eco Way, Eco Fit, Outros), Bloco e Ap (Tudo Opcional) */}
+        {/* OPÇÃO ENTREGA: Nome, Telefone, Condomínio (Eco Way, Eco Fit, Outros), Bloco e Ap */}
         {fulfillmentType === 'DELIVERY' && (
           <div className="space-y-2.5 pt-1 border-t border-[#E8DFD5] animate-in fade-in">
             <div className="flex items-center justify-between text-[11px]">
               <span className="font-bold text-[#C86D3B] flex items-center gap-1">
                 <Bike className="w-3.5 h-3.5" />
-                <span>Dados de Entrega (Tudo Opcional)</span>
+                <span>Dados de Entrega</span>
               </span>
             </div>
 
@@ -491,7 +491,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
-                  Nome (Opcional)
+                  Nome
                 </label>
                 <input
                   type="text"
@@ -504,7 +504,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
               <div>
                 <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
-                  Telefone (Opcional)
+                  Telefone
                 </label>
                 <input
                   type="text"
@@ -520,7 +520,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             <div>
               <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1 flex items-center gap-1">
                 <Building2 className="w-3 h-3 text-[#C86D3B]" />
-                <span>Condomínio (Opcional)</span>
+                <span>Condomínio</span>
               </label>
               <div className="grid grid-cols-3 gap-1.5">
                 <button
@@ -565,7 +565,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                     type="text"
                     value={deliveryCondoCustom}
                     onChange={(e) => setDeliveryCondoCustom(e.target.value)}
-                    placeholder="Nome do condomínio / Endereço (opcional)"
+                    placeholder="Nome do condomínio / Endereço"
                     className="w-full px-2.5 py-1.5 bg-white border border-[#E8DFD5] rounded-xl text-xs font-medium text-[#2C1810]"
                   />
                 </div>
@@ -576,7 +576,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
-                  Bloco (Opcional)
+                  Bloco
                 </label>
                 <input
                   type="text"
@@ -589,7 +589,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
               <div>
                 <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
-                  Apartamento / Ap (Opcional)
+                  Apartamento / Ap
                 </label>
                 <input
                   type="text"
@@ -601,11 +601,11 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               </div>
             </div>
 
-            {/* Ponto de Referência (Opcional) */}
+            {/* Ponto de Referência */}
             <div>
               <input
                 type="text"
-                placeholder="Ponto de referência / Obs da entrega (opcional)"
+                placeholder="Ponto de referência / Obs da entrega"
                 value={deliveryReference}
                 onChange={(e) => setDeliveryReference(e.target.value)}
                 className="w-full px-2.5 py-1.5 bg-white border border-[#E8DFD5] rounded-xl text-xs font-medium text-[#2C1810]"
@@ -865,22 +865,22 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
       {/* Top Banner & Tabs */}
-      <div className="bg-[#FFFDF9] rounded-2xl p-5 border border-[#E8DFD5] shadow-xs flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3.5">
-          <div className="w-12 h-12 rounded-2xl bg-[#C86D3B]/10 text-[#C86D3B] flex items-center justify-center font-bold text-xl border border-[#C86D3B]/20">
-            <Store className="w-6 h-6 text-[#C86D3B]" />
+      <div className="bg-[#FFFDF9] rounded-2xl p-4 sm:p-5 border border-[#E8DFD5] shadow-xs flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
+          <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-2xl bg-[#C86D3B]/10 text-[#C86D3B] flex items-center justify-center font-bold text-xl border border-[#C86D3B]/20 shrink-0">
+            <Store className="w-5 h-5 sm:w-6 sm:h-6 text-[#C86D3B]" />
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-xl font-black text-[#2C1810]">PDV — Ponto de Venda & Balcão</h2>
-              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#C86D3B]/15 text-[#C86D3B] border border-[#C86D3B]/25">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-lg sm:text-xl font-black text-[#2C1810] break-words">PDV — Ponto de Venda & Balcão</h2>
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#C86D3B]/15 text-[#C86D3B] border border-[#C86D3B]/25 shrink-0">
                 AMANDITA SABORES
               </span>
             </div>
-            <p className="text-xs text-[#8C5E47] mt-0.5 flex items-center gap-2">
-              <span>Operador: <strong className="text-[#2C1810]">{operatorName}</strong></span>
+            <p className="text-xs text-[#8C5E47] mt-0.5 flex items-center gap-2 flex-wrap">
+              <span className="truncate">Operador: <strong className="text-[#2C1810]">{operatorName}</strong></span>
               <span>·</span>
-              <span className={`flex items-center gap-1 font-semibold ${
+              <span className={`flex items-center gap-1 font-semibold shrink-0 ${
                 currentShift && currentShift.status === 'ABERTO' ? 'text-emerald-700' : 'text-amber-700'
               }`}>
                 <span className={`w-2 h-2 rounded-full ${
@@ -893,7 +893,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         </div>
 
         {/* View mode toggle */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {onNavigateToCaixa && (
             <button
               onClick={onNavigateToCaixa}
@@ -907,7 +907,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
           <div className="flex p-1 bg-[#F5EFEB] rounded-xl border border-[#E8DFD5] text-xs font-bold">
             <button
               onClick={() => setActiveTab('vendas')}
-              className={`px-3.5 py-1.5 rounded-lg transition flex items-center gap-1.5 ${
+              className={`px-3 py-1.5 rounded-lg transition flex items-center gap-1.5 ${
                 activeTab === 'vendas'
                   ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
                   : 'text-[#6B4B3E] hover:text-[#2C1810]'
@@ -918,14 +918,14 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             </button>
             <button
               onClick={() => setActiveTab('historico')}
-              className={`px-3.5 py-1.5 rounded-lg transition flex items-center gap-1.5 ${
+              className={`px-3 py-1.5 rounded-lg transition flex items-center gap-1.5 ${
                 activeTab === 'historico'
                   ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
                   : 'text-[#6B4B3E] hover:text-[#2C1810]'
               }`}
             >
               <History className="w-3.5 h-3.5" />
-              <span>Histórico de Vendas ({orders.length})</span>
+              <span>Histórico ({orders.length})</span>
             </button>
           </div>
         </div>
@@ -948,25 +948,27 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                   <button
                     type="button"
                     onClick={() => setSelectionMode('cardapio')}
-                    className={`px-3 py-1 rounded-lg transition flex items-center gap-1.5 cursor-pointer ${
+                    className={`px-2.5 sm:px-3 py-1 rounded-lg transition flex items-center gap-1.5 cursor-pointer ${
                       selectionMode === 'cardapio'
                         ? 'bg-[#3D2314] text-white shadow-2xs'
                         : 'text-[#6B4B3E] hover:text-[#2C1810]'
                     }`}
                   >
                     <Sparkles className="w-3 h-3 text-amber-300" />
-                    <span>Estilo Cardápio (Adicionais & Qtd)</span>
+                    <span className="hidden sm:inline">Estilo Cardápio (Adicionais & Qtd)</span>
+                    <span className="sm:hidden">Cardápio</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setSelectionMode('rapido')}
-                    className={`px-3 py-1 rounded-lg transition flex items-center gap-1.5 cursor-pointer ${
+                    className={`px-2.5 sm:px-3 py-1 rounded-lg transition flex items-center gap-1.5 cursor-pointer ${
                       selectionMode === 'rapido'
                         ? 'bg-[#3D2314] text-white shadow-2xs'
                         : 'text-[#6B4B3E] hover:text-[#2C1810]'
                     }`}
                   >
-                    <span>⚡ 1-Clique Rápido</span>
+                    <span className="hidden sm:inline">⚡ 1-Clique Rápido</span>
+                    <span className="sm:hidden">⚡ Rápido</span>
                   </button>
                 </div>
               </div>

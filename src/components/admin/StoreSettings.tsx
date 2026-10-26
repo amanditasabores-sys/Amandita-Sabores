@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { RestaurantConfig } from '../../types';
-import { generatePixCopiaECola } from '../../utils/pix';
+import { generatePixCopiaECola, sanitizePixKey, sanitizeMerchantName, sanitizeMerchantCity } from '../../utils/pix';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { formatCurrency } from '../../utils/formatters';
 import { 
@@ -45,11 +45,12 @@ export const StoreSettings: React.FC = () => {
     try {
       const payload = generatePixCopiaECola({
         pixKey: config.pixKey.trim(),
+        keyType: config.pixKeyType,
         receiverName: config.pixReceiverName?.trim() || config.name,
-        receiverCity: config.pixReceiverCity?.trim() || 'SAO PAULO',
+        receiverCity: config.pixReceiverCity?.trim() || 'CAMPINA GRANDE',
         amount: amt,
         txId: 'TESTEPIX',
-        description: 'Teste PIX GestaoFood',
+        description: 'Amandita Sabores',
       });
       setTestPixCode(payload);
       const qr = await generateQRCodeDataUrl(payload, { width: 260, margin: 1 });
@@ -61,11 +62,19 @@ export const StoreSettings: React.FC = () => {
 
   useEffect(() => {
     generateTestPix();
-  }, [config.pixKey, config.pixReceiverName, config.pixReceiverCity, testAmount]);
+  }, [config.pixKey, config.pixKeyType, config.pixReceiverName, config.pixReceiverCity, config.name, testAmount]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    store.updateRestaurantConfig(config);
+    // Normalize BACEN fields to ensure the stored configuration never corrupts
+    const normalizedConfig: RestaurantConfig = {
+      ...config,
+      pixKey: sanitizePixKey(config.pixKey, config.pixKeyType),
+      pixReceiverName: sanitizeMerchantName(config.pixReceiverName || config.name),
+      pixReceiverCity: sanitizeMerchantCity(config.pixReceiverCity || 'CAMPINA GRANDE'),
+    };
+    setConfig(normalizedConfig);
+    store.updateRestaurantConfig(normalizedConfig);
     setIsSaved(true);
     setTimeout(() => setIsSaved(false), 3000);
   };
@@ -158,8 +167,8 @@ export const StoreSettings: React.FC = () => {
                   onChange={(e) => setConfig({ ...config, pixKeyType: e.target.value as any })}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
                 >
-                  <option value="CPF">CPF (Somente números)</option>
-                  <option value="CNPJ">CNPJ (Somente números)</option>
+                  <option value="CPF">CPF (11 dígitos)</option>
+                  <option value="CNPJ">CNPJ (14 dígitos)</option>
                   <option value="TELEFONE">Telefone Celular (com DDD)</option>
                   <option value="EMAIL">E-mail</option>
                   <option value="ALEATORIA">Chave Aleatória (EVP)</option>
@@ -176,9 +185,22 @@ export const StoreSettings: React.FC = () => {
                   required
                   value={config.pixKey}
                   onChange={(e) => setConfig({ ...config, pixKey: e.target.value })}
-                  placeholder="Ex: 11987654321 ou loja@email.com"
+                  placeholder={
+                    config.pixKeyType === 'TELEFONE'
+                      ? 'Ex: (83) 99123-4567'
+                      : config.pixKeyType === 'CPF'
+                      ? 'Ex: 123.456.789-00'
+                      : config.pixKeyType === 'CNPJ'
+                      ? 'Ex: 12.345.678/0001-90'
+                      : config.pixKeyType === 'ALEATORIA'
+                      ? 'Ex: 123e4567-e89b-12d3-a456-426614174000'
+                      : 'Ex: contato@amanditasabores.com.br'
+                  }
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
                 />
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  Formatada para BACEN: <strong className="font-mono text-emerald-700">{sanitizePixKey(config.pixKey, config.pixKeyType) || '—'}</strong>
+                </span>
               </div>
 
               {/* Nome do Beneficiário */}
@@ -190,10 +212,12 @@ export const StoreSettings: React.FC = () => {
                   type="text"
                   value={config.pixReceiverName || ''}
                   onChange={(e) => setConfig({ ...config, pixReceiverName: e.target.value })}
-                  placeholder="Ex: RESTAURANTE BRASA E SABOR"
+                  placeholder="Ex: AMANDITA SABORES"
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 uppercase"
                 />
-                <span className="text-[10px] text-slate-400 mt-1 block">Nome que aparece no banco do cliente (máx 25 caracteres)</span>
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  BACEN (máx 25 chars): <strong className="text-slate-700">{sanitizeMerchantName(config.pixReceiverName || config.name)}</strong> ({sanitizeMerchantName(config.pixReceiverName || config.name).length}/25)
+                </span>
               </div>
 
               {/* Cidade do Beneficiário */}
@@ -203,19 +227,21 @@ export const StoreSettings: React.FC = () => {
                 </label>
                 <input
                   type="text"
-                  value={config.pixReceiverCity || 'SAO PAULO'}
+                  value={config.pixReceiverCity || 'CAMPINA GRANDE'}
                   onChange={(e) => setConfig({ ...config, pixReceiverCity: e.target.value })}
-                  placeholder="Ex: SAO PAULO"
+                  placeholder="Ex: CAMPINA GRANDE"
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 uppercase"
                 />
-                <span className="text-[10px] text-slate-400 mt-1 block">Cidade da agência/conta bancária (sem acentos)</span>
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  BACEN (máx 15 chars): <strong className="text-slate-700">{sanitizeMerchantCity(config.pixReceiverCity || 'CAMPINA GRANDE')}</strong> ({sanitizeMerchantCity(config.pixReceiverCity || 'CAMPINA GRANDE').length}/15)
+                </span>
               </div>
             </div>
 
-            <div className="p-3 bg-amber-50/70 border border-amber-200/80 rounded-xl text-xs text-amber-900 flex items-start gap-2">
-              <Sparkles className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div className="p-3 bg-emerald-50/80 border border-emerald-200/80 rounded-xl text-xs text-emerald-950 flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <span>
-                <strong>Como funciona o PIX dinâmico:</strong> Quando o cliente finalizar um pedido no cardápio ou o operador registrar uma venda balcão, o sistema criará na hora um QR Code oficial do Banco Central com o <strong>valor exato</strong> daquela compra, agilizando a conferência e o pagamento sem erros de digitação.
+                <strong>Padrão Oficial BACEN BR Code (Estático com valor):</strong> O QR Code gerado segue rigorosamente o padrão do Banco Central (Ponto de Iniciação <code className="bg-emerald-100 text-emerald-900 px-1 py-0.5 rounded text-[11px] font-mono">01: 11</code>), permitindo leitura imediata e sem erros em qualquer aplicativo de banco (Nubank, Itaú, Banco do Brasil, Bradesco, Inter, Santander, Caixa e Mercado Pago).
               </span>
             </div>
           </div>

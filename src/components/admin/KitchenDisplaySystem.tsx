@@ -42,29 +42,29 @@ export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orde
   return (
     <div className="space-y-4">
       {/* KDS Header summary */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 text-white p-4 rounded-2xl shadow-sm">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold">
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 text-white p-3.5 sm:p-4 rounded-2xl shadow-sm">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
+          <div className="w-10 h-10 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold shrink-0">
             <ChefHat className="w-6 h-6" />
           </div>
-          <div>
-            <h2 className="text-base font-bold tracking-tight">KDS - Controle de Produção da Cozinha</h2>
-            <p className="text-xs text-slate-400">
+          <div className="min-w-0">
+            <h2 className="text-sm sm:text-base font-bold tracking-tight truncate">KDS - Controle de Produção da Cozinha</h2>
+            <p className="text-xs text-slate-400 truncate">
               {kitchenOrders.length} pedido(s) na fila de produção em tempo real
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-3 text-xs">
-          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-500/20 text-emerald-300 rounded-lg border border-emerald-500/30">
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs shrink-0">
+          <div className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 bg-emerald-500/20 text-emerald-300 rounded-lg border border-emerald-500/30">
             <span className="w-2 h-2 rounded-full bg-emerald-400" />
             <span>Normal (&lt;15m)</span>
           </div>
-          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">
+          <div className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">
             <span className="w-2 h-2 rounded-full bg-amber-400" />
             <span>Atenção (15-25m)</span>
           </div>
-          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-rose-500/20 text-rose-300 rounded-lg border border-rose-500/30">
+          <div className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 bg-rose-500/20 text-rose-300 rounded-lg border border-rose-500/30">
             <span className="w-2 h-2 rounded-full bg-rose-400 animate-ping" />
             <span>Atraso (&gt;25m)</span>
           </div>

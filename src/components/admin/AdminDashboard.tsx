@@ -141,24 +141,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
     <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] pb-16">
       {/* Top Main Navigation Bar */}
       <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-md sticky top-0 z-30 border-b border-[#C86D3B]/25">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <AmanditaLogo variant="icon" size="md" theme="dark" />
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-black text-base tracking-tight text-white">{config.name}</h1>
-                <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-[#C86D3B]/25 text-[#E89255] border border-[#C86D3B]/40 uppercase tracking-wider">
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 py-2.5 sm:py-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
+            <div className="shrink-0">
+              <AmanditaLogo variant="icon" size="md" theme="dark" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="font-black text-sm sm:text-base tracking-tight text-white truncate">{config.name}</h1>
+                <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-[#C86D3B]/25 text-[#E89255] border border-[#C86D3B]/40 uppercase tracking-wider shrink-0">
                   PAINEL DE GESTÃO
                 </span>
               </div>
-              <p className="text-xs text-[#D9C7B8] flex items-center gap-2">
-                <span className="font-mono text-amber-300 font-bold">{currentTime}</span>
+              <p className="text-xs text-[#D9C7B8] flex items-center gap-2 flex-wrap mt-0.5">
+                <span className="font-mono text-amber-300 font-bold shrink-0">{currentTime}</span>
                 <span>·</span>
-                <span>{activeOrdersCount} pedidos ativos</span>
+                <span className="shrink-0">{activeOrdersCount} pedidos ativos</span>
                 {newOrdersCount > 0 && (
                   <>
                     <span>·</span>
-                    <span className="text-[#E89255] font-black flex items-center gap-1">
+                    <span className="text-[#E89255] font-black flex items-center gap-1 shrink-0">
                       <Bell className="w-3 h-3 animate-bounce" />
                       {newOrdersCount} novos
                     </span>
@@ -169,7 +171,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
           </div>
 
           {/* Quick shortcuts and Audio toggles */}
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             {/* Audio Alert Toggle & Test Button */}
             <div className="flex items-center gap-1 bg-[#1F100B] p-1 rounded-xl border border-[#4A2E1F]">
               <button
@@ -229,7 +231,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
         </div>
 
         {/* Navigation Tabs */}
-        <div className="max-w-7xl mx-auto px-4 sm:px-6">
+        <div className="max-w-7xl mx-auto px-2 sm:px-6 w-full max-w-full overflow-hidden">
           <div className="flex items-center gap-1 overflow-x-auto border-t border-[#4A2E1F] pt-1.5 pb-1.5 scrollbar-thin">
             {allowedTabs.map((tab) => {
               const Icon = tab.icon;
@@ -239,7 +241,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer ${
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer shrink-0 ${
                     isActive
                       ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-sm'
                       : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'

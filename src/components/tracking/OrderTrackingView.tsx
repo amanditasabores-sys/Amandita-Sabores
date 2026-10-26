@@ -205,28 +205,28 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({
     <div className="min-h-screen bg-slate-100/70 pb-16">
       {/* Top Bar */}
       <header className="bg-slate-900 text-white sticky top-0 z-30 shadow-md">
-        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <div className="max-w-2xl mx-auto px-3 sm:px-4 py-2.5 sm:py-3 flex items-center justify-between gap-2 flex-wrap sm:flex-nowrap">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
             {onNavigateToMenu && (
               <button
                 onClick={onNavigateToMenu}
-                className="p-1.5 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
+                className="p-1.5 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer shrink-0"
                 title="Voltar ao Cardápio"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
             )}
-            <div>
-              <h1 className="font-bold text-sm tracking-tight">{config.name}</h1>
-              <p className="text-[11px] text-amber-400 font-mono">Rastreamento de Pedido {order.orderNumber}</p>
+            <div className="min-w-0">
+              <h1 className="font-bold text-xs sm:text-sm tracking-tight truncate">{config.name}</h1>
+              <p className="text-[10px] sm:text-[11px] text-amber-400 font-mono truncate">Rastreamento de Pedido {order.orderNumber}</p>
             </div>
           </div>
           <button
             onClick={copyTrackingLink}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded-lg transition cursor-pointer"
+            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded-lg transition cursor-pointer shrink-0"
           >
             {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-            <span>{copiedLink ? 'Link Copiado!' : 'Copiar Link'}</span>
+            <span>{copiedLink ? 'Copiado!' : 'Copiar Link'}</span>
           </button>
         </div>
       </header>

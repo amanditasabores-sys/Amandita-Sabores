@@ -168,8 +168,8 @@ export const MenuManagement: React.FC = () => {
   return (
     <div className="space-y-4">
       {/* Action & Filter Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
-        <div className="flex items-center gap-3 flex-1 min-w-[280px]">
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 flex-1 min-w-0 sm:min-w-[280px]">
           <div className="relative flex-1 max-w-md">
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
             <input
@@ -194,7 +194,7 @@ export const MenuManagement: React.FC = () => {
 
         <button
           onClick={handleOpenCreate}
-          className="flex items-center gap-1.5 px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition shadow-sm cursor-pointer"
+          className="flex items-center justify-center gap-1.5 px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition shadow-sm cursor-pointer w-full sm:w-auto"
         >
           <Plus className="w-4 h-4 stroke-[3]" />
           <span>Novo Prato / Item</span>
@@ -215,9 +215,9 @@ export const MenuManagement: React.FC = () => {
                 <div className="w-20 h-20 rounded-xl overflow-hidden bg-slate-100 shrink-0">
                   <img src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" />
                 </div>
-                <div className="flex-1">
+                <div className="min-w-0 flex-1">
                   <div className="flex items-start justify-between">
-                    <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider block">
+                    <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider block truncate">
                       {item.category}
                     </span>
                     <button
