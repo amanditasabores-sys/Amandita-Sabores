@@ -23,6 +23,7 @@ import {
   Database
 } from 'lucide-react';
 import { FirebaseStatusModal } from './FirebaseStatusModal';
+import { PrinterSettings } from './PrinterSettings';
 
 export const StoreSettings: React.FC = () => {
   const [config, setConfig] = useState<RestaurantConfig>(() => store.getRestaurantConfig());
@@ -411,6 +412,9 @@ export const StoreSettings: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* SECTION 4: IMPRESSORA DE PEDIDOS TÉRMICA 58MM BLUETOOTH */}
+      <PrinterSettings />
 
       <FirebaseStatusModal
         isOpen={isFirebaseModalOpen}

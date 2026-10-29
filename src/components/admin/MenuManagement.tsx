@@ -16,15 +16,12 @@ import {
 import { ConfirmModal } from '../common/ConfirmModal';
 
 const PRESET_IMAGES = [
-  { label: 'Hambúrguer 1', url: 'https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Hambúrguer 2', url: 'https://images.unsplash.com/photo-1586190848861-99aa4a171e90?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Pizza Margherita', url: 'https://images.unsplash.com/photo-1604382355076-af4b0eb60143?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Pizza Calabresa', url: 'https://images.unsplash.com/photo-1513104890138-7c749659a591?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Batata Rústica', url: 'https://images.unsplash.com/photo-1576107232684-1279f3908594?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Coxinha / Porção', url: 'https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Refrigerante', url: 'https://images.unsplash.com/photo-1622483767028-3f66f32aef97?auto=format&fit=crop&w=700&q=80' },
+  { label: 'Cuscuz Nordestino', url: 'https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80' },
+  { label: 'Tapioca Recheada', url: 'https://images.unsplash.com/photo-1544025162-d76694265947?auto=format&fit=crop&w=700&q=80' },
+  { label: 'Café Especial', url: 'https://images.unsplash.com/photo-1514432324607-a09d9b4aefdd?auto=format&fit=crop&w=700&q=80' },
+  { label: 'Pão na Chapa', url: 'https://images.unsplash.com/photo-1586190848861-99aa4a171e90?auto=format&fit=crop&w=700&q=80' },
   { label: 'Suco Natural', url: 'https://images.unsplash.com/photo-1613478223719-2ab802602423?auto=format&fit=crop&w=700&q=80' },
-  { label: 'Sobremesa / Cheesecake', url: 'https://images.unsplash.com/photo-1533134242443-d4fd215305ad?auto=format&fit=crop&w=700&q=80' },
+  { label: 'Bolo Caseiro / Sobremesa', url: 'https://images.unsplash.com/photo-1533134242443-d4fd215305ad?auto=format&fit=crop&w=700&q=80' },
 ];
 
 export const MenuManagement: React.FC = () => {
@@ -40,7 +37,7 @@ export const MenuManagement: React.FC = () => {
   // Form fields
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [category, setCategory] = useState('Hambúrgueres Artesanais');
+  const [category, setCategory] = useState('Cuscuz Recheado');
   const [price, setPrice] = useState('');
   const [costPrice, setCostPrice] = useState('');
   const [prepTimeMinutes, setPrepTimeMinutes] = useState('20');
@@ -67,7 +64,7 @@ export const MenuManagement: React.FC = () => {
     setEditingItem(null);
     setName('');
     setDescription('');
-    setCategory('Hambúrgueres Artesanais');
+    setCategory('Cuscuz Recheado');
     setPrice('');
     setCostPrice('');
     setPrepTimeMinutes('20');

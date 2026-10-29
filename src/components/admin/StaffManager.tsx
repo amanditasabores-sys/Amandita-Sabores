@@ -250,9 +250,9 @@ export const StaffManager: React.FC = () => {
   const filteredUsers = users.filter((u) => {
     const q = searchQuery.toLowerCase();
     const nameMatch = (u.name || '').toLowerCase().includes(q);
-    const userMatch = u.username.toLowerCase().includes(q);
-    const emailMatch = u.email.toLowerCase().includes(q);
-    const roleMatch = u.role.toLowerCase().includes(q);
+    const userMatch = (u.username || '').toLowerCase().includes(q);
+    const emailMatch = (u.email || '').toLowerCase().includes(q);
+    const roleMatch = (u.role || '').toLowerCase().includes(q);
     return nameMatch || userMatch || emailMatch || roleMatch;
   });
 

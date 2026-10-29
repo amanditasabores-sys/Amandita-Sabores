@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { store } from '../../services/store';
+import { thermalPrinterService } from '../../services/thermalPrinter';
 import { Order, OrderStatus } from '../../types';
 import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel, getStatusDetails } from '../../utils/formatters';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
@@ -19,6 +20,7 @@ import {
   AlertCircle,
   Trash2,
   UploadCloud,
+  FileText,
   X
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
@@ -90,6 +92,8 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     }
   };
 
+  const [thermalPrintNotice, setThermalPrintNotice] = useState<{ message: string; success: boolean } | null>(null);
+
   const handlePrintReceipt = async (order: Order) => {
     setPrintableOrder(order);
     // Generate public QR code for delivery driver to scan without 403 error
@@ -102,8 +106,39 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     }, 300);
   };
 
+  const handleThermalPrint = async (order: Order) => {
+    const isReprint = thermalPrinterService.hasOrderBeenPrinted(order.id);
+    const res = await thermalPrinterService.printOrder(order, { forceReprint: isReprint });
+    setThermalPrintNotice({
+      message: res.message,
+      success: res.success,
+    });
+    setTimeout(() => setThermalPrintNotice(null), 4000);
+  };
+
   return (
     <div className="space-y-4">
+      {/* Toast Notice for Thermal Printer */}
+      {thermalPrintNotice && (
+        <div className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 shadow-sm ${
+          thermalPrintNotice.success 
+            ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' 
+            : 'bg-amber-50 text-amber-800 border border-amber-200'
+        }`}>
+          <div className="flex items-center gap-2">
+            <Printer className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-semibold">{thermalPrintNotice.message}</span>
+          </div>
+          <button 
+            type="button" 
+            onClick={() => setThermalPrintNotice(null)} 
+            className="text-slate-400 hover:text-slate-600 text-xs px-1 font-bold cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Kanban Board Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3.5 items-start">
         {columns.map((col) => {
@@ -160,6 +195,12 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                             ) : (
                               <span title="Salvo em armazenamento local deste dispositivo" className="inline-flex text-slate-400">
                                 <Clock className="w-3 h-3 opacity-50" />
+                              </span>
+                            )}
+                            {thermalPrinterService.hasOrderBeenPrinted(order.id) && (
+                              <span title="Comprovante de Balcão já impresso" className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-emerald-50 text-emerald-700 rounded text-[9px] font-bold border border-emerald-200">
+                                <Printer className="w-2.5 h-2.5" />
+                                <span>Impresso</span>
                               </span>
                             )}
                           </div>
@@ -248,11 +289,27 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                           )}
 
                           <button
-                            onClick={(e) => { e.stopPropagation(); handlePrintReceipt(order); }}
-                            className="p-1 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition"
-                            title="Imprimir Comanda com QR Code"
+                            onClick={(e) => { e.stopPropagation(); handleThermalPrint(order); }}
+                            className={`p-1 rounded-lg transition ${
+                              thermalPrinterService.hasOrderBeenPrinted(order.id)
+                                ? 'text-emerald-700 hover:text-emerald-800 hover:bg-emerald-50'
+                                : 'text-[#C86D3B] hover:text-[#721C24] hover:bg-amber-50'
+                            }`}
+                            title={
+                              thermalPrinterService.hasOrderBeenPrinted(order.id)
+                                ? 'Reimprimir Cupom Térmico 58mm (Bluetooth)'
+                                : 'Imprimir Cupom Térmico 58mm (Bluetooth)'
+                            }
                           >
                             <Printer className="w-3.5 h-3.5" />
+                          </button>
+
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handlePrintReceipt(order); }}
+                            className="p-1 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition"
+                            title="Imprimir Comanda Completa (Spooler / A4)"
+                          >
+                            <FileText className="w-3.5 h-3.5" />
                           </button>
 
                           <button
@@ -289,11 +346,26 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => handlePrintReceipt(selectedOrderForModal)}
-                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+                  type="button"
+                  onClick={() => handleThermalPrint(selectedOrderForModal)}
+                  className="px-3 py-1.5 bg-[#C86D3B] hover:bg-[#721C24] text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow-xs cursor-pointer"
+                  title="Imprimir comprovante formatado para impressora térmica de 58 mm via Bluetooth"
                 >
                   <Printer className="w-3.5 h-3.5" />
-                  <span>Imprimir Comanda</span>
+                  <span>
+                    {thermalPrinterService.hasOrderBeenPrinted(selectedOrderForModal.id)
+                      ? 'Reimprimir Térmica 58mm'
+                      : 'Imprimir Térmica 58mm'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePrintReceipt(selectedOrderForModal)}
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition"
+                  title="Imprimir Comanda Completa A4/Spooler com QR Code"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>Comanda A4</span>
                 </button>
                 <button
                   onClick={() => setSelectedOrderForModal(null)}

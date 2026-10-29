@@ -14,8 +14,9 @@ import {
   UserRole
 } from '../types';
 import { soundService } from './audio';
+import { thermalPrinterService } from './thermalPrinter';
 import { generatePixCopiaECola } from '../utils/pix';
-import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_USERS, INITIAL_ORDERS } from '../data/initialData';
+import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_USERS, INITIAL_ORDERS, OFFICIAL_ADDONS } from '../data/initialData';
 import { 
   db, 
   auth, 
@@ -36,6 +37,7 @@ import {
   collection, 
   doc, 
   setDoc, 
+  updateDoc,
   deleteDoc, 
   getDocs, 
   getDoc,
@@ -401,7 +403,7 @@ class StoreService {
               if (!profile) {
                 const localUsers = this.getUsers();
                 profile = localUsers.find(
-                  (u) => u.id === firebaseUser.uid || (firebaseUser.email && u.email.toLowerCase() === firebaseUser.email.toLowerCase())
+                  (u) => u.id === firebaseUser.uid || (firebaseUser.email && (u.email || '').toLowerCase() === firebaseUser.email.toLowerCase())
                 ) || null;
               }
               if (profile && profile.status === 'ATIVO') {
@@ -442,9 +444,22 @@ class StoreService {
 
   private initStorage() {
     try {
-      // Menu items migration check
+      // Menu items robust preservation check
       const currentMenuData = localStorage.getItem('gf_menu_items');
-      if (!currentMenuData || currentMenuData.includes('Smash Burger') || !currentMenuData.includes('Gostosinho')) {
+      let needsMenuInit = false;
+      if (!currentMenuData) {
+        needsMenuInit = true;
+      } else {
+        try {
+          const parsed = JSON.parse(currentMenuData);
+          if (!Array.isArray(parsed) || parsed.length === 0 || currentMenuData.includes('Smash Burger')) {
+            needsMenuInit = true;
+          }
+        } catch {
+          needsMenuInit = true;
+        }
+      }
+      if (needsMenuInit) {
         localStorage.setItem('gf_menu_items', JSON.stringify(INITIAL_MENU));
       }
 
@@ -504,10 +519,19 @@ class StoreService {
         localStorage.setItem('gf_access_logs', JSON.stringify(initialLogs));
       }
 
-      // Set default logged user if none exists or update to Amandita admin
+      // Security Isolation: Never auto-log in visitors as staff.
+      // Visitor sessions start unauthenticated (currentUser is null).
+      // Only retain gf_current_user if the user legitimately logged in with authorized modules.
       const currUser = localStorage.getItem('gf_current_user');
-      if (!currUser || !currUser.includes('allowedModules')) {
-        localStorage.setItem('gf_current_user', JSON.stringify(INITIAL_USERS[0]));
+      if (currUser) {
+        try {
+          const parsed = JSON.parse(currUser);
+          if (!parsed || !parsed.allowedModules || !parsed.role) {
+            localStorage.removeItem('gf_current_user');
+          }
+        } catch {
+          localStorage.removeItem('gf_current_user');
+        }
       }
     } catch {
       // Storage quota or restriction fallback
@@ -647,7 +671,7 @@ class StoreService {
     // 4. Staff domain email check (@staff.amanditasabores.com.br or @amanditasabores.com.br)
     if (firebaseUser.email && (firebaseUser.email.endsWith('@staff.amanditasabores.com.br') || firebaseUser.email.endsWith('@amanditasabores.com.br'))) {
       const username = firebaseUser.email.split('@')[0].toLowerCase();
-      const byUser = localUsers.find((u) => u.username.toLowerCase() === username);
+      const byUser = localUsers.find((u) => (u.username || '').toLowerCase() === username);
       if (byUser && this.isAuthorizedStaffRole(byUser.role)) {
         return byUser.role as UserRole;
       }
@@ -695,12 +719,28 @@ class StoreService {
         collection(db, 'menu_items'),
         (snapshot) => {
           if (!snapshot.empty) {
-            const remoteMenu: MenuItem[] = [];
+            const currentList = this.getMenuItems();
+            const currentMap = new Map<string, MenuItem>();
+            for (const it of currentList) {
+              currentMap.set(it.id, it);
+            }
             snapshot.forEach((docSnap) => {
-              remoteMenu.push(docSnap.data() as MenuItem);
+              const d = docSnap.data() as MenuItem;
+              if (d && d.name) {
+                const base = currentMap.get(docSnap.id);
+                currentMap.set(docSnap.id, {
+                  ...(base || {}),
+                  ...d,
+                  id: docSnap.id,
+                  available: d.available !== false,
+                });
+              }
             });
-            localStorage.setItem('gf_menu_items', JSON.stringify(remoteMenu));
-            this.notify('FIRESTORE_MENU_SYNCED', { count: remoteMenu.length });
+            const merged = Array.from(currentMap.values());
+            if (merged.length > 0) {
+              localStorage.setItem('gf_menu_items', JSON.stringify(merged));
+              this.notify('FIRESTORE_MENU_SYNCED', { count: merged.length });
+            }
           }
         },
         (error) => {
@@ -770,6 +810,7 @@ class StoreService {
 
       const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA' || allowedModules.includes('caixa');
       const canAccessUsers = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('usuarios');
+      const canManageMenu = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('menu') || allowedModules.includes('relatorios');
 
       // 1. Synchronize All Orders in Real Time (Staff only: Kitchen KDS, POS Balcão, Entregadores, Admin)
       const unsubOrders = onSnapshot(
@@ -790,6 +831,22 @@ class StoreService {
           if (newIncoming.length > 0) {
             newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
             soundService.startPersistentOrderAlert(3500);
+
+            // Auto-print newly received pickup orders on 58mm thermal printer if enabled
+            try {
+              const printerCfg = thermalPrinterService.getConfig();
+              if (printerCfg.enabled && printerCfg.autoPrintPickup) {
+                newIncoming.forEach((o) => {
+                  if (o.fulfillmentType === 'RETIRADA' && !thermalPrinterService.hasOrderBeenPrinted(o.id)) {
+                    thermalPrinterService.printOrder(o).catch((err) => {
+                      console.info('[Impressora Térmica 58mm] Aviso ao auto-imprimir pedido:', err);
+                    });
+                  }
+                });
+              }
+            } catch {
+              // Non-blocking
+            }
           }
 
           if (remoteOrders.length > 0) {
@@ -889,13 +946,39 @@ class StoreService {
             if (!snapshot.empty) {
               const remoteUsers: User[] = [];
               snapshot.forEach((docSnap) => {
-                remoteUsers.push(docSnap.data() as User);
+                const data = docSnap.data() as Partial<User>;
+                if (data) {
+                  const sanitizedUser: User = {
+                    id: docSnap.id || data.id || `user-${Date.now()}`,
+                    name: data.name || (data.email ? data.email.split('@')[0] : 'Colaborador'),
+                    username: (data.username || (data.email ? data.email.split('@')[0] : `user_${docSnap.id.slice(0, 6)}`)).toLowerCase(),
+                    email: data.email || '',
+                    isEmailVerified: Boolean(data.isEmailVerified),
+                    role: data.role || 'ATENDENTE',
+                    status: data.status || 'ATIVO',
+                    allowedModules: Array.isArray(data.allowedModules) ? data.allowedModules : [],
+                    phone: data.phone || '',
+                    lastLoginAt: data.lastLoginAt,
+                    createdAt: data.createdAt || new Date().toISOString(),
+                  };
+                  remoteUsers.push(sanitizedUser);
+                }
               });
 
               const localUsers = this.getUsers();
               const merged = [...remoteUsers];
               for (const lu of localUsers) {
-                if (!merged.some((ru) => ru.id === lu.id || ru.username.toLowerCase() === lu.username.toLowerCase())) {
+                const luUser = (lu.username || '').trim().toLowerCase();
+                const luEmail = (lu.email || '').trim().toLowerCase();
+                const alreadyInMerged = merged.some((ru) => {
+                  if (ru.id && lu.id && ru.id === lu.id) return true;
+                  const ruUser = (ru.username || '').trim().toLowerCase();
+                  if (ruUser && luUser && ruUser === luUser) return true;
+                  const ruEmail = (ru.email || '').trim().toLowerCase();
+                  if (ruEmail && luEmail && ruEmail === luEmail) return true;
+                  return false;
+                });
+                if (!alreadyInMerged) {
                   merged.push(lu);
                 }
               }
@@ -914,6 +997,42 @@ class StoreService {
         this.staffUnsubscribers.push(unsubUsers);
       }
 
+      // 4. Synchronize Confidential Menu Costs in Real Time (Restricted to Manager / Admin)
+      if (canManageMenu) {
+        const unsubCosts = onSnapshot(
+          collection(db, 'menu_item_costs'),
+          (snapshot) => {
+            if (!snapshot.empty) {
+              const costsMap = new Map<string, number>();
+              snapshot.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (typeof data.costPrice === 'number') {
+                  costsMap.set(docSnap.id, data.costPrice);
+                }
+              });
+
+              const items = this.getMenuItems();
+              let updated = false;
+              for (const item of items) {
+                if (costsMap.has(item.id) && item.costPrice !== costsMap.get(item.id)) {
+                  item.costPrice = costsMap.get(item.id);
+                  updated = true;
+                }
+              }
+
+              if (updated) {
+                localStorage.setItem('gf_menu_items', JSON.stringify(items));
+                this.notify('MENU_UPDATED', {});
+              }
+            }
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Confidential cost listener notice:', error.message);
+          }
+        );
+        this.staffUnsubscribers.push(unsubCosts);
+      }
+
     } catch (err) {
       console.warn('[Firestore Staff Sync Setup Error]:', err);
     }
@@ -922,6 +1041,7 @@ class StoreService {
   /**
    * Seeds initial menu items and restaurant config to Cloud Firestore
    * if the collections are currently empty on the cloud database.
+   * Strips costPrice from public menu_items and isolates it in menu_item_costs.
    */
   public async ensureInitialDataSeededToFirestore(): Promise<void> {
     if (!db || !this.isFirebaseAuthStaff()) return;
@@ -932,19 +1052,109 @@ class StoreService {
         console.info('[Firestore] Populando cardápio inicial no Cloud Firestore (amandita-sabores)...');
         const items = this.getMenuItems();
         for (const item of items) {
-          await setDoc(doc(db, 'menu_items', item.id), item);
+          const { costPrice, ...publicItem } = item;
+          await setDoc(doc(db, 'menu_items', item.id), this.cleanForFirestore(publicItem));
+          if (costPrice !== undefined) {
+            await setDoc(doc(db, 'menu_item_costs', item.id), {
+              id: item.id,
+              costPrice,
+              updatedAt: new Date().toISOString()
+            }, { merge: true }).catch(() => {});
+          }
         }
+      } else {
+        // Coleção já existe: migra com segurança e limpa qualquer 'costPrice' residual
+        await this.migrateAndCleanseLegacyMenuItemCosts();
       }
 
       const configRef = doc(db, 'configs', 'restaurant');
       const configSnap = await getDoc(configRef);
       if (!configSnap.exists()) {
         const config = this.getRestaurantConfig();
-        await setDoc(configRef, config);
+        const publicPayload = {
+          name: config.name,
+          phone: config.phone,
+          whatsapp: config.whatsapp,
+          address: config.address,
+          city: config.city,
+          pixKey: config.pixKey,
+          pixKeyType: config.pixKeyType || 'EMAIL',
+          pixReceiverName: config.pixReceiverName || config.name,
+          pixReceiverCity: config.pixReceiverCity || 'CAMPINA GRANDE',
+          deliveryFeeBase: config.deliveryFeeBase ?? 5.0,
+          avgPrepTimeMinutes: config.avgPrepTimeMinutes ?? 15,
+          avgDeliveryTimeMinutes: config.avgDeliveryTimeMinutes ?? 25,
+          isOpen: Boolean(config.isOpen),
+          ...(config.customPublicUrl ? { customPublicUrl: config.customPublicUrl } : {}),
+          updatedAt: new Date().toISOString()
+        };
+        await setDoc(configRef, publicPayload);
       }
     } catch (err) {
       console.warn('[Firestore Initial Seeding Notice]:', err);
     }
+  }
+
+  /**
+   * Safe migration to sanitize legacy /menu_items in Cloud Firestore:
+   * Finds any documents that still contain `costPrice`, transfers their cost
+   * to /menu_item_costs/{itemId} and rewrites /menu_items/{itemId} without costPrice.
+   * Completely preserves all prices, products, addons, descriptions and images.
+   */
+  public async migrateAndCleanseLegacyMenuItemCosts(): Promise<{
+    inspected: number;
+    costsPreserved: number;
+    sanitized: number;
+    errors: number;
+  }> {
+    if (!db) {
+      return { inspected: 0, costsPreserved: 0, sanitized: 0, errors: 0 };
+    }
+
+    let inspected = 0;
+    let costsPreserved = 0;
+    let sanitized = 0;
+    let errors = 0;
+
+    try {
+      const snapshot = await getDocs(collection(db, 'menu_items'));
+      inspected = snapshot.size;
+
+      for (const docSnap of snapshot.docs) {
+        const data = docSnap.data();
+        if (data && 'costPrice' in data && data.costPrice !== undefined) {
+          try {
+            const costVal = Number(data.costPrice);
+            // 1. Grava na coleção confidencial protegida /menu_item_costs
+            if (!Number.isNaN(costVal)) {
+              await setDoc(doc(db, 'menu_item_costs', docSnap.id), {
+                id: docSnap.id,
+                costPrice: costVal,
+                updatedAt: new Date().toISOString()
+              }, { merge: true });
+              costsPreserved++;
+            }
+
+            // 2. Remove o campo costPrice do documento público /menu_items
+            const cleanedData = { ...data };
+            delete cleanedData.costPrice;
+            await setDoc(doc(db, 'menu_items', docSnap.id), this.cleanForFirestore(cleanedData));
+            sanitized++;
+          } catch (err) {
+            console.warn(`[Menu Cost Migration] Falha no item ${docSnap.id}:`, err);
+            errors++;
+          }
+        }
+      }
+
+      if (sanitized > 0) {
+        console.info(`[Menu Cost Migration] ${sanitized} itens de cardápio tiveram seus custos isolados em /menu_item_costs.`);
+      }
+    } catch (err) {
+      console.warn('[Menu Cost Migration] Erro ao inspecionar menu_items:', err);
+    }
+
+    return { inspected, costsPreserved, sanitized, errors };
   }
 
   public stopStaffFirestoreSync(): void {
@@ -1006,29 +1216,56 @@ class StoreService {
       let configCount = 0;
       let skippedCount = 0;
 
-      // 1. Migrate Restaurant Config
+      // 1. Migrate Restaurant Config (Public data only)
       const config = this.getRestaurantConfig();
       const configRef = doc(db, 'configs', 'restaurant');
       const configSnap = await getDoc(configRef);
       if (!configSnap.exists()) {
-        await setDoc(configRef, config);
+        const publicPayload = {
+          name: config.name,
+          phone: config.phone,
+          whatsapp: config.whatsapp,
+          address: config.address,
+          city: config.city,
+          pixKey: config.pixKey,
+          pixKeyType: config.pixKeyType || 'EMAIL',
+          pixReceiverName: config.pixReceiverName || config.name,
+          pixReceiverCity: config.pixReceiverCity || 'CAMPINA GRANDE',
+          deliveryFeeBase: config.deliveryFeeBase ?? 5.0,
+          avgPrepTimeMinutes: config.avgPrepTimeMinutes ?? 15,
+          avgDeliveryTimeMinutes: config.avgDeliveryTimeMinutes ?? 25,
+          isOpen: Boolean(config.isOpen),
+          ...(config.customPublicUrl ? { customPublicUrl: config.customPublicUrl } : {}),
+          updatedAt: new Date().toISOString()
+        };
+        await setDoc(configRef, publicPayload);
         configCount++;
       } else {
         skippedCount++;
       }
 
-      // 2. Migrate Menu Items with deduplication
+      // 2. Migrate Menu Items with deduplication and costPrice protection
       const menuItems = this.getMenuItems();
       for (const item of menuItems) {
         const itemRef = doc(db, 'menu_items', item.id);
         const itemSnap = await getDoc(itemRef);
         if (!itemSnap.exists()) {
-          await setDoc(itemRef, item);
+          const { costPrice, ...publicItem } = item;
+          await setDoc(itemRef, this.cleanForFirestore(publicItem));
+          if (costPrice !== undefined) {
+            await setDoc(doc(db, 'menu_item_costs', item.id), {
+              id: item.id,
+              costPrice,
+              updatedAt: new Date().toISOString()
+            }, { merge: true }).catch(() => {});
+          }
           menuCount++;
         } else {
           skippedCount++;
         }
       }
+      // Migrate and cleanse any legacy items on Firestore
+      await this.migrateAndCleanseLegacyMenuItemCosts();
 
       // 3. Migrate Orders with deduplication
       const orders = this.getOrders();
@@ -1125,7 +1362,41 @@ class StoreService {
   public getMenuItems(): MenuItem[] {
     try {
       const data = localStorage.getItem('gf_menu_items');
-      return data ? JSON.parse(data) : INITIAL_MENU;
+      const itemMap = new Map<string, MenuItem>();
+
+      // 1. Seed with full official catalog (72 items from INITIAL_MENU)
+      for (const item of INITIAL_MENU) {
+        itemMap.set(item.id, {
+          ...item,
+          available: item.available !== false,
+          addons: item.addons || OFFICIAL_ADDONS,
+        });
+      }
+
+      // 2. Overlay any locally saved or updated items
+      if (data) {
+        try {
+          const parsed = JSON.parse(data);
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              if (item && item.id) {
+                const base = itemMap.get(item.id);
+                itemMap.set(item.id, {
+                  ...(base || {}),
+                  ...item,
+                  available: item.available !== false,
+                  addons: item.addons || base?.addons || OFFICIAL_ADDONS,
+                });
+              }
+            }
+          }
+        } catch {
+          // fallback
+        }
+      }
+
+      const mergedList = Array.from(itemMap.values());
+      return mergedList;
     } catch {
       return INITIAL_MENU;
     }
@@ -1149,9 +1420,17 @@ class StoreService {
 
     // Asynchronously sync to Firestore
     if (db) {
-      setDoc(doc(db, 'menu_items', item.id), item).catch((err) => {
+      const { costPrice, ...publicItem } = item;
+      setDoc(doc(db, 'menu_items', item.id), this.cleanForFirestore(publicItem)).catch((err) => {
         handleFirestoreError(err, OperationType.WRITE, `menu_items/${item.id}`);
       });
+      if (this.canUserManageMenu() && costPrice !== undefined) {
+        setDoc(doc(db, 'menu_item_costs', item.id), {
+          id: item.id,
+          costPrice,
+          updatedAt: new Date().toISOString()
+        }).catch(() => {});
+      }
     }
   }
 
@@ -1170,6 +1449,7 @@ class StoreService {
       deleteDoc(doc(db, 'menu_items', id)).catch((err) => {
         handleFirestoreError(err, OperationType.DELETE, `menu_items/${id}`);
       });
+      deleteDoc(doc(db, 'menu_item_costs', id)).catch(() => {});
     }
   }
 
@@ -1268,6 +1548,16 @@ class StoreService {
     }
 
     this.notify('ORDER_CREATED', newOrder);
+
+    // Auto-print on 58mm thermal printer if order is RETIRADA and auto-print is enabled
+    try {
+      const printerCfg = thermalPrinterService.getConfig();
+      if (printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA' && !thermalPrinterService.hasOrderBeenPrinted(newOrder.id)) {
+        thermalPrinterService.printOrder(newOrder).catch(() => {});
+      }
+    } catch {
+      // Non-blocking
+    }
 
     // Queue for cloud sync and attempt immediate transmission to Cloud Firestore if autoPersist is true
     this.queueOrderForSync(newOrder);
@@ -1556,37 +1846,55 @@ class StoreService {
 
     // Additional status actions
     if (newStatus === 'ENTREGUE') {
-      order.paymentStatus = 'PAGO';
-      if (order.deliveryPerson) {
+      // NOTE: Concluding physical delivery does NOT automatically force payment to PAGO if it was PENDENTE.
+      // Payment status is preserved and must be confirmed by cashier/operator when funds are verified.
+      const cleanDriverName = author.replace(/^Entregador\s*/i, '').trim() || 'Entregador de Plantão';
+      if (!order.deliveryPerson) {
+        order.deliveryPerson = {
+          id: `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          name: cleanDriverName,
+          phone: '',
+          assignedAt: now,
+          deliveredAt: now,
+        };
+      } else {
         order.deliveryPerson.deliveredAt = now;
+        if (!order.deliveryPerson.name || order.deliveryPerson.name === 'Entregador de Plantão') {
+          order.deliveryPerson.name = cleanDriverName;
+        }
       }
-      // Automatically record into open cash register
-      const shift = this.getCurrentCashShift();
-      if (shift && shift.status === 'ABERTO') {
-        const alreadyExists = shift.movements.some((m: CashMovement) => m.orderId === order.id);
-        if (!alreadyExists) {
-          shift.movements.push({
-            id: `cash-sale-${order.id}`,
-            timestamp: now,
-            type: 'VENDA',
-            amount: order.totalAmount,
-            paymentMethod: order.paymentMethod,
-            description: `Venda Pedido ${order.orderNumber} - ${order.customer.name}`,
-            orderId: order.id,
-            orderNumber: order.orderNumber,
-            author: author,
-          });
-          this.saveCurrentCashShift(shift);
+      // Record into open cash register ONLY if payment has already been confirmed as PAGO
+      if (order.paymentStatus === 'PAGO') {
+        const shift = this.getCurrentCashShift();
+        if (shift && shift.status === 'ABERTO') {
+          const alreadyExists = shift.movements.some((m: CashMovement) => m.orderId === order.id);
+          if (!alreadyExists) {
+            shift.movements.push({
+              id: `cash-sale-${order.id}`,
+              timestamp: now,
+              type: 'VENDA',
+              amount: order.totalAmount,
+              paymentMethod: order.paymentMethod,
+              description: `Venda Pedido ${order.orderNumber} - ${order.customer.name}`,
+              orderId: order.id,
+              orderNumber: order.orderNumber,
+              author: author,
+            });
+            this.saveCurrentCashShift(shift);
+          }
         }
       }
     } else if (newStatus === 'EM_ROTA') {
+      const cleanDriverName = author.replace(/^Entregador\s*/i, '').trim() || 'Entregador de Plantão';
       if (!order.deliveryPerson) {
         order.deliveryPerson = {
-          id: 'entregador-web',
-          name: author.includes('Entregador') ? author : 'Entregador de Plantão',
-          phone: '(11) 99999-8888',
+          id: `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          name: cleanDriverName,
+          phone: '',
           assignedAt: now,
         };
+      } else if (!order.deliveryPerson.assignedAt) {
+        order.deliveryPerson.assignedAt = now;
       }
     }
 
@@ -1621,6 +1929,73 @@ class StoreService {
     notes?: string
   ): Promise<{ order: Order | null; synced: boolean; error?: string }> {
     const order = this.updateOrderStatus(orderId, newStatus, author, notes);
+    if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
+    const res = await this.persistOrderToFirestore(order);
+    return { order, synced: res.success, error: res.error };
+  }
+
+  public updatePaymentStatus(
+    orderId: string, 
+    newPaymentStatus: 'PAGO' | 'PENDENTE', 
+    author = 'Caixa', 
+    notes?: string
+  ): Order | null {
+    const orders = this.getOrders();
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) return null;
+
+    const previousPaymentStatus = order.paymentStatus;
+    if (previousPaymentStatus === newPaymentStatus) return order;
+
+    const now = new Date().toISOString();
+    order.paymentStatus = newPaymentStatus;
+    order.updatedAt = now;
+
+    // If marked as PAGO, record sale in open cash register if not recorded yet
+    if (newPaymentStatus === 'PAGO') {
+      const shift = this.getCurrentCashShift();
+      if (shift && shift.status === 'ABERTO') {
+        const alreadyExists = shift.movements.some((m: CashMovement) => m.orderId === order.id);
+        if (!alreadyExists) {
+          shift.movements.push({
+            id: `cash-sale-${order.id}`,
+            timestamp: now,
+            type: 'VENDA',
+            amount: order.totalAmount,
+            paymentMethod: order.paymentMethod,
+            description: `Recebimento Pedido ${order.orderNumber} - ${order.customer.name}`,
+            orderId: order.id,
+            orderNumber: order.orderNumber,
+            author,
+          });
+          this.saveCurrentCashShift(shift);
+        }
+      }
+    }
+
+    order.movements.push({
+      id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      timestamp: now,
+      toStatus: order.status,
+      author,
+      notes: notes || `Pagamento alterado de ${previousPaymentStatus} para ${newPaymentStatus}`,
+    });
+
+    order._cloudSyncStatus = 'PENDING';
+    localStorage.setItem('gf_orders', JSON.stringify(orders));
+    this.notify('ORDER_UPDATED', order);
+    this.queueOrderForSync(order);
+    this.persistOrderToFirestore(order).catch(() => {});
+    return order;
+  }
+
+  public async updatePaymentStatusAsync(
+    orderId: string, 
+    newPaymentStatus: 'PAGO' | 'PENDENTE', 
+    author = 'Caixa', 
+    notes?: string
+  ): Promise<{ order: Order | null; synced: boolean; error?: string }> {
+    const order = this.updatePaymentStatus(orderId, newPaymentStatus, author, notes);
     if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
     const res = await this.persistOrderToFirestore(order);
     return { order, synced: res.success, error: res.error };
@@ -1942,7 +2317,25 @@ class StoreService {
     this.notify('CONFIG_UPDATED', config);
 
     if (db) {
-      setDoc(doc(db, 'configs', 'restaurant'), config).catch((err) => {
+      const publicPayload = {
+        name: config.name,
+        phone: config.phone,
+        whatsapp: config.whatsapp,
+        address: config.address,
+        city: config.city,
+        pixKey: config.pixKey,
+        pixKeyType: config.pixKeyType || 'EMAIL',
+        pixReceiverName: config.pixReceiverName || config.name,
+        pixReceiverCity: config.pixReceiverCity || 'CAMPINA GRANDE',
+        deliveryFeeBase: config.deliveryFeeBase ?? 5.0,
+        avgPrepTimeMinutes: config.avgPrepTimeMinutes ?? 15,
+        avgDeliveryTimeMinutes: config.avgDeliveryTimeMinutes ?? 25,
+        isOpen: Boolean(config.isOpen),
+        ...(config.customPublicUrl ? { customPublicUrl: config.customPublicUrl } : {}),
+        updatedAt: new Date().toISOString()
+      };
+
+      setDoc(doc(db, 'configs', 'restaurant'), publicPayload).catch((err) => {
         handleFirestoreError(err, OperationType.WRITE, 'configs/restaurant');
       });
     }
@@ -1954,7 +2347,17 @@ class StoreService {
   public getUsers(): User[] {
     try {
       const data = localStorage.getItem('gf_users');
-      return data ? JSON.parse(data) : INITIAL_USERS;
+      const list: User[] = data ? JSON.parse(data) : INITIAL_USERS;
+      return (Array.isArray(list) ? list : INITIAL_USERS).map((u) => ({
+        ...u,
+        name: u.name || 'Colaborador',
+        username: (u.username || (u.email ? u.email.split('@')[0] : u.id) || 'usuario').toLowerCase(),
+        email: u.email || '',
+        isEmailVerified: Boolean(u.isEmailVerified),
+        role: u.role || 'ATENDENTE',
+        status: u.status || 'ATIVO',
+        allowedModules: Array.isArray(u.allowedModules) ? u.allowedModules : [],
+      }));
     } catch {
       return INITIAL_USERS;
     }
@@ -2031,7 +2434,7 @@ class StoreService {
       return { success: false, message: 'Nome de usuário inválido ou vazio.' };
     }
 
-    if (users.some((u) => u.username.toLowerCase() === cleanUsername)) {
+    if (users.some((u) => (u.username || '').toLowerCase() === cleanUsername)) {
       return { success: false, message: 'Nome de usuário já cadastrado. Escolha outro nome de login.' };
     }
 
@@ -2040,7 +2443,7 @@ class StoreService {
       ? userData.email.trim().toLowerCase()
       : `${cleanUsername}@staff.amanditasabores.com.br`;
 
-    if (userData.email && userData.email.trim().length > 0 && users.some((u) => u.email.toLowerCase() === cleanEmail)) {
+    if (userData.email && userData.email.trim().length > 0 && users.some((u) => (u.email || '').toLowerCase() === cleanEmail)) {
       return { success: false, message: 'E-mail já registrado para outro colaborador.' };
     }
 
@@ -2420,7 +2823,7 @@ class StoreService {
 
     // 1. Identify employee candidate to resolve username
     let localCandidate = users.find(
-      (u) => u.username.toLowerCase() === term || u.email.toLowerCase() === term
+      (u) => (u.username || '').toLowerCase() === term || (u.email || '').toLowerCase() === term
     );
 
     // If candidate not cached locally, query Firestore
@@ -2537,6 +2940,13 @@ class StoreService {
             profile.authProvider = 'firebase_email';
             profile.firebaseUid = fbUser.uid;
             this.setCurrentUser(profile);
+
+            // Atualiza estritamente lastLoginAt no Firestore respeitando a regra de autoatualização
+            if (db && fbUser) {
+              updateDoc(doc(db, 'users', fbUser.uid), {
+                lastLoginAt: profile.lastLoginAt
+              }).catch(() => {});
+            }
 
             this.logAccess({
               userId: profile.id,

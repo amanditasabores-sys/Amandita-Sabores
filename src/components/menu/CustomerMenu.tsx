@@ -33,6 +33,7 @@ import {
   Wifi
 } from 'lucide-react';
 import { AmanditaLogo } from '../common/AmanditaLogo';
+import { PWAInstallButton } from '../common/PWAInstallButton';
 
 interface CustomerMenuProps {
   onNavigateToTracking?: (orderId: string, trackingCode?: string) => void;
@@ -122,8 +123,8 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   // Filtered Items (Advanced Search)
   const filteredItems = useMemo(() => {
     return menuItems.filter((item) => {
-      // Only available items
-      if (!item.available) return false;
+      // Only available items (default to true if available property is not explicitly false)
+      if (item.available === false) return false;
 
       // Category filter
       if (selectedCategory !== 'TODAS' && item.category !== selectedCategory) {
@@ -320,15 +321,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {onNavigateToAdmin && (store.getCurrentUser()?.role === 'ADMINISTRADOR' || store.getCurrentUser()?.role === 'GERENTE') && (
-              <button
-                onClick={onNavigateToAdmin}
-                className="p-2 sm:p-2.5 bg-white/10 hover:bg-white/20 text-[#D9C7B8] hover:text-white rounded-xl transition text-xs font-semibold flex items-center gap-1 sm:gap-1.5 border border-white/10 cursor-pointer"
-                title="Voltar ao Painel Administrativo"
-              >
-                <span>Painel<span className="hidden sm:inline"> ADM</span></span>
-              </button>
-            )}
+            <PWAInstallButton variant="compact" />
 
             <button
               onClick={() => setIsCartOpen(true)}
@@ -546,21 +539,11 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         )}
       </main>
 
-      {/* Customer Footer with Subtle Staff Access */}
-      <footer className="mt-16 py-8 border-t border-[#E8DFD5] text-center text-xs text-[#8C5E47] space-y-2">
+      {/* Customer Footer (Exclusively for customers, no staff access links) */}
+      <footer className="mt-16 py-8 border-t border-[#E8DFD5] text-center text-xs text-[#8C5E47] space-y-1.5">
         <p className="font-bold text-[#2C1810]">Amandita Sabores — Cuscuz Gourmet, Tapiocas & Café Especial</p>
         <p>{config.address} · {config.phone}</p>
-        <div className="pt-2">
-          {onOpenStaffLogin && (
-            <button
-              onClick={onOpenStaffLogin}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold text-[#8C5E47] hover:text-[#C86D3B] hover:bg-[#F2EAE0] transition cursor-pointer"
-            >
-              <Lock className="w-3.5 h-3.5" />
-              <span>Acesso de Colaboradores</span>
-            </button>
-          )}
-        </div>
+        <p className="text-[11px] text-[#A6806C]">Feito com carinho para você · Peça online e receba quentinho</p>
       </footer>
 
       {/* Floating Bottom Cart Bar */}

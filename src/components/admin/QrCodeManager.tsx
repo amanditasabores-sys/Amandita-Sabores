@@ -42,8 +42,8 @@ export const QrCodeManager: React.FC<QrCodeManagerProps> = ({ onNavigateToView }
     ? preOrigin 
     : (customDomain.trim() || currentOrigin);
 
-  const menuUrl = buildAppUrl('cardapio', undefined, effectiveBaseUrl);
-  const deliveryUrl = buildAppUrl('entregador', undefined, effectiveBaseUrl);
+  const menuUrl = buildAppUrl('cardapio', undefined, undefined, effectiveBaseUrl);
+  const deliveryUrl = buildAppUrl('entregador', undefined, undefined, effectiveBaseUrl);
 
   const [menuQrData, setMenuQrData] = useState<string>('');
   const [deliveryQrData, setDeliveryQrData] = useState<string>('');

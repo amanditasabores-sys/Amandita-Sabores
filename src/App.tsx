@@ -16,17 +16,23 @@ import {
   MapPin, 
   RotateCcw, 
   LogIn, 
-  Flame,
-  ChefHat,
-  Vault,
-  Store,
-  ShieldAlert,
-  X,
-  Lock,
-  Sparkles
+  Flame, 
+  ChefHat, 
+  Vault, 
+  Store, 
+  ShieldAlert, 
+  X, 
+  Lock, 
+  Sparkles,
+  User as UserIcon,
+  AlertCircle,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { ConfirmModal } from './components/common/ConfirmModal';
 import { FirebaseStatusModal } from './components/admin/FirebaseStatusModal';
+import { PWAInstallButton } from './components/common/PWAInstallButton';
+import { PWAInstallBanner } from './components/common/PWAInstallBanner';
 
 export type AppView = 'admin' | 'cardapio' | 'entregador' | 'producao' | 'caixa' | 'atendente' | 'rastreio';
 
@@ -37,7 +43,7 @@ export default function App() {
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
   const [securityNotice, setSecurityNotice] = useState<string | null>(null);
 
-  // Current view detection from URL query parameters
+  // Current view detection from URL query parameters (main domain defaults to employee access)
   const [currentView, setCurrentView] = useState<AppView>(() => {
     const user = store.getCurrentUser();
     if (user) {
@@ -48,8 +54,50 @@ export default function App() {
       if (role === 'ATENDENTE') return 'atendente';
       return 'admin';
     }
-    return 'cardapio';
+    // Check initial URL parameters for public views
+    if (typeof window !== 'undefined') {
+      const search = window.location.search.toLowerCase();
+      const hash = window.location.hash.toLowerCase();
+      const pathname = window.location.pathname.toLowerCase();
+      if (search.includes('view=cardapio') || hash.includes('cardapio') || pathname.includes('/cardapio')) {
+        return 'cardapio';
+      }
+      if (search.includes('view=rastreio') || hash.includes('rastreio') || pathname.includes('/rastreio')) {
+        return 'rastreio';
+      }
+    }
+    // Default main domain: employee access & login
+    return 'admin';
   });
+
+  // Employee inline login state
+  const [loginIdentifier, setLoginIdentifier] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginLoading, setLoginLoading] = useState(false);
+
+  const handleInlineLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    setLoginLoading(true);
+
+    if (!loginIdentifier.trim() || !loginPassword.trim()) {
+      setLoginError('Por favor, informe seu usuário ou e-mail e senha.');
+      setLoginLoading(false);
+      return;
+    }
+
+    const res = await store.login(loginIdentifier, loginPassword);
+    setLoginLoading(false);
+
+    if (res.success && res.user) {
+      setCurrentUser(res.user);
+      navigateTo(getDefaultViewForRole(res.user.role));
+    } else {
+      setLoginError(res.message);
+    }
+  };
 
   const [selectedOrderId, setSelectedOrderId] = useState<string>('ord-1002');
   const [selectedTrackingCode, setSelectedTrackingCode] = useState<string>('');
@@ -67,8 +115,8 @@ export default function App() {
     // Public customer views
     if (view === 'cardapio' || view === 'rastreio') return true;
 
-    // Unauthenticated visitors: only 'cardapio', 'rastreio' or 'admin' (which renders staff login)
-    if (!user) return view === 'admin';
+    // Unauthenticated visitors have NO permission for internal modules
+    if (!user) return false;
 
     const role = user.role?.toUpperCase();
     if (role === 'ADMINISTRADOR' || role === 'GERENTE' || user.username === 'admin') {
@@ -123,6 +171,9 @@ export default function App() {
     }
 
     const activeUser = store.getCurrentUser();
+    if (activeUser) {
+      setCurrentUser((prev) => (!prev || prev.id !== activeUser.id ? activeUser : prev));
+    }
     const validViews: AppView[] = ['admin', 'cardapio', 'entregador', 'producao', 'caixa', 'atendente', 'rastreio'];
 
     if (viewParam && validViews.includes(viewParam)) {
@@ -139,11 +190,18 @@ export default function App() {
       } else {
         // Unauthenticated visitor trying to access internal staff area
         setCurrentView('admin');
+        if (viewParam !== 'admin') {
+          setSecurityNotice('Acesso restrito. Faça login com suas credenciais de colaborador para acessar este módulo.');
+          const url = new URL(window.location.href);
+          url.searchParams.set('view', 'admin');
+          window.history.replaceState({}, '', url.toString());
+        }
       }
     } else if (activeUser) {
       setCurrentView(getDefaultViewForRole(activeUser.role));
     } else {
-      setCurrentView('cardapio');
+      // Main domain access without parameter: presents employee system access / login
+      setCurrentView('admin');
     }
 
     if (orderParam) {
@@ -192,11 +250,19 @@ export default function App() {
     trackingCode?: string
   ) => {
     const activeUser = store.getCurrentUser();
+    if (activeUser) {
+      setCurrentUser((prev) => (!prev || prev.id !== activeUser.id ? activeUser : prev));
+    }
     if (!isViewAllowedForUser(view, activeUser)) {
       if (activeUser) {
         const allowed = getDefaultViewForRole(activeUser.role);
         setCurrentView(allowed);
         setSecurityNotice(`Acesso negado: seu perfil de ${activeUser.role} não possui permissão para acessar este módulo.`);
+        return;
+      }
+      if (view !== 'admin') {
+        setCurrentView('admin');
+        setSecurityNotice('Acesso restrito. Faça login com suas credenciais de colaborador para acessar.');
         return;
       }
     }
@@ -228,7 +294,7 @@ export default function App() {
   const handleLogout = () => {
     store.logout();
     setCurrentUser(null);
-    navigateTo('cardapio');
+    navigateTo('admin');
   };
 
   const handleResetSampleData = () => {
@@ -241,9 +307,13 @@ export default function App() {
     window.location.reload();
   };
 
-  // Only Administrator or Gerente can see the global preview assistant toolbar
+  // Only Administrator or Gerente can see the global navigation toolbar,
+  // and NEVER on public customer views (cardapio or rastreio)
   const isGlobalToolbarVisible = Boolean(
-    currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin')
+    currentUser && 
+    (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin') &&
+    currentView !== 'cardapio' &&
+    currentView !== 'rastreio'
   );
 
   return (
@@ -358,8 +428,29 @@ export default function App() {
               >
                 <RotateCcw className="w-3.5 h-3.5" />
               </button>
+
+              {/* PWA Install Button */}
+              <PWAInstallButton variant="subtle" />
             </div>
           </div>
+        </aside>
+      )}
+
+      {/* STAFF PREVIEW HELPER BAR (ONLY VISIBLE TO LOGGED IN STAFF PREVIEWING THE PUBLIC MENU) */}
+      {currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin') && currentView === 'cardapio' && (
+        <aside aria-label="Aviso de Pré-visualização Staff" className="sticky top-0 z-50 w-full bg-[#1F100B] text-white border-b border-amber-600/40 px-3 py-1.5 text-xs flex items-center justify-between shadow-md">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span className="font-bold text-amber-300">Modo de Visualização do Cardápio Público</span>
+            <span className="text-[#D9C7B8] hidden sm:inline text-[11px]">· Sessão ativa: {currentUser.name || currentUser.username} ({currentUser.role})</span>
+          </div>
+          <button
+            onClick={() => navigateTo('admin')}
+            className="px-2.5 py-1 bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white rounded-lg font-bold text-[11px] hover:opacity-95 transition cursor-pointer flex items-center gap-1.5"
+          >
+            <ShieldCheck className="w-3.5 h-3.5" />
+            <span>Voltar ao Painel ADM</span>
+          </button>
         </aside>
       )}
 
@@ -426,39 +517,84 @@ export default function App() {
             />
           ) : (
             <div className="min-h-[85vh] flex flex-col items-center justify-center p-4">
-              <div className="bg-[#FFFDF9] rounded-3xl p-8 max-w-md w-full text-center shadow-xl border border-[#E8DFD5]">
-                <div className="w-16 h-16 rounded-2xl bg-[#C86D3B]/10 text-[#C86D3B] flex items-center justify-center mx-auto mb-4 font-bold border border-[#C86D3B]/20">
-                  <ShieldCheck className="w-8 h-8" />
+              <div className="bg-[#FFFDF9] rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-xl border border-[#E8DFD5]">
+                <div className="text-center mb-5">
+                  <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-[#C86D3B]/10 text-[#C86D3B] flex items-center justify-center mx-auto mb-3 font-bold border border-[#C86D3B]/20">
+                    <ShieldCheck className="w-7 h-7 sm:w-8 sm:h-8" />
+                  </div>
+                  <h2 className="text-xl sm:text-2xl font-black text-[#2C1810]">Acesso do Colaborador</h2>
+                  <p className="text-xs text-[#8C5E47] mt-1.5 leading-relaxed">
+                    Amandita Sabores · Faça login com seu usuário e senha autorizados para acessar seu módulo de trabalho.
+                  </p>
                 </div>
-                <h2 className="text-2xl font-black text-[#2C1810]">Acesso do Colaborador</h2>
-                <p className="text-xs text-[#8C5E47] mt-2 mb-6">
-                  Área restrita da Amandita Sabores. Faça login com seu usuário e senha autorizados pelo Administrador para ser direcionado à sua tela de trabalho.
-                </p>
-                <div className="space-y-3">
+
+                {loginError && (
+                  <div className="mb-4 p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2 animate-in fade-in">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+                    <span>{loginError}</span>
+                  </div>
+                )}
+
+                <form onSubmit={handleInlineLogin} className="space-y-3.5">
+                  <div>
+                    <label className="block text-xs font-bold text-[#3D2314] uppercase tracking-wider mb-1">
+                      Usuário ou E-mail
+                    </label>
+                    <div className="relative">
+                      <UserIcon className="w-4 h-4 text-[#8C5E47] absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={loginIdentifier}
+                        onChange={(e) => setLoginIdentifier(e.target.value)}
+                        placeholder="Ex: admin, caixa, cozinha..."
+                        className="w-full pl-10 pr-4 py-2.5 bg-white border border-[#E8DFD5] rounded-xl text-sm text-[#2C1810] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#C86D3B]/40 focus:border-[#C86D3B] transition"
+                        autoFocus
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-[#3D2314] uppercase tracking-wider mb-1">
+                      Senha
+                    </label>
+                    <div className="relative">
+                      <Lock className="w-4 h-4 text-[#8C5E47] absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        value={loginPassword}
+                        onChange={(e) => setLoginPassword(e.target.value)}
+                        placeholder="Sua senha secreta"
+                        className="w-full pl-10 pr-10 py-2.5 bg-white border border-[#E8DFD5] rounded-xl text-sm text-[#2C1810] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#C86D3B]/40 focus:border-[#C86D3B] transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-[#3D2314] p-1 transition cursor-pointer"
+                        title={showPassword ? 'Ocultar senha' : 'Ver senha'}
+                      >
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+
                   <button
-                    onClick={() => setIsAuthModalOpen(true)}
-                    className="w-full py-3 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] hover:opacity-95 text-white font-bold rounded-xl text-sm transition flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+                    type="submit"
+                    disabled={loginLoading}
+                    className="w-full py-3 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] hover:opacity-95 text-white font-bold rounded-xl text-sm transition flex items-center justify-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
                   >
                     <LogIn className="w-4 h-4 text-white" />
-                    <span>Entrar no Sistema</span>
+                    <span>{loginLoading ? 'Validando Acesso...' : 'Entrar no Sistema'}</span>
                   </button>
+                </form>
+
+                <div className="mt-5 pt-4 border-t border-[#E8DFD5] text-center">
                   <button
-                    onClick={async () => {
-                      const res = await store.login('admin', '123456');
-                      if (res.user) {
-                        setCurrentUser(res.user);
-                        navigateTo(getDefaultViewForRole(res.user.role));
-                      }
-                    }}
-                    className="w-full py-2.5 bg-[#FAF7F2] hover:bg-[#F2EAE0] text-[#3D2314] font-bold rounded-xl text-xs transition border border-[#E8DFD5] cursor-pointer"
-                  >
-                    ⚡ Entrar Imediatamente como Administrador (Demo)
-                  </button>
-                  <button
+                    type="button"
                     onClick={() => navigateTo('cardapio')}
-                    className="w-full py-2 text-xs font-semibold text-[#8C5E47] hover:text-[#2C1810] transition cursor-pointer"
+                    className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#8C5E47] hover:text-[#C86D3B] transition cursor-pointer"
                   >
-                    ← Voltar ao Cardápio Digital Público
+                    <UtensilsCrossed className="w-3.5 h-3.5" />
+                    <span>Acessar Cardápio Digital Público do Cliente →</span>
                   </button>
                 </div>
               </div>
@@ -511,6 +647,9 @@ export default function App() {
           onCancel={() => setIsResetConfirmOpen(false)}
         />
       )}
+
+      {/* PWA MOBILE INSTALL BANNER */}
+      <PWAInstallBanner />
     </div>
   );
 }

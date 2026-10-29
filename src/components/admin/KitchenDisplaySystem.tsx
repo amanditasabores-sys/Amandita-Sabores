@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
+import { thermalPrinterService } from '../../services/thermalPrinter';
 import { Order } from '../../types';
 import { formatTime } from '../../utils/formatters';
-import { ChefHat, Clock, Check, AlertTriangle, PackageCheck, Flame } from 'lucide-react';
+import { ChefHat, Clock, Check, AlertTriangle, PackageCheck, Flame, Printer } from 'lucide-react';
 
 interface KitchenDisplaySystemProps {
   orders: Order[];
@@ -108,12 +109,26 @@ export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orde
                     <h3 className="text-xl font-black">{order.orderNumber}</h3>
                   </div>
 
-                  <div className="text-right">
-                    <div className="flex items-center gap-1 font-mono font-bold text-sm bg-black/30 px-2 py-0.5 rounded-lg">
-                      <Clock className="w-3.5 h-3.5" />
-                      <span>{elapsed} min</span>
+                  <div className="text-right flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); thermalPrinterService.printOrder(order, { forceReprint: true }); }}
+                      className="p-1.5 bg-black/30 hover:bg-black/50 text-white rounded-lg transition"
+                      title={
+                        thermalPrinterService.hasOrderBeenPrinted(order.id)
+                          ? "Reimprimir comprovante 58mm"
+                          : "Imprimir comprovante térmico 58mm (Bluetooth)"
+                      }
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                    </button>
+                    <div>
+                      <div className="flex items-center gap-1 font-mono font-bold text-sm bg-black/30 px-2 py-0.5 rounded-lg">
+                        <Clock className="w-3.5 h-3.5" />
+                        <span>{elapsed} min</span>
+                      </div>
+                      <span className="text-[10px] opacity-80 block mt-0.5">Criado: {formatTime(order.createdAt)}</span>
                     </div>
-                    <span className="text-[10px] opacity-80 block mt-0.5">Criado: {formatTime(order.createdAt)}</span>
                   </div>
                 </div>
 

@@ -46,8 +46,8 @@ service cloud.firestore {
     // Bootstrapped Emergency Recovery Administrator (Whitelisted Designated Accounts)
     function isBootstrappedAdmin() {
       return isSignedIn() && 'email' in request.auth.token && (
-        request.auth.token.email == 'dvrmercadinho@gmail.com' ||
-        request.auth.token.email == 'admin@amanditasabores.com.br'
+        request.auth.token.email.lower() == 'dvrmercadinho@gmail.com' ||
+        request.auth.token.email.lower() == 'admin@amanditasabores.com.br'
       );
     }
 
@@ -89,22 +89,54 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // 1. MENU ITEMS (Cardápio Digital)
-    // Public catalog read; modifications restricted to Admin / Gerente
+    // 1. MENU ITEMS (Cardápio Digital Público)
+    // Public catalog read; modifications restricted to Admin / Gerente.
+    // ZERO EXPOSURE OF COST PRICE: costPrice is strictly forbidden in this public collection.
     // =========================================================================
     match /menu_items/{itemId} {
       allow get, list: if isValidId(itemId);
-      allow create, update, delete: if isValidId(itemId) && isGerente();
+      // Enforce that costPrice is NEVER written into the public catalog collection:
+      allow create, update: if isValidId(itemId) && isGerente() && !('costPrice' in incoming());
+      allow delete: if isValidId(itemId) && isGerente();
     }
 
     // =========================================================================
-    // 2. RESTAURANT CONFIG (Dados da Loja, Horários, PIX Oficial)
-    // Public read for restaurant document; updates restricted to Admin
+    // 1b. MENU ITEM COSTS (Custos Internos de Produção - Confidencial)
+    // Strictly restricted to Gerente / Admin. ZERO public access.
+    // Solves Firestore limitation: Firestore cannot filter fields on read.
     // =========================================================================
-    match /configs/{configId} {
-      allow get: if configId == 'restaurant';
+    match /menu_item_costs/{itemId} {
+      allow get, list, create, update, delete: if isValidId(itemId) && isGerente();
+    }
+
+    // =========================================================================
+    // 2. RESTAURANT CONFIG (Dados Públicos do Estabelecimento & PIX Oficial)
+    // Public read for restaurant document; updates restricted to Gerente / Admin.
+    // Whitelists strictly public store fields and forbids any private secrets/tokens.
+    // =========================================================================
+    match /configs/restaurant {
+      allow get: if true;
       allow list: if isStaff();
-      allow create, update, delete: if configId == 'restaurant' && isAdmin();
+      allow create, update: if isGerente() &&
+        incoming().keys().hasOnly([
+          'name', 'phone', 'whatsapp', 'address', 'city',
+          'pixKey', 'pixKeyType', 'pixReceiverName', 'pixReceiverCity',
+          'deliveryFeeBase', 'avgPrepTimeMinutes', 'avgDeliveryTimeMinutes',
+          'isOpen', 'customPublicUrl', 'updatedAt'
+        ]);
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 2b. INTERNAL CONFIG (Configurações Internas e Privadas da Operação)
+    // Strictly restricted to Administrator. ZERO public access.
+    // =========================================================================
+    match /configs/internal {
+      allow get, list, create, update, delete: if isAdmin();
+    }
+
+    match /configs/{otherConfig} {
+      allow get, list, create, update, delete: if isAdmin();
     }
 
     // =========================================================================
@@ -319,7 +351,7 @@ service cloud.firestore {
         data.customer.name is string &&
         data.customer.name.size() >= 1 &&
         data.customer.name.size() <= 100 &&
-        // Items list validation: all items checked against official catalog for public orders (1-5 items)
+        // Items list validation: all items checked against official catalog for public orders (1-8 items)
         data.items is list &&
         (
           (staff && areStaffItemsValid(data.items)) ||
@@ -375,7 +407,7 @@ service cloud.firestore {
             data.customer == prev.customer
           )
         ) &&
-        // Delivery role restrictions: cannot modify prices, discount, or items
+        // Delivery role restrictions: cannot modify prices, discount, items or customer
         (
           !isDeliveryStaff() || isGerente() || (
             data.status in ['EM_ROTA', 'ENTREGUE'] &&
@@ -385,7 +417,7 @@ service cloud.firestore {
             data.totalAmount == prev.totalAmount &&
             data.paymentMethod == prev.paymentMethod &&
             data.items == prev.items &&
-            data.customer.name == prev.customer.name
+            data.customer == prev.customer
           )
         ) &&
         // Cashier role restrictions: cannot alter core items and subtotal
@@ -427,21 +459,39 @@ service cloud.firestore {
 
     // =========================================================================
     // 5. USERS & ROLES (Equipe e Permissões)
-    // Only staff can read. Updates/Deletions strictly restricted to Admin.
-    // Users cannot change their own roles or privileges.
+    // Only staff can read. Updates/Deletions strictly restricted to Admin,
+    // with safe self-update of personal non-sensitive fields (e.g. lastLoginAt).
+    // Users cannot change their own roles, status or emails.
     // =========================================================================
     match /users/{userId} {
       allow get: if isSignedIn() && (request.auth.uid == userId || isStaff());
       allow list: if isStaff();
-      // Admin has full control over user profiles
-      allow update, delete: if isValidId(userId) && isAdmin();
+      allow delete: if isValidId(userId) && isAdmin();
+      // Safe update: Admin has full update power.
+      // Gerente can update operational staff (cannot modify or promote to Admin; id and email immutable).
+      // Self-update is strictly restricted to lastLoginAt: ONLY lastLoginAt can be modified by the user!
+      allow update: if isValidId(userId) && (
+        isAdmin() || (
+          isGerente() &&
+          existing().role != 'ADMINISTRADOR' &&
+          existing().role != 'admin' &&
+          incoming().role != 'ADMINISTRADOR' &&
+          incoming().role != 'admin' &&
+          incoming().id == existing().id &&
+          incoming().email == existing().email
+        ) || (
+          isSignedIn() && request.auth.uid == userId &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['lastLoginAt']) &&
+          incoming().lastLoginAt is string
+        )
+      );
       // User creation: Admin, or initial self-registration for authorized staff email linking to their own UID
       allow create: if isValidId(userId) && (
         isAdmin() || (
           isSignedIn() && request.auth.uid == userId &&
           'email' in request.auth.token &&
           incoming().id == userId &&
-          incoming().email == request.auth.token.email &&
+          incoming().email.lower() == request.auth.token.email.lower() &&
           incoming().status == 'ATIVO' &&
           (
             // Whitelisted emergency bootstrap accounts can initialize ADMINISTRADOR
@@ -449,8 +499,8 @@ service cloud.firestore {
             // General staff self-registration is strictly restricted to base operational roles
             (
               (
-                request.auth.token.email.matches('.*@staff\\.amanditasabores\\.com\\.br$') ||
-                request.auth.token.email.matches('.*@amanditasabores\\.com\\.br$')
+                request.auth.token.email.lower().matches('.*@staff\\.amanditasabores\\.com\\.br$') ||
+                request.auth.token.email.lower().matches('.*@amanditasabores\\.com\\.br$')
               ) &&
               incoming().role in ['CAIXA', 'COZINHA', 'ENTREGADOR', 'ATENDENTE', 'caixa', 'cozinha', 'entregador', 'atendente']
             )

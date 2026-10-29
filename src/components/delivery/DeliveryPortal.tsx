@@ -44,7 +44,9 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
   const [activeOrder, setActiveOrder] = useState<Order | null>(null);
   const [readyOrders, setReadyOrders] = useState<Order[]>([]);
+  const [deliveredOrders, setDeliveredOrders] = useState<Order[]>([]);
   const [deliveredCount, setDeliveredCount] = useState(0);
+  const [deliveryTab, setDeliveryTab] = useState<'pendentes' | 'concluidas'>('pendentes');
 
   // Scanner state
   const [isScannerOpen, setIsScannerOpen] = useState(false);
@@ -55,14 +57,25 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
   const loadData = () => {
     const orders = store.getOrders();
-    // Orders ready or in prep
+    // Orders ready or in transit (pending delivery completion)
     const ready = orders.filter((o) => o.status === 'PRONTO' || o.status === 'EM_ROTA');
     setReadyOrders(ready);
 
-    // Delivered by this driver today
-    const done = orders.filter(
-      (o) => o.status === 'ENTREGUE' && o.deliveryPerson?.name === driverName
-    );
+    // Delivered deliveries (completed)
+    const cleanCurrentDriver = (driverName || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+    const done = orders.filter((o) => {
+      if (o.status !== 'ENTREGUE') return false;
+      if (!o.deliveryPerson) return true; // Modality delivery marked delivered
+      const cleanOrderDriver = (o.deliveryPerson.name || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+      return (
+        !cleanCurrentDriver ||
+        cleanOrderDriver === cleanCurrentDriver ||
+        cleanOrderDriver.includes(cleanCurrentDriver) ||
+        cleanCurrentDriver.includes(cleanOrderDriver)
+      );
+    });
+
+    setDeliveredOrders(done);
     setDeliveredCount(done.length);
 
     if (activeOrder) {
@@ -172,14 +185,20 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
   const handleCompleteDelivery = async () => {
     if (!activeOrder) return;
-    const updated = await store.updateOrderStatusAsync(
+    store.assignDeliveryPerson(activeOrder.id, {
+      id: `driver-${driverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+      name: driverName,
+      phone: driverPhone,
+    });
+    const res = await store.updateOrderStatusAsync(
       activeOrder.id,
       'ENTREGUE',
       `Entregador ${driverName}`,
       `Entrega confirmada pelo entregador ${driverName} no endereço do cliente.`
     );
-    if (updated) {
-      setActiveOrder(store.getOrderById(activeOrder.id) || null);
+    const refreshed = store.getOrderById(activeOrder.id) || res.order;
+    if (refreshed) {
+      setActiveOrder(refreshed);
       loadData();
       confetti({
         particleCount: 80,
@@ -236,7 +255,7 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {onNavigateToAdmin && (currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE' || !currentUser) && (
+            {onNavigateToAdmin && (currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE') && (
               <button
                 onClick={onNavigateToAdmin}
                 className="px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition border border-slate-700 cursor-pointer"
@@ -626,91 +645,188 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                 )}
 
                 {activeOrder.status === 'ENTREGUE' && (
-                  <div className="p-4 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-center">
-                    <CheckCircle className="w-8 h-8 text-emerald-400 mx-auto mb-1" />
-                    <p className="font-bold text-emerald-300 text-sm">Pedido Concluído com Sucesso!</p>
-                    <p className="text-xs text-slate-400 mt-1">Obrigado pela entrega, {driverName}.</p>
-                    <button
-                      onClick={() => setActiveOrder(null)}
-                      className="mt-3 px-4 py-2 bg-slate-700 hover:bg-slate-600 text-xs font-semibold rounded-lg text-white"
-                    >
-                      Voltar e pegar próximo pedido
-                    </button>
+                  <div className="p-4 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-center space-y-2">
+                    <CheckCircle className="w-9 h-9 text-emerald-400 mx-auto" />
+                    <p className="font-bold text-emerald-300 text-sm">Entrega Concluída e Registrada com Sucesso!</p>
+                    <p className="text-xs text-slate-300">
+                      Pedido <strong>{activeOrder.orderNumber}</strong> entregue por <strong>{driverName}</strong>.
+                    </p>
+                    <div className="flex flex-col sm:flex-row gap-2 pt-2">
+                      <button
+                        onClick={() => { setActiveOrder(null); setDeliveryTab('pendentes'); }}
+                        className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl transition cursor-pointer"
+                      >
+                        Próximo Pedido Pendente
+                      </button>
+                      <button
+                        onClick={() => { setActiveOrder(null); setDeliveryTab('concluidas'); }}
+                        className="flex-1 py-2.5 bg-slate-700 hover:bg-slate-600 text-white font-semibold text-xs rounded-xl transition cursor-pointer border border-slate-600"
+                      >
+                        Ver Entregas Concluídas ({deliveredCount})
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
             </div>
           </div>
         ) : (
-          /* NO ORDER SELECTED: SHOW PENDING LIST */
+          /* NO ORDER SELECTED: SHOW TABBED LIST (PENDING OR COMPLETED) */
           <div className="space-y-4">
+            {/* Delivery Navigation Tabs */}
+            <div className="flex p-1 bg-slate-800 rounded-xl border border-slate-700">
+              <button
+                type="button"
+                onClick={() => setDeliveryTab('pendentes')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                  deliveryTab === 'pendentes'
+                    ? 'bg-amber-500 text-slate-950 shadow-xs'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Bike className="w-3.5 h-3.5" />
+                <span>Pendentes ({readyOrders.length})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setDeliveryTab('concluidas')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                  deliveryTab === 'concluidas'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <CheckCircle className="w-3.5 h-3.5" />
+                <span>Concluídas ({deliveredCount})</span>
+              </button>
+            </div>
+
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">
-                Pedidos Aguardando Entrega ({readyOrders.length})
+              <h2 className="text-xs sm:text-sm font-bold uppercase tracking-wider text-slate-400">
+                {deliveryTab === 'pendentes'
+                  ? `Pedidos Aguardando Entrega (${readyOrders.length})`
+                  : `Entregas Concluídas por ${driverName} (${deliveredCount})`}
               </h2>
               <button
                 onClick={loadData}
-                className="text-xs text-amber-400 hover:underline flex items-center gap-1"
+                className="text-xs text-amber-400 hover:underline flex items-center gap-1 cursor-pointer"
               >
                 <RotateCcw className="w-3 h-3" />
                 Atualizar
               </button>
             </div>
 
-            {readyOrders.length === 0 ? (
-              <div className="bg-slate-800/80 rounded-2xl p-8 border border-slate-700 text-center">
-                <Bike className="w-12 h-12 text-slate-600 mx-auto mb-3" />
-                <h3 className="text-base font-bold text-white">Nenhum Pedido Aguardando</h3>
-                <p className="text-xs text-slate-400 mt-1 mb-4">
-                  Assim que a cozinha concluir o preparo ou você ler um QR Code, o pedido aparecerá aqui.
-                </p>
-                <button
-                  onClick={startCamera}
-                  className="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition"
-                >
-                  Abrir Leitor de QR Code
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {readyOrders.map((ord) => (
-                  <div
-                    key={ord.id}
-                    onClick={() => handleSelectOrder(ord)}
-                    className="bg-slate-800 hover:bg-slate-750 border border-slate-700 hover:border-amber-500/50 rounded-2xl p-4 transition cursor-pointer shadow-sm group"
+            {deliveryTab === 'pendentes' ? (
+              readyOrders.length === 0 ? (
+                <div className="bg-slate-800/80 rounded-2xl p-8 border border-slate-700 text-center">
+                  <Bike className="w-12 h-12 text-slate-600 mx-auto mb-3" />
+                  <h3 className="text-base font-bold text-white">Nenhum Pedido Aguardando</h3>
+                  <p className="text-xs text-slate-400 mt-1 mb-4">
+                    Assim que a cozinha concluir o preparo ou você ler um QR Code, o pedido aparecerá aqui.
+                  </p>
+                  <button
+                    onClick={startCamera}
+                    className="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition cursor-pointer"
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-base font-extrabold text-white">{ord.orderNumber}</span>
-                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0 ${
-                            ord.status === 'EM_ROTA' ? 'bg-indigo-500/20 text-indigo-400' : 'bg-amber-500/20 text-amber-400'
-                          }`}>
-                            {ord.status === 'EM_ROTA' ? 'Em Rota' : 'Pronto p/ Entrega'}
+                    Abrir Leitor de QR Code
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {readyOrders.map((ord) => (
+                    <div
+                      key={ord.id}
+                      onClick={() => handleSelectOrder(ord)}
+                      className="bg-slate-800 hover:bg-slate-750 border border-slate-700 hover:border-amber-500/50 rounded-2xl p-4 transition cursor-pointer shadow-sm group"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-base font-extrabold text-white">{ord.orderNumber}</span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold shrink-0 ${
+                              ord.status === 'EM_ROTA' ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                            }`}>
+                              {ord.status === 'EM_ROTA' ? 'Em Rota com Você' : 'Pronto p/ Entrega'}
+                            </span>
+                          </div>
+                          <p className="text-sm font-semibold text-slate-200 mt-1 truncate">{ord.customer.name}</p>
+                          <p className="text-xs text-slate-400 flex items-center gap-1 mt-0.5">
+                            <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                            <span className="truncate">
+                              {ord.customer.address 
+                                ? `${ord.customer.address.street}, ${ord.customer.address.number} · ${ord.customer.address.neighborhood}`
+                                : 'Retirada no Balcão'}
+                            </span>
+                          </p>
+                        </div>
+
+                        <div className="text-right shrink-0">
+                          <span className="text-sm font-bold text-amber-400">{formatCurrency(ord.totalAmount)}</span>
+                          <p className="text-[11px] text-slate-400">{getPaymentMethodLabel(ord.paymentMethod)}</p>
+                          <span className="inline-block mt-2 text-xs font-semibold text-amber-400 group-hover:translate-x-0.5 transition-transform">
+                            {ord.status === 'EM_ROTA' ? 'Concluir →' : 'Iniciar →'}
                           </span>
                         </div>
-                        <p className="text-sm font-semibold text-slate-200 mt-1 truncate">{ord.customer.name}</p>
-                        <p className="text-xs text-slate-400 flex items-center gap-1 mt-0.5">
-                          <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                          <span className="truncate">
-                            {ord.customer.address 
-                              ? `${ord.customer.address.street}, ${ord.customer.address.number} · ${ord.customer.address.neighborhood}`
-                              : 'Retirada no Balcão'}
-                          </span>
-                        </p>
-                      </div>
-
-                      <div className="text-right shrink-0">
-                        <span className="text-sm font-bold text-amber-400">{formatCurrency(ord.totalAmount)}</span>
-                        <p className="text-[11px] text-slate-400">{getPaymentMethodLabel(ord.paymentMethod)}</p>
-                        <span className="inline-block mt-2 text-xs font-semibold text-amber-400 group-hover:translate-x-0.5 transition-transform">
-                          Ver Detalhes →
-                        </span>
                       </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )
+            ) : (
+              /* COMPLETED DELIVERIES LIST */
+              deliveredOrders.length === 0 ? (
+                <div className="bg-slate-800/80 rounded-2xl p-8 border border-slate-700 text-center">
+                  <CheckCircle className="w-12 h-12 text-slate-600 mx-auto mb-3" />
+                  <h3 className="text-base font-bold text-white">Nenhuma Entrega Concluída Hoje</h3>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Os pedidos que você entregar aparecerão listados aqui com comprovação de horário e pagamento.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {deliveredOrders.map((ord) => (
+                    <div
+                      key={ord.id}
+                      onClick={() => handleSelectOrder(ord)}
+                      className="bg-slate-800/90 hover:bg-slate-750 border border-emerald-500/30 rounded-2xl p-4 transition cursor-pointer shadow-sm group"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-base font-extrabold text-white">{ord.orderNumber}</span>
+                            <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 flex items-center gap-1 shrink-0">
+                              <CheckCircle className="w-3 h-3" />
+                              <span>Entregue com Sucesso</span>
+                            </span>
+                          </div>
+                          <p className="text-sm font-semibold text-slate-200 mt-1 truncate">{ord.customer.name}</p>
+                          <p className="text-xs text-slate-400 flex items-center gap-1 mt-0.5">
+                            <MapPin className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                            <span className="truncate">
+                              {ord.customer.address 
+                                ? `${ord.customer.address.street}, ${ord.customer.address.number} · ${ord.customer.address.neighborhood}`
+                                : 'Retirada no Balcão'}
+                            </span>
+                          </p>
+                          {ord.deliveryPerson?.deliveredAt && (
+                            <p className="text-[11px] text-emerald-400/90 mt-1 font-mono">
+                              Horário de entrega: {formatTime(ord.deliveryPerson.deliveredAt)}
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="text-right shrink-0">
+                          <span className="text-sm font-bold text-emerald-400">{formatCurrency(ord.totalAmount)}</span>
+                          <p className="text-[11px] text-slate-400">{getPaymentMethodLabel(ord.paymentMethod)}</p>
+                          <span className="inline-block mt-2 text-xs font-semibold text-slate-400 group-hover:text-emerald-400 transition-colors">
+                            Ver Recibo →
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
             )}
           </div>
         )}

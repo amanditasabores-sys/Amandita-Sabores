@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import webpush from 'web-push';
 import { initializeApp as initClientApp, getApps as getClientApps, getApp as getClientApp } from 'firebase/app';
 import { getFirestore as getClientFirestore, doc as clientDoc, setDoc as clientSetDoc } from 'firebase/firestore';
 import { initializeApp as initAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
@@ -29,6 +30,63 @@ for (const item of INITIAL_MENU) {
     price: item.price,
     available: item.available,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Web Push & Background Notification Configuration
+// ---------------------------------------------------------------------------
+// Default VAPID keypair for offline/local development or custom env keys
+const VAPID_PUBLIC_KEY = process.env.VITE_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzk rxTjJqU4T_p_5w9n6vL5yXJtK2G5X5W5_P2Q3R4';
+const VAPID_PRIVATE_KEY = process.env.FIREBASE_VAPID_PRIVATE_KEY || process.env.VAPID_PRIVATE_KEY || '7K8L9M0N1O2P3Q4R5S6T7U8V9W0BCZ5T7bXg7rYt3j';
+const VAPID_SUBJECT = `mailto:${INITIAL_ADMIN_EMAIL}`;
+
+try {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} catch (vapidErr) {
+  console.info('[Web Push] VAPID aguarda configuração de chave em produção:', vapidErr instanceof Error ? vapidErr.message : vapidErr);
+}
+
+interface PushSubscriptionData {
+  subscription: webpush.PushSubscription;
+  role?: string;
+  userAgent?: string;
+  subscribedAt: string;
+}
+
+const activePushSubscriptions: Map<string, PushSubscriptionData> = new Map();
+const sentNotificationOrderIds = new Set<string>();
+
+async function sendOrderPushNotification(order: any) {
+  if (!order || !order.id || sentNotificationOrderIds.has(order.id)) {
+    return; // Prevent duplicate notifications
+  }
+  sentNotificationOrderIds.add(order.id);
+
+  const payload = JSON.stringify({
+    title: `Novo Pedido #${order.orderNumber}!`,
+    body: `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`,
+    icon: '/pwa-192x192.png',
+    badge: '/favicon-32x32.png',
+    tag: `order-${order.id}`,
+    orderId: order.id,
+    url: '/?view=producao',
+    timestamp: Date.now(),
+  });
+
+  const deadEndpoints: string[] = [];
+  for (const [endpoint, subData] of activePushSubscriptions.entries()) {
+    try {
+      await webpush.sendNotification(subData.subscription, payload);
+    } catch (err: any) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        deadEndpoints.push(endpoint);
+      }
+    }
+  }
+
+  for (const endpoint of deadEndpoints) {
+    activePushSubscriptions.delete(endpoint);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +350,34 @@ async function startServer() {
       hasClientSdk: Boolean(clientDb),
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // Web Push Configuration & Subscription Endpoints
+  app.get('/api/push/vapid-key', (_req: Request, res: Response) => {
+    res.json({
+      publicKey: VAPID_PUBLIC_KEY,
+      isConfigured: Boolean(process.env.VITE_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY),
+    });
+  });
+
+  app.post('/api/push/subscribe', (req: Request, res: Response) => {
+    try {
+      const { subscription, role, userAgent } = req.body;
+      if (!subscription || !subscription.endpoint) {
+        res.status(400).json({ success: false, message: 'Assinatura Push inválida.' });
+        return;
+      }
+      activePushSubscriptions.set(subscription.endpoint, {
+        subscription,
+        role: role || 'staff',
+        userAgent,
+        subscribedAt: new Date().toISOString(),
+      });
+      res.json({ success: true, message: 'Dispositivo registrado com sucesso para notificações em segundo plano.' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: msg });
+    }
   });
 
   // Secure Backend API: Staff Registration and Credential Administration
@@ -568,6 +654,11 @@ async function startServer() {
       }
 
       // Document write is confirmed
+      // Dispatch background Push Notification to subscribed devices (Kitchen/Admin)
+      sendOrderPushNotification(order).catch((pushErr) => {
+        console.warn('[Web Push] Falha ao enviar notificação aos dispositivos:', pushErr?.message || pushErr);
+      });
+
       res.json({
         success: true,
         message: 'Pedido verificado e gravado com sucesso no Cloud Firestore.',

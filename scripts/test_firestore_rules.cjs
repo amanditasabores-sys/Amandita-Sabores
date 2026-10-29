@@ -70,19 +70,42 @@ class FirestoreRuleEngine {
   evalMenuItemList(auth) {
     return true;
   }
-  evalMenuItemWrite(auth, itemId) {
+  evalMenuItemWrite(auth, itemId, incoming) {
+    if (incoming && 'costPrice' in incoming) return false;
+    return this.isValidId(itemId) && this.isGerente(auth);
+  }
+  evalMenuItemCostRead(auth, itemId) {
+    return this.isValidId(itemId) && this.isGerente(auth);
+  }
+  evalMenuItemCostWrite(auth, itemId) {
     return this.isValidId(itemId) && this.isGerente(auth);
   }
 
   // Collection: configs
   evalConfigGet(auth, configId) {
-    return configId === 'restaurant';
+    if (configId === 'restaurant') return true;
+    return this.isAdmin(auth);
   }
   evalConfigList(auth) {
     return this.isStaff(auth);
   }
-  evalConfigWrite(auth, configId) {
-    return configId === 'restaurant' && this.isAdmin(auth);
+  evalConfigWrite(auth, configId, incoming) {
+    if (configId === 'restaurant') {
+      if (!this.isGerente(auth)) return false;
+      if (incoming) {
+        const allowed = new Set([
+          'name', 'phone', 'whatsapp', 'address', 'city',
+          'pixKey', 'pixKeyType', 'pixReceiverName', 'pixReceiverCity',
+          'deliveryFeeBase', 'avgPrepTimeMinutes', 'avgDeliveryTimeMinutes',
+          'isOpen', 'customPublicUrl', 'updatedAt'
+        ]);
+        for (const k of Object.keys(incoming)) {
+          if (!allowed.has(k)) return false;
+        }
+      }
+      return true;
+    }
+    return this.isAdmin(auth);
   }
 
   // Collection: orders
@@ -295,8 +318,31 @@ class FirestoreRuleEngine {
   evalUsersGet(auth, userId) {
     return Boolean(auth && (auth.uid === userId || this.isStaff(auth)));
   }
-  evalUsersUpdate(auth, userId) {
-    return this.isValidId(userId) && this.isAdmin(auth);
+  evalUsersUpdate(auth, userId, incoming, existing) {
+    if (!this.isValidId(userId)) return false;
+    if (this.isAdmin(auth)) return true;
+
+    // Gerente updating staff
+    if (this.isGerente(auth)) {
+      if (existing && (existing.role === 'ADMINISTRADOR' || existing.role === 'admin')) return false;
+      if (incoming && (incoming.role === 'ADMINISTRADOR' || incoming.role === 'admin')) return false;
+      if (incoming && existing && incoming.id === existing.id && incoming.email === existing.email) {
+        return true;
+      }
+      return false;
+    }
+
+    // User self-update: strictly limited to lastLoginAt!
+    if (auth && auth.uid === userId && incoming && existing) {
+      if (typeof incoming.lastLoginAt !== 'string') return false;
+      const allKeys = new Set([...Object.keys(incoming), ...Object.keys(existing)]);
+      const changedKeys = [];
+      for (const k of allKeys) {
+        if (incoming[k] !== existing[k]) changedKeys.push(k);
+      }
+      return changedKeys.length === 1 && changedKeys[0] === 'lastLoginAt';
+    }
+    return false;
   }
   evalUsersDelete(auth, userId) {
     return this.isValidId(userId) && this.isAdmin(auth);
@@ -772,6 +818,74 @@ runTest('19. Usuário Bloqueado: Acesso revogado imediatamente para todas as col
 
 runTest('20. Leitura do Próprio Perfil: Permitida para colaborador autenticado', () => {
   assert.strictEqual(engine.evalUsersGet(cozinhaAuth, 'cozinha-1'), true);
+});
+
+// 7. Cost Price Protection & User Safe Updates
+runTest('21. Blindagem de Custo: PROIBIR costPrice no cardápio público e isolar em menu_item_costs', () => {
+  const itemWithCost = { id: 'cuscuz-teste', name: 'Cuscuz', price: 10.0, costPrice: 3.5 };
+  const itemWithoutCost = { id: 'cuscuz-teste', name: 'Cuscuz', price: 10.0 };
+
+  // Proibir costPrice na coleção pública menu_items:
+  assert.strictEqual(engine.evalMenuItemWrite(gerenteAuth, 'cuscuz-teste', itemWithCost), false, 'Gravação com costPrice em menu_items deve ser rejeitada');
+  assert.strictEqual(engine.evalMenuItemWrite(gerenteAuth, 'cuscuz-teste', itemWithoutCost), true, 'Gravação sem costPrice em menu_items deve ser permitida');
+
+  // Acesso à coleção isolada menu_item_costs:
+  assert.strictEqual(engine.evalMenuItemCostRead(anonymousAuth, 'cuscuz-teste'), false, 'Cliente anônimo não pode ler menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostRead(cozinhaAuth, 'cuscuz-teste'), false, 'Funcionário comum não pode ler menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostRead(gerenteAuth, 'cuscuz-teste'), true, 'Gerente pode ler menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostWrite(gerenteAuth, 'cuscuz-teste'), true, 'Gerente pode gravar menu_item_costs');
+});
+
+runTest('22. Atualização Segura de Perfil: Permitir lastLoginAt e PROIBIR elevação de cargo', () => {
+  const existingDoc = { id: 'caixa-1', email: 'caixa@staff.amanditasabores.com.br', role: 'CAIXA', status: 'ATIVO', name: 'Caixa 1' };
+  const safeUpdate = { ...existingDoc, lastLoginAt: new Date().toISOString() };
+  const forgedRole = { ...existingDoc, role: 'ADMINISTRADOR' };
+  const forgedStatus = { ...existingDoc, status: 'ATIVO' }; // if previous was blocked
+
+  // Auto-atualização de lastLoginAt permitida:
+  assert.strictEqual(engine.evalUsersUpdate(caixaAuth, 'caixa-1', safeUpdate, existingDoc), true, 'Colaborador pode atualizar seu lastLoginAt');
+  // Tentativa de auto-elevação de cargo é rejeitada:
+  assert.strictEqual(engine.evalUsersUpdate(caixaAuth, 'caixa-1', forgedRole, existingDoc), false, 'Colaborador NÃO pode auto-elevar seu cargo');
+});
+
+runTest('23. Auto-atualização Estrita: Rejeitar alteração de allowedModules, nome ou status pelo próprio usuário', () => {
+  const existingDoc = { id: 'caixa-1', email: 'caixa@staff.amanditasabores.com.br', role: 'CAIXA', status: 'ATIVO', name: 'Caixa 1', allowedModules: ['pdv'] };
+  const forgedModules = { ...existingDoc, lastLoginAt: new Date().toISOString(), allowedModules: ['pdv', 'usuarios', 'relatorios'] };
+  const forgedName = { ...existingDoc, lastLoginAt: new Date().toISOString(), name: 'Super Admin' };
+  
+  assert.strictEqual(engine.evalUsersUpdate(caixaAuth, 'caixa-1', forgedModules, existingDoc), false, 'Usuário NÃO pode auto-conceder módulos');
+  assert.strictEqual(engine.evalUsersUpdate(caixaAuth, 'caixa-1', forgedName, existingDoc), false, 'Usuário NÃO pode alterar dados protegidos via autoatualização');
+  assert.strictEqual(engine.evalUsersUpdate(adminAuth, 'caixa-1', forgedModules, existingDoc), true, 'Administrador pode atualizar permissões de colaborador');
+});
+
+runTest('24. Configurações Públicas vs Privadas: Rejeitar injeção de secrets em /configs/restaurant', () => {
+  const validPublicConfig = {
+    name: 'Amandita Sabores',
+    phone: '83999999999',
+    whatsapp: '5583999999999',
+    address: 'Rua Principal',
+    city: 'Campina Grande',
+    pixKey: 'contato@amanditasabores.com.br',
+    pixKeyType: 'EMAIL',
+    pixReceiverName: 'AMANDITA SABORES',
+    pixReceiverCity: 'CAMPINA GRANDE',
+    deliveryFeeBase: 5.0,
+    avgPrepTimeMinutes: 15,
+    avgDeliveryTimeMinutes: 25,
+    isOpen: true
+  };
+  const configWithSecret = { ...validPublicConfig, secretKey: 'top_secret_token_123' };
+
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'restaurant', validPublicConfig), true, 'Gerente pode atualizar campos públicos oficiais');
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'restaurant', configWithSecret), false, 'Rejeitar injeção de campos privados/secrets em /configs/restaurant');
+  assert.strictEqual(engine.evalConfigWrite(caixaAuth, 'restaurant', validPublicConfig), false, 'Funcionário comum não pode alterar configs');
+});
+
+runTest('25. Configurações Internas: /configs/internal restrito exclusivamente a Administrador', () => {
+  assert.strictEqual(engine.evalConfigGet(anonymousAuth, 'internal'), false, 'Cliente anônimo não pode ler /configs/internal');
+  assert.strictEqual(engine.evalConfigGet(gerenteAuth, 'internal'), false, 'Gerente não pode ler /configs/internal');
+  assert.strictEqual(engine.evalConfigGet(adminAuth, 'internal'), true, 'Administrador pode ler /configs/internal');
+  assert.strictEqual(engine.evalConfigWrite(adminAuth, 'internal', { internalDbPass: 'secret' }), true, 'Administrador pode gravar /configs/internal');
 });
 
 console.log(`\n======================================================`);

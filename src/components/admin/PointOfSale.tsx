@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { store } from '../../services/store';
+import { thermalPrinterService } from '../../services/thermalPrinter';
 import { MenuItem, Order, OrderItem, PaymentMethod, User, MenuItemAddon } from '../../types';
 import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel } from '../../utils/formatters';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
@@ -139,7 +140,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       const matchesSearch = item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
         item.description.toLowerCase().includes(searchQuery.toLowerCase());
       const matchesCategory = selectedCategory === 'TODOS' || item.category === selectedCategory;
-      return matchesSearch && matchesCategory && item.available;
+      return matchesSearch && matchesCategory && item.available !== false;
     });
   }, [menuItems, searchQuery, selectedCategory]);
 
@@ -1505,20 +1506,31 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               O pedido foi enviado diretamente para a <strong>Cozinha / KDS</strong> e computado no saldo do caixa.
             </p>
 
-            <div className="flex gap-2">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button
+                type="button"
+                onClick={() => thermalPrinterService.printOrder(completedOrder, { forceReprint: true })}
+                className="flex-1 py-3 bg-[#C86D3B] hover:bg-[#721C24] text-white font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition shadow-xs cursor-pointer"
+                title="Imprimir comprovante formatado para impressora térmica de 58 mm via Bluetooth"
+              >
+                <Printer className="w-4 h-4" />
+                <span>Imprimir Térmica 58mm</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => handlePrintReceipt(completedOrder)}
-                className="flex-1 py-3 bg-[#FAF7F2] hover:bg-[#EFE6DC] border border-[#E8DFD5] text-[#3D2314] font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition"
+                className="py-3 px-3 bg-[#FAF7F2] hover:bg-[#EFE6DC] border border-[#E8DFD5] text-[#3D2314] font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition"
+                title="Imprimir Comanda Completa no Spooler / A4"
               >
-                <Printer className="w-4 h-4 text-[#C86D3B]" />
-                <span>Imprimir Comprovante</span>
+                <FileText className="w-4 h-4 text-slate-500" />
+                <span>Spooler A4</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setCompletedOrder(null)}
-                className="flex-1 py-3 bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white font-bold rounded-xl text-xs transition"
+                className="flex-1 py-3 bg-gradient-to-r from-slate-800 to-slate-900 text-white font-bold rounded-xl text-xs transition cursor-pointer"
               >
                 Nova Venda
               </button>
