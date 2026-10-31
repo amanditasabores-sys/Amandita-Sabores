@@ -13,7 +13,8 @@ import {
   Bell, 
   Clock,
   Flame,
-  ShieldCheck
+  ShieldCheck,
+  Store
 } from 'lucide-react';
 
 interface KitchenScreenProps {
@@ -23,6 +24,14 @@ interface KitchenScreenProps {
 
 export const KitchenScreen: React.FC<KitchenScreenProps> = ({ currentUser, onLogout }) => {
   const [orders, setOrders] = useState<Order[]>(() => store.getOrders());
+  const canAccessPdv = Boolean(
+    currentUser && (
+      currentUser.role === 'ADMINISTRADOR' ||
+      currentUser.role === 'GERENTE' ||
+      currentUser.username === 'admin' ||
+      (currentUser.allowedModules && currentUser.allowedModules.includes('pdv'))
+    )
+  );
   const [isSoundActive, setIsSoundActive] = useState(() => soundService.isEnabled());
   const [newOrderNotice, setNewOrderNotice] = useState<Order | null>(null);
   const [currentTime, setCurrentTime] = useState(
@@ -131,6 +140,24 @@ export const KitchenScreen: React.FC<KitchenScreenProps> = ({ currentUser, onLog
                 Testar Campainha
               </button>
             </div>
+
+            {/* Return to PDV if user has permission */}
+            {canAccessPdv && (
+              <button
+                onClick={() => {
+                  const url = new URL(window.location.href);
+                  url.searchParams.set('view', 'admin');
+                  window.history.pushState({}, '', url.toString());
+                  window.dispatchEvent(new PopStateEvent('popstate'));
+                  window.dispatchEvent(new CustomEvent('switch_to_pdv'));
+                }}
+                className="px-2.5 py-1.5 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-emerald-500/40 cursor-pointer"
+                title="Retornar à tela principal do PDV / Painel de Controle"
+              >
+                <Store className="w-3.5 h-3.5 text-[#E89255]" />
+                <span className="hidden sm:inline">PDV / Painel</span>
+              </button>
+            )}
 
             {/* User Profile & Logout */}
             <div className="flex items-center gap-3 pl-3 border-l border-white/15">

@@ -266,10 +266,13 @@ export async function testFirestoreConnection(): Promise<{ success: boolean; mes
 
     // If client is offline or network request failed
     if (msg.includes('the client is offline') || msg.includes('network') || msg.includes('unavailable') || code === 'unavailable') {
+      const isActuallyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
       return {
         success: false,
-        message: 'Cliente offline ou rede bloqueada.',
-        details: 'Não foi possível alcançar firestore.googleapis.com. Verifique a conexão com a internet e bloqueadores de requisições.'
+        message: isActuallyOffline ? 'Dispositivo desconectado da internet.' : 'Aguardando estabilização da conexão com a nuvem.',
+        details: isActuallyOffline
+          ? 'O aparelho está sem conexão Wi-Fi ou dados móveis no momento. A sincronização será restabelecida automaticamente assim que o sinal retornar.'
+          : 'O aplicativo estava suspenso em segundo plano e está restabelecendo o canal com o Cloud Firestore.'
       };
     }
 

@@ -75,6 +75,18 @@ const printerSettingsContent = fs.readFileSync(printerSettingsPath, 'utf8');
 assert(printerSettingsContent.includes("connectBluetoothBLE"), "Interface administrativa inclui botão de pareamento Bluetooth");
 assert(printerSettingsContent.includes("printTestReceipt"), "Interface administrativa inclui botão de Impressão de Teste");
 
+console.log('\n6. Testando Diferenciação de Cupom: RETIRADA vs ENTREGA...');
+assert(serviceContent.includes("isDelivery"), "Detecção dinâmica da modalidade do pedido no comprovante");
+assert(serviceContent.includes("*** RETIRADA NO BALCAO ***"), "Indicação expressa de RETIRADA NO BALCÃO");
+assert(serviceContent.includes("*** ENTREGA ***"), "Indicação expressa de ENTREGA");
+assert(serviceContent.includes("ENDERECO DE ENTREGA:"), "Seção formatada de endereço de entrega");
+assert(serviceContent.includes("TAXA DE ENTREGA:"), "Taxa de entrega discriminada nos totais para pedidos de entrega");
+
+console.log('\n7. Testando Resiliência de Conexão BLE e Reconexão...');
+assert(serviceContent.includes("discoverWriteCharacteristic"), "Redescoberta dinâmica de característica de escrita BLE");
+assert(serviceContent.includes("reconnectSavedBLE"), "Reconexão com dispositivo BLE salvo sem reabrir diálogo");
+assert(printerSettingsContent.includes("handleReconnectSaved") || printerSettingsContent.includes("Reconectar Impressora"), "Botão de reconexão direta disponível na interface de configurações");
+
 console.log('====================================================');
 console.log(`TOTAL DE TESTES DA IMPRESSORA: ${testsPassed + testsFailed} | APROVADOS: ${testsPassed} | FALHAS: ${testsFailed}`);
 console.log('====================================================');

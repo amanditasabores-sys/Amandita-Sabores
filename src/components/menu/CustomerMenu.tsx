@@ -33,7 +33,6 @@ import {
   Wifi
 } from 'lucide-react';
 import { AmanditaLogo } from '../common/AmanditaLogo';
-import { PWAInstallButton } from '../common/PWAInstallButton';
 
 interface CustomerMenuProps {
   onNavigateToTracking?: (orderId: string, trackingCode?: string) => void;
@@ -321,8 +320,6 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            <PWAInstallButton variant="compact" />
-
             <button
               onClick={() => setIsCartOpen(true)}
               className="relative p-2 sm:p-2.5 bg-gradient-to-r from-[#C86D3B] to-[#721C24] hover:opacity-95 text-white rounded-xl transition font-bold text-xs flex items-center gap-1.5 sm:gap-2 shadow-sm cursor-pointer"

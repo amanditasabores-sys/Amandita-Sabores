@@ -3,8 +3,16 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import webpush from 'web-push';
+import crypto from 'crypto';
 import { initializeApp as initClientApp, getApps as getClientApps, getApp as getClientApp } from 'firebase/app';
-import { getFirestore as getClientFirestore, doc as clientDoc, setDoc as clientSetDoc } from 'firebase/firestore';
+import { 
+  getFirestore as getClientFirestore, 
+  doc as clientDoc, 
+  setDoc as clientSetDoc, 
+  getDocs as clientGetDocs, 
+  collection as clientCollection, 
+  deleteDoc as clientDeleteDoc 
+} from 'firebase/firestore';
 import { initializeApp as initAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
 import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
 import { INITIAL_MENU, OFFICIAL_ADDONS } from './src/data/initialData.ts';
@@ -55,39 +63,6 @@ interface PushSubscriptionData {
 
 const activePushSubscriptions: Map<string, PushSubscriptionData> = new Map();
 const sentNotificationOrderIds = new Set<string>();
-
-async function sendOrderPushNotification(order: any) {
-  if (!order || !order.id || sentNotificationOrderIds.has(order.id)) {
-    return; // Prevent duplicate notifications
-  }
-  sentNotificationOrderIds.add(order.id);
-
-  const payload = JSON.stringify({
-    title: `Novo Pedido #${order.orderNumber}!`,
-    body: `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`,
-    icon: '/pwa-192x192.png',
-    badge: '/favicon-32x32.png',
-    tag: `order-${order.id}`,
-    orderId: order.id,
-    url: '/?view=producao',
-    timestamp: Date.now(),
-  });
-
-  const deadEndpoints: string[] = [];
-  for (const [endpoint, subData] of activePushSubscriptions.entries()) {
-    try {
-      await webpush.sendNotification(subData.subscription, payload);
-    } catch (err: any) {
-      if (err.statusCode === 404 || err.statusCode === 410) {
-        deadEndpoints.push(endpoint);
-      }
-    }
-  }
-
-  for (const endpoint of deadEndpoints) {
-    activePushSubscriptions.delete(endpoint);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Firebase Server Instances Setup
@@ -189,6 +164,268 @@ function jsonToFirestoreDocument(obj: Record<string, unknown>): Record<string, u
     }
   }
   return { fields };
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Cloud Firestore Persistent Push Subscriptions (Vercel Multi-Worker Safe)
+// ---------------------------------------------------------------------------
+async function savePushSubscription(subData: PushSubscriptionData): Promise<boolean> {
+  const endpoint = subData.subscription.endpoint;
+  const endpointHash = crypto.createHash('sha256').update(endpoint).digest('hex');
+  const record = {
+    id: endpointHash,
+    endpoint,
+    keys: {
+      p256dh: subData.subscription.keys?.p256dh || '',
+      auth: subData.subscription.keys?.auth || '',
+    },
+    role: subData.role || 'staff',
+    userAgent: subData.userAgent || '',
+    updatedAt: new Date().toISOString(),
+  };
+
+  // In-memory cache
+  activePushSubscriptions.set(endpoint, subData);
+
+  // Strategy 1: Firebase Admin SDK
+  if (adminDb) {
+    try {
+      await adminDb.collection('push_subscriptions').doc(endpointHash).set(record);
+      return true;
+    } catch (adminErr) {
+      console.warn('[Push Store AdminDb] Fallback necessário:', adminErr);
+    }
+  }
+
+  // Strategy 2: Client SDK
+  if (clientDb) {
+    try {
+      await clientSetDoc(clientDoc(clientDb, 'push_subscriptions', endpointHash), record);
+      return true;
+    } catch (clientErr) {
+      console.warn('[Push Store ClientDb] Fallback necessário:', clientErr);
+    }
+  }
+
+  // Strategy 3: Firestore REST API
+  try {
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+    const docPayload = jsonToFirestoreDocument(record);
+    const res = await fetch(`${baseUrl}/push_subscriptions/${endpointHash}?key=${API_KEY}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(docPayload),
+    });
+    return res.ok;
+  } catch (restErr) {
+    console.warn('[Push Store REST] Falha ao persistir inscrição push:', restErr);
+    return false;
+  }
+}
+
+async function getAllPushSubscriptions(): Promise<PushSubscriptionData[]> {
+  const results: PushSubscriptionData[] = [];
+  const seenEndpoints = new Set<string>();
+
+  // Strategy 1: Firebase Admin SDK
+  if (adminDb) {
+    try {
+      const snap = await adminDb.collection('push_subscriptions').get();
+      snap.forEach((doc) => {
+        const d = doc.data();
+        if (d && d.endpoint && d.keys && !seenEndpoints.has(d.endpoint)) {
+          seenEndpoints.add(d.endpoint);
+          results.push({
+            subscription: {
+              endpoint: d.endpoint,
+              keys: d.keys,
+            } as any,
+            role: d.role,
+            userAgent: d.userAgent,
+            subscribedAt: d.updatedAt || '',
+          });
+        }
+      });
+      if (results.length > 0) return results;
+    } catch (e) {
+      console.warn('[Push Get AdminDb] Erro ao recuperar inscrições:', e);
+    }
+  }
+
+  // Strategy 2: Client SDK
+  if (clientDb) {
+    try {
+      const snap = await clientGetDocs(clientCollection(clientDb, 'push_subscriptions'));
+      snap.forEach((docSnap) => {
+        const d = docSnap.data();
+        if (d && d.endpoint && d.keys && !seenEndpoints.has(d.endpoint)) {
+          seenEndpoints.add(d.endpoint);
+          results.push({
+            subscription: {
+              endpoint: d.endpoint,
+              keys: d.keys,
+            } as any,
+            role: d.role,
+            userAgent: d.userAgent,
+            subscribedAt: d.updatedAt || '',
+          });
+        }
+      });
+      if (results.length > 0) return results;
+    } catch (e) {
+      console.warn('[Push Get ClientDb] Erro ao recuperar inscrições:', e);
+    }
+  }
+
+  // Strategy 3: Firestore REST API
+  try {
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/push_subscriptions?key=${API_KEY}`;
+    const res = await fetch(baseUrl);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.documents && Array.isArray(data.documents)) {
+        for (const doc of data.documents) {
+          const fields = doc.fields || {};
+          const endpoint = fields.endpoint?.stringValue;
+          const p256dh = fields.keys?.mapValue?.fields?.p256dh?.stringValue;
+          const auth = fields.keys?.mapValue?.fields?.auth?.stringValue;
+          if (endpoint && p256dh && auth && !seenEndpoints.has(endpoint)) {
+            seenEndpoints.add(endpoint);
+            results.push({
+              subscription: {
+                endpoint,
+                keys: { p256dh, auth },
+              } as any,
+              role: fields.role?.stringValue,
+              userAgent: fields.userAgent?.stringValue,
+              subscribedAt: fields.updatedAt?.stringValue || '',
+            });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Push Get REST] Erro ao recuperar inscrições:', err);
+  }
+
+  // Strategy 4: Local memory cache
+  for (const [endpoint, sub] of activePushSubscriptions.entries()) {
+    if (!seenEndpoints.has(endpoint)) {
+      results.push(sub);
+    }
+  }
+
+  return results;
+}
+
+async function deletePushSubscription(endpoint: string): Promise<void> {
+  activePushSubscriptions.delete(endpoint);
+  const endpointHash = crypto.createHash('sha256').update(endpoint).digest('hex');
+  if (adminDb) {
+    try {
+      await adminDb.collection('push_subscriptions').doc(endpointHash).delete();
+      return;
+    } catch {}
+  }
+  if (clientDb) {
+    try {
+      await clientDeleteDoc(clientDoc(clientDb, 'push_subscriptions', endpointHash));
+      return;
+    } catch {}
+  }
+  try {
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/push_subscriptions/${endpointHash}?key=${API_KEY}`;
+    await fetch(baseUrl, { method: 'DELETE' });
+  } catch {}
+}
+
+async function sendOrderPushNotification(order: any) {
+  if (!order || !order.id || sentNotificationOrderIds.has(order.id)) {
+    return; // Prevent duplicate notifications
+  }
+  sentNotificationOrderIds.add(order.id);
+
+  const subscriptions = await getAllPushSubscriptions();
+  if (subscriptions.length === 0) {
+    return;
+  }
+
+  const payload = JSON.stringify({
+    title: `Novo Pedido #${order.orderNumber}!`,
+    body: `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`,
+    icon: '/pwa-192x192.png',
+    badge: '/favicon-32x32.png',
+    tag: `order-${order.id}`,
+    orderId: order.id,
+    url: '/?view=producao',
+    timestamp: Date.now(),
+  });
+
+  const pushOptions = {
+    TTL: 86400, // 24 horas de retenção nos gateways FCM/Apple
+    urgency: 'high' as const, // Força acordar o dispositivo mesmo em modo Doze/economia de bateria no Android
+    topic: 'new-orders',
+  };
+
+  const deadEndpoints: string[] = [];
+  for (const subData of subscriptions) {
+    try {
+      await webpush.sendNotification(subData.subscription, payload, pushOptions);
+    } catch (err: any) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        deadEndpoints.push(subData.subscription.endpoint);
+      }
+    }
+  }
+
+  for (const endpoint of deadEndpoints) {
+    await deletePushSubscription(endpoint);
+  }
+}
+
+async function sendTestPushNotification(): Promise<{ sent: number; failed: number }> {
+  const subscriptions = await getAllPushSubscriptions();
+  if (subscriptions.length === 0) {
+    return { sent: 0, failed: 0 };
+  }
+
+  const payload = JSON.stringify({
+    title: '🔔 Teste de Notificação - Amandita Sabores',
+    body: 'Notificação em segundo plano ativa com prioridade alta! O aparelho acordará com tela bloqueada.',
+    icon: '/pwa-192x192.png',
+    badge: '/favicon-32x32.png',
+    tag: `test-push-${Date.now()}`,
+    url: '/?view=producao',
+    timestamp: Date.now(),
+  });
+
+  const pushOptions = {
+    TTL: 86400,
+    urgency: 'high' as const,
+    topic: 'system-tests',
+  };
+
+  let sent = 0;
+  let failed = 0;
+  const deadEndpoints: string[] = [];
+
+  for (const subData of subscriptions) {
+    try {
+      await webpush.sendNotification(subData.subscription, payload, pushOptions);
+      sent++;
+    } catch (err: any) {
+      failed++;
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        deadEndpoints.push(subData.subscription.endpoint);
+      }
+    }
+  }
+
+  for (const endpoint of deadEndpoints) {
+    await deletePushSubscription(endpoint);
+  }
+
+  return { sent, failed };
 }
 
 // ---------------------------------------------------------------------------
@@ -360,20 +597,56 @@ async function startServer() {
     });
   });
 
-  app.post('/api/push/subscribe', (req: Request, res: Response) => {
+  app.post('/api/push/subscribe', async (req: Request, res: Response) => {
     try {
       const { subscription, role, userAgent } = req.body;
-      if (!subscription || !subscription.endpoint) {
-        res.status(400).json({ success: false, message: 'Assinatura Push inválida.' });
+      if (!subscription || !subscription.endpoint || !subscription.keys?.p256dh || !subscription.keys?.auth) {
+        res.status(400).json({ success: false, message: 'Assinatura Push incompleta ou inválida.' });
         return;
       }
-      activePushSubscriptions.set(subscription.endpoint, {
+      await savePushSubscription({
         subscription,
         role: role || 'staff',
         userAgent,
         subscribedAt: new Date().toISOString(),
       });
-      res.json({ success: true, message: 'Dispositivo registrado com sucesso para notificações em segundo plano.' });
+      res.json({ success: true, message: 'Dispositivo registrado com sucesso no Firestore para notificações em segundo plano.' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: msg });
+    }
+  });
+
+  // Background Push Trigger for Newly Ingested Orders (Called automatically on all orders)
+  app.post('/api/push/notify-order', async (req: Request, res: Response) => {
+    try {
+      const { order } = req.body;
+      if (!order || !order.id) {
+        res.status(400).json({ success: false, message: 'Pedido ausente ou sem identificador.' });
+        return;
+      }
+      sendOrderPushNotification(order).catch((pushErr) => {
+        console.warn('[Web Push Notify-Order] Aviso ao despachar push:', pushErr?.message || pushErr);
+      });
+      res.json({ success: true, message: 'Notificação push de novo pedido despachada com sucesso aos dispositivos da equipe.' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: msg });
+    }
+  });
+
+  // Background Push Diagnostic & Testing Endpoint
+  app.post('/api/push/test', async (req: Request, res: Response) => {
+    try {
+      const result = await sendTestPushNotification();
+      res.json({
+        success: true,
+        message: result.sent > 0 
+          ? `Notificação de teste enviada com sucesso para ${result.sent} dispositivo(s)!`
+          : 'Nenhum dispositivo com notificação push registrado no momento.',
+        sent: result.sent,
+        failed: result.failed,
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, message: msg });

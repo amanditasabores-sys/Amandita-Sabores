@@ -9,14 +9,13 @@ import { KitchenScreen } from './components/staff/KitchenScreen';
 import { CashierScreen } from './components/staff/CashierScreen';
 import { AttendantScreen } from './components/staff/AttendantScreen';
 import { AuthModal } from './components/auth/AuthModal';
+import { pushNotificationService } from './services/pushNotification';
 import { 
   ShieldCheck, 
   UtensilsCrossed, 
   Bike, 
   MapPin, 
-  RotateCcw, 
   LogIn, 
-  Flame, 
   ChefHat, 
   Vault, 
   Store, 
@@ -29,18 +28,12 @@ import {
   Eye,
   EyeOff
 } from 'lucide-react';
-import { ConfirmModal } from './components/common/ConfirmModal';
-import { FirebaseStatusModal } from './components/admin/FirebaseStatusModal';
-import { PWAInstallButton } from './components/common/PWAInstallButton';
-import { PWAInstallBanner } from './components/common/PWAInstallBanner';
 
 export type AppView = 'admin' | 'cardapio' | 'entregador' | 'producao' | 'caixa' | 'atendente' | 'rastreio';
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(() => store.getCurrentUser());
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
-  const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
-  const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
   const [securityNotice, setSecurityNotice] = useState<string | null>(null);
 
   // Current view detection from URL query parameters (main domain defaults to employee access)
@@ -241,6 +234,11 @@ export default function App() {
       store.ensureFirebaseAuthForStaff().then(() => {
         store.initStaffFirestoreSync();
       }).catch(() => {});
+
+      // Sincroniza inscrição de notificações push se o navegador já tiver permissão
+      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+        pushNotificationService.requestAndSubscribe(currentUser.role).catch(() => {});
+      }
     }
   }, [currentUser, currentView]);
 
@@ -297,16 +295,6 @@ export default function App() {
     navigateTo('admin');
   };
 
-  const handleResetSampleData = () => {
-    setIsResetConfirmOpen(true);
-  };
-
-  const executeResetSampleData = () => {
-    store.resetToSampleData();
-    setIsResetConfirmOpen(false);
-    window.location.reload();
-  };
-
   // Only Administrator or Gerente can see the global navigation toolbar,
   // and NEVER on public customer views (cardapio or rastreio)
   const isGlobalToolbarVisible = Boolean(
@@ -332,17 +320,21 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-1 sm:gap-2 overflow-x-auto scrollbar-none py-0.5 min-w-0 flex-1 justify-end">
-              {/* 1. Admin */}
+              {/* 1. Botão de retorno ao PDV / Painel de Controle */}
               <button
-                onClick={() => navigateTo('admin')}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                onClick={() => {
+                  navigateTo('admin');
+                  window.dispatchEvent(new CustomEvent('switch_to_pdv'));
+                }}
+                className={`px-2.5 sm:px-3 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
                   currentView === 'admin'
                     ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    : 'bg-emerald-600/30 text-emerald-200 hover:text-white hover:bg-emerald-600/50 border border-emerald-500/40'
                 }`}
+                title="Retornar diretamente à tela principal do PDV / Painel de Controle"
               >
-                <ShieldCheck className="w-3.5 h-3.5" />
-                <span><span className="hidden sm:inline">Painel </span>Admin</span>
+                <Store className="w-3.5 h-3.5 text-[#E89255]" />
+                <span>PDV / Painel de Controle</span>
               </button>
 
               {/* 2. Customer Menu */}
@@ -409,28 +401,6 @@ export default function App() {
                 <Bike className="w-3.5 h-3.5" />
                 <span>Entregas</span>
               </button>
-
-              {/* 7. Firebase Cloud Status */}
-              <button
-                onClick={() => setIsFirebaseModalOpen(true)}
-                title="Status do Cloud Firestore & Migração de Dados"
-                className="px-2 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer bg-amber-500/20 text-[#FFCA28] hover:bg-amber-500/30 border border-[#FFCA28]/40"
-              >
-                <Flame className="w-3.5 h-3.5 text-[#FFCA28]" />
-                <span className="hidden sm:inline">Firebase</span>
-              </button>
-
-              {/* Reset data */}
-              <button
-                onClick={handleResetSampleData}
-                title="Restaurar dados iniciais da Amandita Sabores"
-                className="p-1 text-[#D9C7B8] hover:text-white hover:bg-white/10 rounded-lg ml-0.5 shrink-0 cursor-pointer"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-              </button>
-
-              {/* PWA Install Button */}
-              <PWAInstallButton variant="subtle" />
             </div>
           </div>
         </aside>
@@ -617,12 +587,6 @@ export default function App() {
         </div>
       )}
 
-      {/* FIREBASE STATUS & MIGRATION MODAL */}
-      <FirebaseStatusModal
-        isOpen={isFirebaseModalOpen}
-        onClose={() => setIsFirebaseModalOpen(false)}
-      />
-
       {/* AUTH MODAL */}
       <AuthModal
         isOpen={isAuthModalOpen}
@@ -633,23 +597,6 @@ export default function App() {
           navigateTo(getDefaultViewForRole(user.role));
         }}
       />
-
-      {/* CONFIRM RESET SAMPLE DATA MODAL */}
-      {isResetConfirmOpen && (
-        <ConfirmModal
-          isOpen={true}
-          title="Restaurar Dados de Demonstração"
-          message="Deseja restaurar todos os pedidos, cardápio e turnos de caixa para a demonstração inicial com pedidos recentes de exemplo? Quaisquer alterações não salvas serão reinicializadas."
-          confirmLabel="Restaurar Dados Iniciais"
-          cancelLabel="Cancelar"
-          isDanger={true}
-          onConfirm={executeResetSampleData}
-          onCancel={() => setIsResetConfirmOpen(false)}
-        />
-      )}
-
-      {/* PWA MOBILE INSTALL BANNER */}
-      <PWAInstallBanner />
     </div>
   );
 }

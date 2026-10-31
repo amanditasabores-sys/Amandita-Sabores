@@ -113,10 +113,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
       }
     };
 
+    const handleSwitchToPdv = () => {
+      setActiveTab('pdv');
+    };
+
     window.addEventListener('gestaofood_state_changed', handleStateChange);
+    window.addEventListener('switch_to_pdv', handleSwitchToPdv);
     return () => {
       clearInterval(timer);
       window.removeEventListener('gestaofood_state_changed', handleStateChange);
+      window.removeEventListener('switch_to_pdv', handleSwitchToPdv);
     };
   }, []);
 
@@ -191,6 +197,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
                 Testar Som
               </button>
             </div>
+
+            {/* Quick return to PDV / Balcão if in other tabs */}
+            {activeTab !== 'pdv' && allowedTabs.some((t) => t.id === 'pdv') && (
+              <button
+                onClick={() => setActiveTab('pdv')}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-emerald-700 to-emerald-600 hover:opacity-95 text-white rounded-xl text-xs font-bold transition shadow-2xs cursor-pointer"
+                title="Retornar diretamente à tela principal do PDV Balcão"
+              >
+                <Store className="w-3.5 h-3.5" />
+                <span>PDV / Painel de Controle</span>
+              </button>
+            )}
 
             {/* Quick Link buttons to Client Menu and Driver Portal */}
             <button
@@ -348,7 +366,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
         )}
 
         {activeTab === 'settings' && (
-          <StoreSettings />
+          <StoreSettings currentUser={currentUser} onNavigateToPdv={() => setActiveTab('pdv')} />
         )}
       </main>
 

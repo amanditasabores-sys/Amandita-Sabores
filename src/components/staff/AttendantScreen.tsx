@@ -133,6 +133,18 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
               </button>
             </div>
 
+            {/* Quick return to PDV if on kanban tab */}
+            {activeTab !== 'pdv' && (
+              <button
+                onClick={() => setActiveTab('pdv')}
+                className="px-2.5 py-1.5 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-emerald-500/40 cursor-pointer"
+                title="Retornar à tela principal do PDV"
+              >
+                <Store className="w-3.5 h-3.5 text-[#E89255]" />
+                <span className="hidden sm:inline">PDV / Painel</span>
+              </button>
+            )}
+
             {/* User Profile & Logout */}
             <div className="flex items-center gap-2 pl-2 border-l border-[#4A2E1F]">
               <div className="text-right hidden sm:block">

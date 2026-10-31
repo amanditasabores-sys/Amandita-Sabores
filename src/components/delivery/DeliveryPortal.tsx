@@ -16,7 +16,8 @@ import {
   X,
   UserCheck,
   RotateCcw,
-  LogOut
+  LogOut,
+  Store
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { User } from '../../types';
@@ -257,12 +258,16 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {onNavigateToAdmin && (currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE') && (
               <button
-                onClick={onNavigateToAdmin}
-                className="px-2.5 sm:px-3 py-1.5 sm:py-2 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition border border-slate-700 cursor-pointer"
-                title="Voltar ao Painel Administrativo"
+                onClick={() => {
+                  onNavigateToAdmin();
+                  window.dispatchEvent(new CustomEvent('switch_to_pdv'));
+                }}
+                className="px-2.5 sm:px-3 py-1.5 sm:py-2 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition border border-emerald-500/40 cursor-pointer flex items-center gap-1.5"
+                title="Voltar diretamente ao PDV / Painel de Controle"
               >
-                <span className="hidden sm:inline">Painel ADM</span>
-                <span className="sm:hidden">ADM</span>
+                <Store className="w-3.5 h-3.5 text-[#E89255]" />
+                <span className="hidden sm:inline">PDV / Painel</span>
+                <span className="sm:hidden">PDV</span>
               </button>
             )}
 

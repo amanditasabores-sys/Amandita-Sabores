@@ -15,9 +15,11 @@ self.addEventListener('push', function (event) {
     body: payload.body || 'Um novo pedido acabou de entrar no sistema.',
     icon: payload.icon || '/pwa-192x192.png',
     badge: payload.badge || '/favicon-32x32.png',
-    vibrate: [200, 100, 200, 100, 200],
+    vibrate: [300, 100, 300, 100, 300],
     tag: payload.tag || ('order-' + (payload.orderId || Date.now())),
     renotify: true,
+    requireInteraction: true, // Mantém notificação visível na tela de bloqueio até interação
+    silent: false,
     data: {
       url: payload.url || '/?view=producao',
       orderId: payload.orderId || '',

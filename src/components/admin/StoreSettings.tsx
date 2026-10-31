@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
-import { RestaurantConfig } from '../../types';
+import { RestaurantConfig, User } from '../../types';
 import { generatePixCopiaECola, sanitizePixKey, sanitizeMerchantName, sanitizeMerchantCity } from '../../utils/pix';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { formatCurrency } from '../../utils/formatters';
@@ -20,15 +20,194 @@ import {
   Sparkles,
   AlertCircle,
   Flame,
-  Database
+  Database,
+  Download,
+  RotateCcw,
+  Lock,
+  ShieldAlert,
+  Eye,
+  EyeOff,
+  RefreshCw,
+  AlertTriangle,
+  Store,
+  X,
+  Bell
 } from 'lucide-react';
 import { FirebaseStatusModal } from './FirebaseStatusModal';
 import { PrinterSettings } from './PrinterSettings';
+import { PWAInstallButton } from '../common/PWAInstallButton';
+import { pushNotificationService } from '../../services/pushNotification';
 
-export const StoreSettings: React.FC = () => {
+interface StoreSettingsProps {
+  currentUser?: User | null;
+  onNavigateToPdv?: () => void;
+}
+
+export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNavigateToPdv }) => {
   const [config, setConfig] = useState<RestaurantConfig>(() => store.getRestaurantConfig());
   const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
   const [isSaved, setIsSaved] = useState(false);
+
+  // Firebase Live Test
+  const [isTestingFirebase, setIsTestingFirebase] = useState(false);
+  const [firebaseTestResult, setFirebaseTestResult] = useState<{
+    success?: boolean;
+    message?: string;
+    details?: string;
+  } | null>(null);
+
+  // Protected Data Restoration
+  const [isRestoreModalOpen, setIsRestoreModalOpen] = useState(false);
+  const [restoreStep, setRestoreStep] = useState<'password' | 'confirm'>('password');
+  const [adminPasswordInput, setAdminPasswordInput] = useState('');
+  const [showAdminPassword, setShowAdminPassword] = useState(false);
+  const [isCheckingPassword, setIsCheckingPassword] = useState(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [isRestoring, setIsRestoring] = useState(false);
+  const [confirmUnderstand, setConfirmUnderstand] = useState(false);
+
+  const activeUser = currentUser || store.getCurrentUser();
+  const isAdmin = Boolean(
+    (activeUser?.role || '').toUpperCase() === 'ADMINISTRADOR' ||
+    activeUser?.username === 'admin'
+  );
+
+  // Handlers for Firebase Connection Test
+  const handleTestFirebaseConnection = async () => {
+    setIsTestingFirebase(true);
+    setFirebaseTestResult(null);
+    try {
+      const res = await store.testConnection();
+      setFirebaseTestResult(res);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setFirebaseTestResult({
+        success: false,
+        message: msg,
+        details: 'Falha durante o teste de conexão com o Firebase.'
+      });
+    } finally {
+      setIsTestingFirebase(false);
+    }
+  };
+
+  // Push Notification State & Handlers
+  const [pushStatus, setPushStatus] = useState<{
+    supported: boolean;
+    permission: NotificationPermission;
+    subscribed: boolean;
+  }>({
+    supported: pushNotificationService.isSupported(),
+    permission: pushNotificationService.getPermission(),
+    subscribed: false,
+  });
+  const [isSubscribingPush, setIsSubscribingPush] = useState(false);
+  const [isTestingPush, setIsTestingPush] = useState(false);
+  const [pushFeedback, setPushFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  useEffect(() => {
+    pushNotificationService.getStatus().then((st) => {
+      setPushStatus({
+        supported: st.supported,
+        permission: st.permission,
+        subscribed: st.subscribed,
+      });
+    }).catch(() => {});
+  }, []);
+
+  const handleEnablePush = async () => {
+    setIsSubscribingPush(true);
+    setPushFeedback(null);
+    try {
+      const role = activeUser?.role || 'staff';
+      const res = await pushNotificationService.requestAndSubscribe(role);
+      if (res.success) {
+        setPushFeedback({ type: 'success', message: res.message });
+        const st = await pushNotificationService.getStatus();
+        setPushStatus({
+          supported: st.supported,
+          permission: st.permission,
+          subscribed: st.subscribed,
+        });
+      } else {
+        setPushFeedback({ type: 'error', message: res.message });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPushFeedback({ type: 'error', message: msg });
+    } finally {
+      setIsSubscribingPush(false);
+    }
+  };
+
+  const handleTestPush = async () => {
+    setIsTestingPush(true);
+    setPushFeedback(null);
+    try {
+      const res = await fetch('/api/push/test', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setPushFeedback({ type: 'success', message: data.message });
+      } else {
+        setPushFeedback({ type: 'error', message: data.message || 'Falha ao despachar notificação de teste.' });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPushFeedback({ type: 'error', message: `Erro ao testar push: ${msg}` });
+    } finally {
+      setIsTestingPush(false);
+    }
+  };
+
+  // Handlers for Protected Data Restoration
+  const handleOpenRestoreModal = () => {
+    setRestoreStep('password');
+    setAdminPasswordInput('');
+    setPasswordError(null);
+    setConfirmUnderstand(false);
+    setIsRestoreModalOpen(true);
+  };
+
+  const handleValidatePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPasswordError(null);
+    if (!adminPasswordInput.trim()) {
+      setPasswordError('Por favor, informe a senha do administrador.');
+      return;
+    }
+    setIsCheckingPassword(true);
+    try {
+      const res = await store.verifyAdminPassword(adminPasswordInput);
+      if (res.success) {
+        setRestoreStep('confirm');
+      } else {
+        setPasswordError(res.message || 'Senha incorreta. Acesso não autorizado.');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPasswordError(`Erro na validação: ${msg}`);
+    } finally {
+      setIsCheckingPassword(false);
+    }
+  };
+
+  const handleExecuteRestore = () => {
+    if (!confirmUnderstand) return;
+    setIsRestoring(true);
+    const active = currentUser || store.getCurrentUser();
+    if (active) {
+      store.logAccess({
+        userId: active.id,
+        username: active.username || active.name || 'admin',
+        role: active.role,
+        action: 'RESTAURACAO_DADOS',
+        details: 'Restauração de dados executada após autenticação de administrador.',
+      });
+    }
+    store.resetToSampleData();
+    setIsRestoreModalOpen(false);
+    window.location.reload();
+  };
 
   // PIX Test Simulation
   const [testAmount, setTestAmount] = useState('25.00');
@@ -415,6 +594,388 @@ export const StoreSettings: React.FC = () => {
 
       {/* SECTION 4: IMPRESSORA DE PEDIDOS TÉRMICA 58MM BLUETOOTH */}
       <PrinterSettings />
+
+      {/* SECTION 5: INSTALAR APLICATIVO (PWA) */}
+      <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-700 flex items-center justify-center font-bold">
+              <Download className="w-5 h-5 text-amber-600" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-slate-900">Instalar aplicativo (PWA)</h3>
+              <p className="text-xs text-slate-500">
+                Instale o Amandita Sabores no seu celular Android, iPhone ou computador para acesso instantâneo em tela cheia.
+              </p>
+            </div>
+          </div>
+          <PWAInstallButton variant="primary" />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1 text-xs text-slate-600">
+          <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80">
+            <span className="font-bold text-slate-800 block mb-1">Android (Google Chrome)</span>
+            <p className="text-[11px] leading-relaxed">
+              Clique em "Instalar App" acima ou no menu do Chrome (três pontos) e selecione "Instalar aplicativo" para criar o ícone na tela inicial.
+            </p>
+          </div>
+          <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80">
+            <span className="font-bold text-slate-800 block mb-1">iPhone / iPad (Safari)</span>
+            <p className="text-[11px] leading-relaxed">
+              Toque no botão de Compartilhar (quadrado com seta para cima) na barra do Safari e selecione "Adicionar à Tela de Início".
+            </p>
+          </div>
+          <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80">
+            <span className="font-bold text-slate-800 block mb-1">Computador (Windows / Mac)</span>
+            <p className="text-[11px] leading-relaxed">
+              No Chrome ou Edge, clique no ícone de instalação ao lado da barra de endereços para abrir o app em janela independente.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION: NOTIFICAÇÕES PUSH EM SEGUNDO PLANO */}
+      <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-600 flex items-center justify-center font-bold">
+              <Bell className="w-5 h-5 text-amber-600" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-base font-bold text-slate-900">Notificações Push em Segundo Plano (Web Push)</h3>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                  pushStatus.permission === 'granted'
+                    ? 'bg-emerald-100 text-emerald-800'
+                    : pushStatus.permission === 'denied'
+                    ? 'bg-rose-100 text-rose-800'
+                    : 'bg-amber-100 text-amber-800'
+                }`}>
+                  {pushStatus.permission === 'granted' ? 'Permissão Ativa' : pushStatus.permission === 'denied' ? 'Bloqueada' : 'Pendente'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500">
+                Receba alertas sonoros e avisos de novos pedidos mesmo com o celular bloqueado ou o navegador em segundo plano.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleEnablePush}
+              disabled={isSubscribingPush}
+              className="px-3.5 py-2 text-xs font-bold rounded-xl bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-2 transition cursor-pointer shadow-xs disabled:opacity-50"
+            >
+              <Bell className={`w-3.5 h-3.5 ${isSubscribingPush ? 'animate-bounce' : ''}`} />
+              <span>{isSubscribingPush ? 'Ativando...' : 'Ativar no Aparelho'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleTestPush}
+              disabled={isTestingPush}
+              className="px-3.5 py-2 text-xs font-bold rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 border border-slate-200"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isTestingPush ? 'animate-spin' : ''}`} />
+              <span>{isTestingPush ? 'Disparando...' : 'Enviar Notificação de Teste'}</span>
+            </button>
+          </div>
+        </div>
+
+        {pushFeedback && (
+          <div className={`p-3.5 rounded-xl text-xs flex items-center justify-between gap-2 ${
+            pushFeedback.type === 'success' 
+              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' 
+              : 'bg-rose-50 text-rose-800 border border-rose-200'
+          }`}>
+            <div className="flex items-center gap-2">
+              {pushFeedback.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              ) : (
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              )}
+              <span>{pushFeedback.message}</span>
+            </div>
+            <button 
+              type="button" 
+              onClick={() => setPushFeedback(null)} 
+              className="text-slate-400 hover:text-slate-600 font-bold px-1"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Guia Android Tela Bloqueada / Economia de Bateria */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-600">
+          <div className="p-3.5 bg-amber-500/5 rounded-xl border border-amber-500/20 space-y-1.5">
+            <span className="font-bold text-amber-900 flex items-center gap-1.5">
+              <Smartphone className="w-4 h-4 text-amber-600" />
+              Instruções para Celular Android (Tela Bloqueada)
+            </span>
+            <p className="text-[11px] leading-relaxed text-slate-600">
+              Para receber alertas sonoros com a tela desligada ou bloqueada: no Android, vá em <strong>Configurações &gt; Aplicativos &gt; Chrome (ou Amandita) &gt; Bateria</strong> e marque <strong>"Sem Restrições"</strong> (desativa a economia de bateria/modo Doze para o app).
+            </p>
+          </div>
+          <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200/80 space-y-1.5">
+            <span className="font-bold text-slate-800 flex items-center gap-1.5">
+              <Check className="w-4 h-4 text-emerald-600" />
+              Persistência Segura no Cloud Firestore
+            </span>
+            <p className="text-[11px] leading-relaxed text-slate-600">
+              As inscrições são salvas na coleção <code>push_subscriptions</code> do Firestore. Quando um cliente finaliza um pedido, o servidor despacha o alerta Web Push com prioridade máxima (high urgency) para todos os dispositivos autorizados.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION 6: TESTAR CONEXÃO COM FIREBASE */}
+      <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-600 flex items-center justify-center font-bold">
+              <Flame className="w-5 h-5 text-amber-500" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-slate-900">Testar conexão com Firebase</h3>
+              <p className="text-xs text-slate-500">
+                Verifique a comunicação em tempo real entre o Amandita Sabores e o Cloud Firestore na nuvem.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleTestFirebaseConnection}
+              disabled={isTestingFirebase}
+              className="px-3.5 py-2 text-xs font-bold rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center gap-2 transition cursor-pointer shadow-xs disabled:opacity-50"
+            >
+              <Flame className={`w-4 h-4 ${isTestingFirebase ? 'animate-bounce' : ''}`} />
+              <span>{isTestingFirebase ? 'Testando Conexão...' : 'Testar conexão com Firebase'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsFirebaseModalOpen(true)}
+              className="px-3 py-2 text-xs font-semibold rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center gap-1.5 transition cursor-pointer"
+              title="Ver painel avançado e migração do Firebase"
+            >
+              <Database className="w-3.5 h-3.5 text-slate-500" />
+              <span className="hidden sm:inline">Diagnóstico Avançado</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Live Test Feedback Banner */}
+        {firebaseTestResult && (
+          <div className={`p-4 rounded-xl border text-xs space-y-1.5 animate-in fade-in ${
+            firebaseTestResult.success
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              : 'bg-rose-50 border-rose-200 text-rose-900'
+          }`}>
+            <div className="flex items-center gap-2 font-bold text-sm">
+              {firebaseTestResult.success ? (
+                <>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>Conexão ativa e verificada com o Cloud Firestore!</span>
+                </>
+              ) : (
+                <>
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>Falha na conexão com o Cloud Firestore</span>
+                </>
+              )}
+            </div>
+            <p className="text-xs leading-relaxed opacity-90 pl-6">
+              {firebaseTestResult.message}
+            </p>
+            {firebaseTestResult.details && (
+              <p className="text-[11px] font-mono opacity-75 pl-6 bg-black/5 p-2 rounded-lg mt-1 break-all">
+                {firebaseTestResult.details}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* SECTION 7: RESTAURAR DADOS (PROTEGIDO COM SENHA DO ADMINISTRADOR) */}
+      {isAdmin && (
+        <div className="bg-white rounded-2xl p-6 border border-rose-200/80 shadow-xs space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-rose-100">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/10 text-rose-700 flex items-center justify-center font-bold">
+                <RotateCcw className="w-5 h-5 text-rose-600" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <span>Restaurar dados</span>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700 uppercase tracking-wider">
+                    Área Crítica
+                  </span>
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Reinicializa os dados do sistema para a demonstração padrão inicial (cardápio, pedidos de exemplo e turnos). Requer autenticação por senha do administrador.
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleOpenRestoreModal}
+              className="px-3.5 py-2 text-xs font-bold rounded-xl bg-rose-600 hover:bg-rose-700 text-white flex items-center gap-2 transition cursor-pointer shadow-xs"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Restaurar dados</span>
+            </button>
+          </div>
+
+          <div className="p-3 bg-amber-50/70 border border-amber-200/80 rounded-xl text-xs text-amber-900 flex items-start gap-2.5">
+            <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <p className="leading-relaxed">
+              <strong className="font-bold">Aviso de Segurança:</strong> Esta ferramenta substitui os pedidos locais e turnos de caixa atuais pelos dados padrão de demonstração. A operação é protegida e exige a senha do Administrador e confirmação explícita antes de qualquer alteração.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DE RESTAURAÇÃO DE DADOS COM VALIDAÇÃO DE SENHA */}
+      {isRestoreModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-200 text-slate-900 relative">
+            <button
+              type="button"
+              onClick={() => setIsRestoreModalOpen(false)}
+              className="absolute top-5 right-5 p-1.5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 transition cursor-pointer"
+              aria-label="Fechar"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            {/* ETAPA 1: SOLICITAÇÃO E VALIDAÇÃO DA SENHA DO ADMINISTRADOR */}
+            {restoreStep === 'password' && (
+              <form onSubmit={handleValidatePassword} className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-rose-100 text-rose-700 flex items-center justify-center font-bold">
+                    <Lock className="w-6 h-6 text-rose-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-black text-slate-900">Autenticação do Administrador</h3>
+                    <p className="text-xs text-slate-500">Restaurar dados do Amandita Sabores</p>
+                  </div>
+                </div>
+
+                <p className="text-xs text-slate-600 leading-relaxed bg-slate-50 p-3 rounded-xl border border-slate-200/80">
+                  Para acessar a ferramenta de restauração, confirme sua senha cadastrada no sistema. Somente administradores autorizados podem continuar.
+                </p>
+
+                {passwordError && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2 animate-in fade-in">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+                    <span>{passwordError}</span>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
+                    Senha do Administrador
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showAdminPassword ? 'text' : 'password'}
+                      value={adminPasswordInput}
+                      onChange={(e) => setAdminPasswordInput(e.target.value)}
+                      placeholder="Digite sua senha de acesso"
+                      autoFocus
+                      className="w-full pl-3.5 pr-10 py-2.5 bg-white border border-slate-300 rounded-xl text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-rose-500/40 focus:border-rose-500 transition"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowAdminPassword(!showAdminPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"
+                    >
+                      {showAdminPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsRestoreModalOpen(false)}
+                    className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isCheckingPassword}
+                    className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-xl transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                  >
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>{isCheckingPassword ? 'Verificando...' : 'Validar Senha'}</span>
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* ETAPA 2: CONFIRMAÇÃO EXPLÍCITA ANTES DE EXECUTAR */}
+            {restoreStep === 'confirm' && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center font-bold">
+                    <AlertTriangle className="w-6 h-6 text-amber-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-black text-slate-900">Confirmar Restauração de Dados</h3>
+                    <p className="text-xs text-emerald-700 font-semibold flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      Identidade de Administrador confirmada
+                    </p>
+                  </div>
+                </div>
+
+                <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-900 space-y-2">
+                  <p className="font-bold">
+                    Atenção: A restauração pode substituir dados existentes!
+                  </p>
+                  <p className="leading-relaxed opacity-90">
+                    Ao confirmar, os pedidos locais, turnos de caixa e configurações temporárias serão substituídos pela base inicial de demonstração da Amandita Sabores.
+                  </p>
+                </div>
+
+                <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={confirmUnderstand}
+                    onChange={(e) => setConfirmUnderstand(e.target.checked)}
+                    className="mt-0.5 rounded border-slate-300 text-rose-600 focus:ring-rose-500"
+                  />
+                  <span>
+                    Confirmo expressamente que sou o Administrador e desejo restaurar os dados iniciais do sistema.
+                  </span>
+                </label>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsRestoreModalOpen(false)}
+                    className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExecuteRestore}
+                    disabled={!confirmUnderstand || isRestoring}
+                    className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-xl transition flex items-center gap-1.5 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shadow-xs"
+                  >
+                    <RotateCcw className={`w-3.5 h-3.5 ${isRestoring ? 'animate-spin' : ''}`} />
+                    <span>{isRestoring ? 'Restaurando...' : 'Confirmar e Restaurar Dados'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <FirebaseStatusModal
         isOpen={isFirebaseModalOpen}

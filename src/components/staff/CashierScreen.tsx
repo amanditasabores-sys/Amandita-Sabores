@@ -29,7 +29,10 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
 
   const allowedModules = currentUser?.allowedModules || ['caixa'];
   const hasReportsPermission = allowedModules.includes('relatorios');
-  const hasPdvPermission = allowedModules.includes('pdv');
+  const hasPdvPermission = allowedModules.includes('pdv') || 
+    currentUser?.role === 'ADMINISTRADOR' || 
+    currentUser?.role === 'GERENTE' || 
+    currentUser?.username === 'admin';
 
   const refreshData = () => {
     setCurrentShift(store.getCurrentCashShift());
@@ -89,6 +92,22 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
 
           {/* User Profile & Logout */}
           <div className="flex items-center gap-3">
+            {hasPdvPermission && (
+              <button
+                onClick={() => {
+                  const url = new URL(window.location.href);
+                  url.searchParams.set('view', 'admin');
+                  window.history.pushState({}, '', url.toString());
+                  window.dispatchEvent(new PopStateEvent('popstate'));
+                  window.dispatchEvent(new CustomEvent('switch_to_pdv'));
+                }}
+                className="px-2.5 py-1.5 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-emerald-500/40 cursor-pointer"
+                title="Retornar à tela principal do PDV / Painel de Controle"
+              >
+                <Store className="w-3.5 h-3.5 text-[#E89255]" />
+                <span className="hidden sm:inline">PDV / Painel</span>
+              </button>
+            )}
             <div className="text-right hidden sm:block">
               <p className="text-xs font-black text-white leading-tight">
                 {currentUser?.name || currentUser?.username || 'Operador de Caixa'}

@@ -60,7 +60,7 @@ export interface UserAccessLog {
   userId?: string;
   username: string;
   timestamp: string;
-  action: 'LOGIN_SUCESSO' | 'LOGIN_FALHA' | 'LOGOUT' | 'SENHA_ALTERADA' | 'CONTA_BLOQUEADA' | 'LOGIN_CONTINGENCIA_LOCAL' | 'VINCULO_FIREBASE';
+  action: 'LOGIN_SUCESSO' | 'LOGIN_FALHA' | 'LOGOUT' | 'SENHA_ALTERADA' | 'CONTA_BLOQUEADA' | 'LOGIN_CONTINGENCIA_LOCAL' | 'VINCULO_FIREBASE' | 'RESTAURACAO_DADOS';
   details?: string;
   role?: string;
 }

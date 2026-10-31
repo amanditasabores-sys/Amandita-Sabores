@@ -48,6 +48,10 @@ const COMMON_BLE_PRINT_SERVICES = [
   '0000ff00-0000-1000-8000-00805f9b34fb', // Generic POS BLE
   '0000fff0-0000-1000-8000-00805f9b34fb', // Vendor Specific 1
   '0000ae00-0000-1000-8000-00805f9b34fb', // Vendor Specific 2
+  '0000fee7-0000-1000-8000-00805f9b34fb', // Tencent / Chinese POS
+  '0000af30-0000-1000-8000-00805f9b34fb', // Zjiang / PeriPage / Paperang
+  '00001800-0000-1000-8000-00805f9b34fb', // Generic Access
+  '0000180a-0000-1000-8000-00805f9b34fb', // Device Information
 ];
 
 const COMMON_BLE_WRITE_CHARS = [
@@ -58,6 +62,8 @@ const COMMON_BLE_WRITE_CHARS = [
   '0000ff02-0000-1000-8000-00805f9b34fb',
   '0000fff2-0000-1000-8000-00805f9b34fb',
   '0000ae01-0000-1000-8000-00805f9b34fb',
+  '0000fee1-0000-1000-8000-00805f9b34fb',
+  '0000af31-0000-1000-8000-00805f9b34fb',
 ];
 
 const DEFAULT_CONFIG: ThermalPrinterConfig = {
@@ -164,12 +170,28 @@ class ThermalPrinterService {
       return { success: false, message: err };
     }
 
+    const nav = navigator as any;
+
+    // 1. Verifica se o hardware Bluetooth está ligado no dispositivo
+    try {
+      if (typeof nav.bluetooth.getAvailability === 'function') {
+        const isAvailable = await nav.bluetooth.getAvailability();
+        if (!isAvailable) {
+          const msg = 'O Bluetooth do seu aparelho está desligado. Por favor, ative o Bluetooth nas configurações do celular/computador e certifique-se de que a impressora está ligada.';
+          this.lastError = msg;
+          this.notifyStatus();
+          return { success: false, message: msg };
+        }
+      }
+    } catch {
+      // Ignora erro de checagem prévia caso não suportado
+    }
+
     try {
       this.lastError = null;
       this.notifyStatus();
 
-      // Solicita seleção de dispositivo com filtros de serviços térmicos
-      const nav = navigator as any;
+      // Solicita seleção nativa no Google Chrome
       const device = await nav.bluetooth.requestDevice({
         acceptAllDevices: true,
         optionalServices: COMMON_BLE_PRINT_SERVICES,
@@ -180,60 +202,18 @@ class ThermalPrinterService {
       }
 
       this.bleDevice = device;
-
-      device.addEventListener('gattserverdisconnected', () => {
-        this.writeCharacteristic = null;
-        this.gattServer = null;
-        this.notifyStatus();
-      });
+      this.setupDeviceDisconnectionListener(device);
 
       // Conecta ao GATT Server
       const server = await device.gatt.connect();
       this.gattServer = server;
 
-      // Descobre serviço e característica de escrita
-      let foundCharacteristic: any = null;
-
-      for (const serviceUuid of COMMON_BLE_PRINT_SERVICES) {
-        try {
-          const service = await server.getPrimaryService(serviceUuid);
-          if (service) {
-            const characteristics = await service.getCharacteristics();
-            for (const char of characteristics) {
-              if (char.properties.write || char.properties.writeWithoutResponse) {
-                foundCharacteristic = char;
-                break;
-              }
-            }
-          }
-        } catch {
-          // Continua tentando próximo serviço
-        }
-        if (foundCharacteristic) break;
-      }
-
-      // Se não encontrou por UUID conhecido, tenta obter todos os serviços primários
-      if (!foundCharacteristic) {
-        try {
-          const services = await server.getPrimaryServices();
-          for (const s of services) {
-            const chars = await s.getCharacteristics();
-            for (const c of chars) {
-              if (c.properties.write || c.properties.writeWithoutResponse) {
-                foundCharacteristic = c;
-                break;
-              }
-            }
-            if (foundCharacteristic) break;
-          }
-        } catch {
-          // fallback
-        }
-      }
+      // Descobre serviço e característica de escrita ESC/POS
+      const foundCharacteristic = await this.discoverWriteCharacteristic(server);
 
       if (!foundCharacteristic) {
         await this.disconnectBluetooth();
-        const err = `Impressora conectada (${device.name || 'Dispositivo'}), mas não foi encontrada a característica de escrita ESC/POS. Verifique se o modelo suporta BLE ou utilize o modo RawBT.`;
+        const err = `Impressora pareada (${device.name || 'Dispositivo'}), mas não foi encontrada a característica de escrita BLE ESC/POS. A maioria das impressoras portáteis de 58mm utiliza Bluetooth clássico (SPP). Selecione o modo "Android RawBT" para imprimir via RawBT.`;
         this.lastError = err;
         this.notifyStatus();
         return { success: false, message: err };
@@ -254,12 +234,145 @@ class ThermalPrinterService {
         deviceName: device.name,
       };
     } catch (err: any) {
-      const msg = err.name === 'NotFoundError'
-        ? 'Busca cancelada pelo usuário.'
-        : `Erro ao conectar Bluetooth: ${err.message || err}`;
+      let msg = err?.message || String(err);
+      if (err?.name === 'NotFoundError') {
+        msg = 'Nenhuma impressora foi selecionada ou a busca foi cancelada. Se sua impressora não apareceu na lista: 1) Verifique se a impressora está ligada com luz indicadora piscando; 2) No Android, certifique-se de que a Localização/GPS e "Dispositivos Próximos" estão autorizados para o Chrome; 3) Se sua impressora for Bluetooth 2.0/3.0 Clássico (SPP), ela não opera por BLE — utilize o modo "Android RawBT" nas opções.';
+      } else if (err?.name === 'SecurityError') {
+        msg = 'Permissão de Bluetooth negada pelo navegador. Conceda a permissão de Bluetooth nas configurações do site no Chrome.';
+      } else if (err?.name === 'NotSupportedError') {
+        msg = 'Web Bluetooth não é suportado nesta plataforma. Utilize o modo "Android RawBT" ou "Spooler do Sistema".';
+      }
       this.lastError = msg;
       this.notifyStatus();
       return { success: false, message: msg };
+    }
+  }
+
+  private setupDeviceDisconnectionListener(device: any): void {
+    if (!device) return;
+    device.addEventListener('gattserverdisconnected', () => {
+      console.info('[BLE] Conexão GATT com a impressora encerrada pelo hardware ou economia de energia.');
+      this.writeCharacteristic = null;
+      this.gattServer = null;
+      this.notifyStatus();
+    });
+  }
+
+  private async discoverWriteCharacteristic(server: any): Promise<any> {
+    let foundCharacteristic: any = null;
+
+    // Prioridade 1: Inspeciona todos os serviços primários expostos
+    try {
+      const services = await server.getPrimaryServices();
+      for (const s of services) {
+        try {
+          const chars = await s.getCharacteristics();
+          for (const c of chars) {
+            if (c.properties && (c.properties.write || c.properties.writeWithoutResponse)) {
+              foundCharacteristic = c;
+              break;
+            }
+          }
+        } catch {
+          // Continua busca nos outros serviços
+        }
+        if (foundCharacteristic) break;
+      }
+    } catch {
+      // Fallback para UUIDs conhecidos
+    }
+
+    // Prioridade 2: Consulta serviços conhecidos de impressoras térmicas
+    if (!foundCharacteristic) {
+      for (const serviceUuid of COMMON_BLE_PRINT_SERVICES) {
+        try {
+          const service = await server.getPrimaryService(serviceUuid);
+          if (service) {
+            const characteristics = await service.getCharacteristics();
+            for (const char of characteristics) {
+              if (char.properties && (char.properties.write || char.properties.writeWithoutResponse)) {
+                foundCharacteristic = char;
+                break;
+              }
+            }
+          }
+        } catch {
+          // Continua
+        }
+        if (foundCharacteristic) break;
+      }
+    }
+
+    return foundCharacteristic;
+  }
+
+  /**
+   * Reconexão resiliente sem reabrir diálogo nativo do Chrome:
+   * Restaura gattServer, recupera dispositivo via getDevices() se perdido após reload,
+   * e redescobre a característica de escrita ESC/POS para evitar falha de characteristic nula.
+   */
+  public async reconnectSavedBLE(): Promise<{ success: boolean; message: string }> {
+    const nav = typeof navigator !== 'undefined' ? (navigator as any) : null;
+    if (!nav?.bluetooth) {
+      return { success: false, message: 'Web Bluetooth não suportado neste navegador.' };
+    }
+
+    // Se já estiver conectado e com característica pronta, retorna sucesso
+    if (this.gattServer && this.gattServer.connected && this.writeCharacteristic) {
+      return { success: true, message: 'Impressora já conectada e pronta.' };
+    }
+
+    try {
+      // 1. Se o objeto de dispositivo em memória foi perdido, tenta recuperar via getDevices()
+      if (!this.bleDevice && nav.bluetooth.getDevices && this.config.lastDeviceId) {
+        try {
+          const devices = await nav.bluetooth.getDevices();
+          const matched = devices.find((d: any) => d.id === this.config.lastDeviceId);
+          if (matched) {
+            this.bleDevice = matched;
+            this.setupDeviceDisconnectionListener(matched);
+          }
+        } catch (e) {
+          console.warn('[BLE Reconnect] getDevices aviso:', e);
+        }
+      }
+
+      if (!this.bleDevice || !this.bleDevice.gatt) {
+        return {
+          success: false,
+          message: 'Nenhuma impressora pareada salva. Clique em "Localizar e Parear Impressora".',
+        };
+      }
+
+      this.lastError = null;
+      this.notifyStatus();
+
+      // 2. Reconecta ao GATT Server
+      const server = await this.bleDevice.gatt.connect();
+      this.gattServer = server;
+
+      // 3. Redescobre a característica de escrita ESC/POS (CORREÇÃO CRÍTICA DO BUG DE CARACTERÍSTICA NULA)
+      const foundChar = await this.discoverWriteCharacteristic(server);
+      if (!foundChar) {
+        await this.disconnectBluetooth();
+        const err = 'Impressora reconectada, mas a característica de escrita BLE não foi encontrada.';
+        this.lastError = err;
+        this.notifyStatus();
+        return { success: false, message: err };
+      }
+
+      this.writeCharacteristic = foundChar;
+      this.notifyStatus();
+
+      return {
+        success: true,
+        message: `Impressora "${this.bleDevice.name || 'Térmica 58mm'}" reconectada com sucesso!`,
+      };
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      this.lastError = `Falha ao reconectar impressora: ${msg}`;
+      this.notifyStatus();
+      return { success: false, message: this.lastError };
     }
   }
 
@@ -386,9 +499,15 @@ class ThermalPrinterService {
       lines.push('');
     }
 
+    const isDelivery = order.fulfillmentType === 'DELIVERY';
+
     // MODALIDADE
     lines.push(separator);
-    lines.push(this.centerText('*** RETIRADA NO BALCAO ***'));
+    if (isDelivery) {
+      lines.push(this.centerText('*** ENTREGA ***'));
+    } else {
+      lines.push(this.centerText('*** RETIRADA NO BALCAO ***'));
+    }
     lines.push(separator);
 
     // PEDIDO E DATA
@@ -396,9 +515,53 @@ class ThermalPrinterService {
     lines.push(`DATA: ${dateFormatted}`);
 
     // DADOS DO CLIENTE
-    lines.push(`CLIENTE: ${this.sanitizeText(order.customer.name || 'Cliente Balcao')}`);
+    lines.push(`CLIENTE: ${this.sanitizeText(order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao'))}`);
     if (order.customer.phone) {
       lines.push(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
+    }
+
+    // ENDEREÇO DE ENTREGA (Exclusivo para modalidade DELIVERY - nunca inventar dados)
+    if (isDelivery && order.customer.address) {
+      const addr = order.customer.address;
+      lines.push(separator);
+      lines.push('ENDERECO DE ENTREGA:');
+
+      if (addr.condominium && addr.condominium.trim()) {
+        const condLines = this.wrapText(`Cond: ${addr.condominium.trim()}`, 32, '  ');
+        lines.push(...condLines);
+      }
+
+      const blockApt = [
+        addr.block && addr.block.trim() ? `Bloco: ${addr.block.trim()}` : '',
+        addr.apartment && addr.apartment.trim() ? `Apto: ${addr.apartment.trim()}` : ''
+      ].filter(Boolean).join(' - ');
+      if (blockApt) {
+        lines.push(`  ${blockApt}`);
+      }
+
+      if (addr.street && addr.street.trim()) {
+        const streetStr = `${addr.street.trim()}${addr.number && addr.number.trim() ? `, ${addr.number.trim()}` : ''}`;
+        const streetLines = this.wrapText(streetStr, 32, '  ');
+        lines.push(...streetLines);
+      }
+
+      if (addr.complement && addr.complement.trim()) {
+        const compLines = this.wrapText(`Compl: ${addr.complement.trim()}`, 32, '  ');
+        lines.push(...compLines);
+      }
+
+      if (addr.neighborhood && addr.neighborhood.trim()) {
+        lines.push(`  Bairro: ${this.sanitizeText(addr.neighborhood.trim())}`);
+      }
+
+      if (addr.city && addr.city.trim()) {
+        lines.push(`  Cidade: ${this.sanitizeText(addr.city.trim())}`);
+      }
+
+      if (addr.reference && addr.reference.trim()) {
+        const refLines = this.wrapText(`Ref: ${addr.reference.trim()}`, 32, '  ');
+        lines.push(...refLines);
+      }
     }
 
     // ITENS DO PEDIDO
@@ -448,6 +611,9 @@ class ThermalPrinterService {
     // TOTAIS E PAGAMENTO
     lines.push(separator);
     lines.push(this.formatLine('SUBTOTAL:', formatCurrency(order.subtotal)));
+    if (isDelivery && typeof order.deliveryFee === 'number' && order.deliveryFee > 0) {
+      lines.push(this.formatLine('TAXA DE ENTREGA:', formatCurrency(order.deliveryFee)));
+    }
     if (order.discount && order.discount > 0) {
       lines.push(this.formatLine('DESCONTO:', `- ${formatCurrency(order.discount)}`));
     }
@@ -520,10 +686,16 @@ class ThermalPrinterService {
 
     append(LF);
 
+    const isDelivery = order.fulfillmentType === 'DELIVERY';
+
     // 3. Modalidade Destaque
     append(GS, 0x21, 0x01); // Double height
     append(ESC, 0x45, 0x01); // Bold ON
-    appendLine('RETIRADA NO BALCAO');
+    if (isDelivery) {
+      appendLine('ENTREGA');
+    } else {
+      appendLine('RETIRADA NO BALCAO');
+    }
     append(GS, 0x21, 0x00); // Normal
     append(ESC, 0x45, 0x00); // Bold OFF
     appendLine('--------------------------------');
@@ -534,9 +706,55 @@ class ThermalPrinterService {
     appendLine(`PEDIDO: ${order.orderNumber}`);
     append(ESC, 0x45, 0x00); // Bold OFF
     appendLine(`DATA: ${formatDateTime(order.createdAt)}`);
-    appendLine(`CLIENTE: ${this.sanitizeText(order.customer.name || 'Cliente Balcao')}`);
+    appendLine(`CLIENTE: ${this.sanitizeText(order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao'))}`);
     if (order.customer.phone) {
       appendLine(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
+    }
+
+    // Endereço de Entrega (Exclusivo para modalidade DELIVERY - nunca inventar dados)
+    if (isDelivery && order.customer.address) {
+      const addr = order.customer.address;
+      appendLine('--------------------------------');
+      append(ESC, 0x45, 0x01); // Bold ON
+      appendLine('ENDERECO DE ENTREGA:');
+      append(ESC, 0x45, 0x00); // Bold OFF
+
+      if (addr.condominium && addr.condominium.trim()) {
+        const condLines = this.wrapText(`Cond: ${addr.condominium.trim()}`, 32, '  ');
+        for (const cl of condLines) appendLine(cl);
+      }
+
+      const blockApt = [
+        addr.block && addr.block.trim() ? `Bloco: ${addr.block.trim()}` : '',
+        addr.apartment && addr.apartment.trim() ? `Apto: ${addr.apartment.trim()}` : ''
+      ].filter(Boolean).join(' - ');
+      if (blockApt) {
+        appendLine(`  ${blockApt}`);
+      }
+
+      if (addr.street && addr.street.trim()) {
+        const streetStr = `${addr.street.trim()}${addr.number && addr.number.trim() ? `, ${addr.number.trim()}` : ''}`;
+        const streetLines = this.wrapText(streetStr, 32, '  ');
+        for (const sl of streetLines) appendLine(sl);
+      }
+
+      if (addr.complement && addr.complement.trim()) {
+        const compLines = this.wrapText(`Compl: ${addr.complement.trim()}`, 32, '  ');
+        for (const cl of compLines) appendLine(cl);
+      }
+
+      if (addr.neighborhood && addr.neighborhood.trim()) {
+        appendLine(`  Bairro: ${this.sanitizeText(addr.neighborhood.trim())}`);
+      }
+
+      if (addr.city && addr.city.trim()) {
+        appendLine(`  Cidade: ${this.sanitizeText(addr.city.trim())}`);
+      }
+
+      if (addr.reference && addr.reference.trim()) {
+        const refLines = this.wrapText(`Ref: ${addr.reference.trim()}`, 32, '  ');
+        for (const rl of refLines) appendLine(rl);
+      }
     }
 
     // 5. Itens
@@ -586,6 +804,9 @@ class ThermalPrinterService {
     // 7. Totais e Pagamento
     appendLine('--------------------------------');
     appendLine(this.formatLine('SUBTOTAL:', formatCurrency(order.subtotal)));
+    if (isDelivery && typeof order.deliveryFee === 'number' && order.deliveryFee > 0) {
+      appendLine(this.formatLine('TAXA DE ENTREGA:', formatCurrency(order.deliveryFee)));
+    }
     if (order.discount && order.discount > 0) {
       appendLine(this.formatLine('DESCONTO:', `- ${formatCurrency(order.discount)}`));
     }
@@ -717,19 +938,12 @@ class ThermalPrinterService {
    */
   private async sendEscPosOverBluetooth(data: Uint8Array): Promise<{ success: boolean; message?: string }> {
     if (!this.writeCharacteristic || !this.gattServer?.connected) {
-      // Tenta reconectar se tiver dispositivo salvo
-      if (this.bleDevice?.gatt) {
-        try {
-          const server = await this.bleDevice.gatt.connect();
-          this.gattServer = server;
-          // Recupera característica
-          const service = await server.getPrimaryService(this.config.bleServiceUuid || COMMON_BLE_PRINT_SERVICES[0]);
-          this.writeCharacteristic = await service.getCharacteristic(this.config.bleCharUuid || COMMON_BLE_WRITE_CHARS[0]);
-        } catch {
-          return { success: false, message: 'Impressora Bluetooth desconectada.' };
-        }
-      } else {
-        return { success: false, message: 'Nenhuma impressora Bluetooth conectada no momento.' };
+      const reconn = await this.reconnectSavedBLE();
+      if (!reconn.success || !this.writeCharacteristic) {
+        return {
+          success: false,
+          message: reconn.message || 'Impressora Bluetooth desconectada. Clique em Reconectar Impressora.',
+        };
       }
     }
 

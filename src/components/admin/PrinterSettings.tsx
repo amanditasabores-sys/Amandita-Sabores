@@ -25,6 +25,7 @@ export const PrinterSettings: React.FC = () => {
   const [config, setConfig] = useState<ThermalPrinterConfig>(() => thermalPrinterService.getConfig());
   const [status, setStatus] = useState<ThermalPrinterStatus>(() => thermalPrinterService.getStatus());
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -50,6 +51,24 @@ export const PrinterSettings: React.FC = () => {
       setActionFeedback({ type: 'error', message: err.message || 'Falha ao buscar dispositivos Bluetooth.' });
     } finally {
       setIsConnecting(false);
+    }
+  };
+
+  const handleReconnectSaved = async () => {
+    setIsReconnecting(true);
+    setActionFeedback(null);
+    try {
+      const res = await thermalPrinterService.reconnectSavedBLE();
+      if (res.success) {
+        setActionFeedback({ type: 'success', message: res.message });
+        setConfig(thermalPrinterService.getConfig());
+      } else {
+        setActionFeedback({ type: 'error', message: res.message });
+      }
+    } catch (err: any) {
+      setActionFeedback({ type: 'error', message: err.message || 'Falha ao reconectar impressora.' });
+    } finally {
+      setIsReconnecting(false);
     }
   };
 
@@ -145,52 +164,94 @@ export const PrinterSettings: React.FC = () => {
 
       {/* Main Connection Controls */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Bluetooth Device Pairing Box */}
+        {/* Bluetooth Device Pairing & Mode Action Box */}
         <div className="p-4 bg-slate-50 rounded-xl border border-slate-200/90 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-              <Bluetooth className="w-4 h-4 text-blue-600" />
-              Dispositivo Bluetooth
+              {config.connectionMode === 'bluetooth_ble' ? (
+                <Bluetooth className="w-4 h-4 text-blue-600" />
+              ) : config.connectionMode === 'android_rawbt' ? (
+                <Smartphone className="w-4 h-4 text-amber-600" />
+              ) : (
+                <Printer className="w-4 h-4 text-emerald-600" />
+              )}
+              {config.connectionMode === 'bluetooth_ble' 
+                ? 'Conexão Bluetooth BLE' 
+                : config.connectionMode === 'android_rawbt'
+                ? 'Ponte Android RawBT (SPP)'
+                : 'Spooler do Sistema (58mm)'}
             </span>
             <span className="text-[11px] text-slate-500 font-mono">
-              {config.lastDeviceName || 'Nenhum'}
+              {config.connectionMode === 'bluetooth_ble' 
+                ? (config.lastDeviceName || 'Nenhum dispositivo')
+                : (config.connectionMode === 'android_rawbt' ? 'RawBT Service' : 'Spooler Nativo')}
             </span>
           </div>
 
           <p className="text-xs text-slate-600 leading-relaxed">
-            Clique no botão abaixo para buscar e conectar sua impressora térmica portátil pareada no Bluetooth do dispositivo.
+            {config.connectionMode === 'bluetooth_ble' 
+              ? 'Localize sua impressora portátil com Bluetooth Low Energy (BLE) diretamente pelo Google Chrome. Certifique-se de que a impressora está ligada com luz piscando.'
+              : config.connectionMode === 'android_rawbt'
+              ? 'Para impressoras Bluetooth clássico 2.0/3.0. Requer o aplicativo gratuito RawBT instalado na Play Store do celular.'
+              : 'Utiliza a janela de impressão do navegador ou driver do sistema com largura configurada para 58mm.'}
           </p>
 
           <div className="flex flex-wrap gap-2 pt-1">
-            {!status.connected ? (
-              <button
-                type="button"
-                onClick={handleConnectBle}
-                disabled={isConnecting}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition cursor-pointer"
-              >
-                {isConnecting ? (
+            {config.connectionMode === 'bluetooth_ble' ? (
+              !status.connected ? (
+                config.lastDeviceId ? (
                   <>
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Buscando impressora...</span>
+                    <button
+                      type="button"
+                      onClick={handleReconnectSaved}
+                      disabled={isReconnecting || isConnecting}
+                      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isReconnecting ? 'animate-spin' : ''}`} />
+                      <span>{isReconnecting ? 'Reconectando...' : 'Reconectar Impressora'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleConnectBle}
+                      disabled={isConnecting || isReconnecting}
+                      className="px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                      title="Parear outro modelo de impressora"
+                    >
+                      <Bluetooth className="w-3.5 h-3.5" />
+                      <span>Parear Nova</span>
+                    </button>
                   </>
                 ) : (
-                  <>
-                    <Bluetooth className="w-3.5 h-3.5" />
-                    <span>Conectar Bluetooth</span>
-                  </>
-                )}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handleDisconnect}
-                className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer"
-              >
-                <Unplug className="w-3.5 h-3.5 text-slate-600" />
-                <span>Desconectar</span>
-              </button>
-            )}
+                  <button
+                    type="button"
+                    onClick={handleConnectBle}
+                    disabled={isConnecting}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition cursor-pointer"
+                  >
+                    {isConnecting ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Buscando impressora...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Bluetooth className="w-3.5 h-3.5" />
+                        <span>Localizar e Parear Impressora</span>
+                      </>
+                    )}
+                  </button>
+                )
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleDisconnect}
+                  className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer"
+                >
+                  <Unplug className="w-3.5 h-3.5 text-slate-600" />
+                  <span>Desconectar</span>
+                </button>
+              )
+            ) : null}
 
             <button
               type="button"
@@ -199,7 +260,7 @@ export const PrinterSettings: React.FC = () => {
               className="px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-100 text-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
             >
               <Play className="w-3.5 h-3.5 text-amber-600" />
-              <span>{isTesting ? 'Imprimindo...' : 'Teste de Impressão'}</span>
+              <span>{isTesting ? 'Imprimindo...' : 'Imprimir Comprovante de Teste'}</span>
             </button>
           </div>
         </div>

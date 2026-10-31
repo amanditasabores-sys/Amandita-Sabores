@@ -210,6 +210,16 @@ class StoreService {
       this.removeOrderFromSyncQueue(order.id);
       this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
       this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+
+      // Dispara envio de notificação push em segundo plano aos aparelhos da equipe cadastrados
+      if (typeof window !== 'undefined') {
+        fetch('/api/push/notify-order', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ order }),
+        }).catch(() => {});
+      }
+
       return { success: true };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -357,7 +367,10 @@ class StoreService {
         this.broadcastChannel = new BroadcastChannel('gestaofood_sync_channel');
         this.broadcastChannel.onmessage = (event) => {
           if (event.data?.type === 'ORDER_CREATED') {
-            soundService.playNewOrderAlert();
+            const current = this.getCurrentUser();
+            if (current && this.isAuthorizedStaffRole(current.role)) {
+              soundService.playNewOrderAlert();
+            }
           }
           window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: event.data }));
         };
@@ -374,7 +387,24 @@ class StoreService {
       window.addEventListener('online', () => {
         console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes...');
         this.flushPendingSyncQueue();
+        const current = this.getCurrentUser();
+        if (current && this.isAuthorizedStaffRole(current.role)) {
+          this.refreshStaffSync();
+        }
       });
+
+      if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') {
+            console.info('[Store Sync] Retorno do segundo plano: verificando conexões e pendências...');
+            this.flushPendingSyncQueue();
+            const current = this.getCurrentUser();
+            if (current && this.isAuthorizedStaffRole(current.role)) {
+              this.refreshStaffSync();
+            }
+          }
+        });
+      }
 
       // Background heartbeat to retry pending sync queue every 20 seconds
       setInterval(() => {
@@ -830,7 +860,10 @@ class StoreService {
           
           if (newIncoming.length > 0) {
             newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
-            soundService.startPersistentOrderAlert(3500);
+            const activeUser = this.getCurrentUser();
+            if (activeUser && this.isAuthorizedStaffRole(activeUser.role)) {
+              soundService.startPersistentOrderAlert(3500);
+            }
 
             // Auto-print newly received pickup orders on 58mm thermal printer if enabled
             try {
@@ -890,7 +923,7 @@ class StoreService {
         },
         (error) => {
           console.warn('[Firestore Staff Sync] Aviso no listener de pedidos:', error.message);
-          this.isStaffSyncActive = false;
+          this.stopStaffFirestoreSync();
           if (error.code === 'permission-denied') {
             setTimeout(() => {
               this.ensureFirebaseAuthForStaff().then(() => this.initStaffFirestoreSync()).catch(() => {});
@@ -1161,6 +1194,12 @@ class StoreService {
     this.staffUnsubscribers.forEach((unsub) => unsub());
     this.staffUnsubscribers = [];
     this.isStaffSyncActive = false;
+  }
+
+  public async refreshStaffSync(): Promise<void> {
+    if (!db) return;
+    this.stopStaffFirestoreSync();
+    await this.initStaffFirestoreSync();
   }
 
   public stopFirestoreSync(): void {
@@ -1540,11 +1579,17 @@ class StoreService {
     const isCustomerMenuOrder = (orderInput.status === 'NOVO') || 
       newOrder.movements[0]?.author?.includes('Cardápio Web');
 
-    if (isCustomerMenuOrder) {
-      this.recordUnseenCustomerOrder(newOrder.id);
-      soundService.startPersistentOrderAlert(3500);
-    } else {
-      soundService.playNewOrderAlert();
+    const activeStaffUser = this.getCurrentUser();
+    const isStaffSession = activeStaffUser && this.isAuthorizedStaffRole(activeStaffUser.role);
+
+    // CRITICAL: Public customer sessions must NEVER play staff kitchen/cashier alarms!
+    if (isStaffSession) {
+      if (isCustomerMenuOrder) {
+        this.recordUnseenCustomerOrder(newOrder.id);
+        soundService.startPersistentOrderAlert(3500);
+      } else {
+        soundService.playNewOrderAlert();
+      }
     }
 
     this.notify('ORDER_CREATED', newOrder);
@@ -1563,6 +1608,15 @@ class StoreService {
     this.queueOrderForSync(newOrder);
     if (autoPersist) {
       this.persistOrderToFirestore(newOrder).catch(() => {});
+    }
+
+    // Always dispatch background Push Notification to backend for subscribed staff devices
+    if (typeof window !== 'undefined') {
+      fetch('/api/push/notify-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order: newOrder }),
+      }).catch(() => {});
     }
 
     return newOrder;
@@ -3050,6 +3104,43 @@ class StoreService {
     }
     signOutFirebase().catch(() => {});
     this.setCurrentUser(null);
+  }
+
+  public async verifyAdminPassword(password: string): Promise<{ success: boolean; message: string }> {
+    const current = this.getCurrentUser();
+    if (!current) {
+      return { success: false, message: 'Nenhum usuário logado na sessão.' };
+    }
+    const role = (current.role || '').toUpperCase();
+    if (role !== 'ADMINISTRADOR' && current.username !== 'admin') {
+      return { success: false, message: 'Permissão insuficiente: somente Administradores podem executar esta ação.' };
+    }
+    const trimmedPw = password.trim();
+    if (!trimmedPw) {
+      return { success: false, message: 'A senha é obrigatória.' };
+    }
+    
+    // Check against standard password storage or authenticate via login flow
+    const identifier = current.email || current.username || 'admin';
+    const loginRes = await this.login(identifier, trimmedPw);
+    if (loginRes.success) {
+      return { success: true, message: 'Senha confirmada com sucesso.' };
+    }
+    
+    // Fallback: check stored passwords map for this user id
+    try {
+      const pwMapRaw = localStorage.getItem('gf_user_passwords');
+      if (pwMapRaw) {
+        const pwMap = JSON.parse(pwMapRaw);
+        if (pwMap[current.id] === trimmedPw || pwMap['user-admin'] === trimmedPw) {
+          return { success: true, message: 'Senha confirmada com sucesso.' };
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    return { success: false, message: 'Senha incorreta. Acesso não autorizado.' };
   }
 
   public resetToSampleData(): void {
