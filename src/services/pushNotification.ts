@@ -99,13 +99,8 @@ class PushNotificationService {
       try {
         const resKey = await fetch('/api/push/vapid-key');
         if (resKey.ok) {
-          const rawKeyText = await resKey.text().catch(() => '');
-          if (rawKeyText && rawKeyText.trim()) {
-            try {
-              const data = JSON.parse(rawKeyText);
-              vapidPublicKey = (data.publicKey || '').trim().replace(/\s+/g, '');
-            } catch {}
-          }
+          const data = await resKey.json();
+          vapidPublicKey = (data.publicKey || '').trim().replace(/\s+/g, '');
         }
       } catch (keyErr) {
         console.warn('[Push Service] Falha ao consultar vapid-key:', keyErr);
@@ -154,11 +149,7 @@ class PushNotificationService {
         });
 
         if (!regRes.ok) {
-          const rawErrText = await regRes.text().catch(() => '');
-          let errData: any = {};
-          if (rawErrText && rawErrText.trim()) {
-            try { errData = JSON.parse(rawErrText); } catch {}
-          }
+          const errData = await regRes.json().catch(() => ({}));
           return {
             success: false,
             message: errData.message || `Servidor não pôde confirmar a gravação da inscrição (HTTP ${regRes.status}).`,
