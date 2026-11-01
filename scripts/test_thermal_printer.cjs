@@ -87,12 +87,34 @@ assert(serviceContent.includes("discoverWriteCharacteristic"), "Redescoberta din
 assert(serviceContent.includes("reconnectSavedBLE"), "Reconexão com dispositivo BLE salvo sem reabrir diálogo");
 assert(printerSettingsContent.includes("handleReconnectSaved") || printerSettingsContent.includes("Reconectar Impressora"), "Botão de reconexão direta disponível na interface de configurações");
 
+console.log('\n8. Testando Deduplicação Estrita de Endereço no Cupom...');
+assert(serviceContent.includes("formatReceiptAddressLines"), "Método formatReceiptAddressLines implementado para montagem do endereço");
+assert(serviceContent.includes("effectiveApt") && serviceContent.includes("effectiveBlock"), "Deduplicação de apartamento e bloco em campos de número e complemento");
+assert(!serviceContent.includes("lines.push(`  ${blockApt}`);\n\n      if (addr.street"), "Bloco e apartamento não são mais concatenados redundantemente com street/number");
+
+console.log('\n9. Testando Rodapé Editável do Cupom...');
+assert(serviceContent.includes("getEffectiveFooterText"), "Helper getEffectiveFooterText lê configuração persistente da loja");
+assert(!serviceContent.includes("lines.push(this.centerText('amanditasabores.com.br'));"), "Texto fixo do site removido do rodapé em favor de configuração dinâmica");
+const settingsPath = path.resolve(__dirname, '../src/components/admin/StoreSettings.tsx');
+const settingsContent = fs.readFileSync(settingsPath, 'utf8');
+assert(settingsContent.includes("receiptFooterText"), "Campo 'Texto do rodapé do cupom' disponível na tela de configurações da loja");
+
+console.log('\n10. Testando Controle de Volume e Mute do Som de Notificação...');
+const audioPath = path.resolve(__dirname, '../src/services/audio.ts');
+const audioContent = fs.readFileSync(audioPath, 'utf8');
+assert(audioContent.includes("newOrderVolume"), "Controle de volume específico implementado no SoundService");
+assert(audioContent.includes("isNewOrderMuted"), "Opção para silenciar som de novos pedidos implementada");
+assert(audioContent.includes("testNewOrderAlert"), "Método para testar som de novos pedidos disponível");
+assert(settingsContent.includes("orderVolume") && settingsContent.includes("handleVolumeChange"), "Slider de volume (0 a 100%) integrado nas configurações");
+assert(settingsContent.includes("isOrderMuted") && settingsContent.includes("handleToggleMuteOrder"), "Checkbox para silenciar som de pedidos integrado nas configurações");
+assert(settingsContent.includes("handleTestAudio"), "Botão 'Testar som' integrado na interface de configurações");
+
 console.log('====================================================');
-console.log(`TOTAL DE TESTES DA IMPRESSORA: ${testsPassed + testsFailed} | APROVADOS: ${testsPassed} | FALHAS: ${testsFailed}`);
+console.log(`TOTAL DE TESTES DA IMPRESSORA E NOTIFICAÇÕES: ${testsPassed + testsFailed} | APROVADOS: ${testsPassed} | FALHAS: ${testsFailed}`);
 console.log('====================================================');
 
 if (testsFailed > 0) {
   process.exit(1);
 } else {
-  console.log('✓ TEST SUITE DA IMPRESSORA TÉRMICA 58MM APROVADA COM SUCESSO!\n');
+  console.log('✓ TEST SUITE DA IMPRESSORA TÉRMICA E CONFIGURAÇÕES APROVADA COM SUCESSO!\n');
 }

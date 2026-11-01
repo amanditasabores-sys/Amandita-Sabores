@@ -43,16 +43,68 @@ for (const item of INITIAL_MENU) {
 // ---------------------------------------------------------------------------
 // Web Push & Background Notification Configuration
 // ---------------------------------------------------------------------------
-// Default VAPID keypair for offline/local development or custom env keys
-const VAPID_PUBLIC_KEY = process.env.VITE_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY || 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzk rxTjJqU4T_p_5w9n6vL5yXJtK2G5X5W5_P2Q3R4';
-const VAPID_PRIVATE_KEY = process.env.FIREBASE_VAPID_PRIVATE_KEY || process.env.VAPID_PRIVATE_KEY || '7K8L9M0N1O2P3Q4R5S6T7U8V9W0BCZ5T7bXg7rYt3j';
-const VAPID_SUBJECT = `mailto:${INITIAL_ADMIN_EMAIL}`;
+// Resolve VAPID keys: prioritize environment variables (with trim and whitespace cleanup)
+const rawVapidPub = process.env.VAPID_PUBLIC_KEY || process.env.VITE_FIREBASE_VAPID_KEY;
+const rawVapidPriv = process.env.VAPID_PRIVATE_KEY || process.env.FIREBASE_VAPID_PRIVATE_KEY;
 
-try {
-  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-} catch (vapidErr) {
-  console.info('[Web Push] VAPID aguarda configuração de chave em produção:', vapidErr instanceof Error ? vapidErr.message : vapidErr);
+// Valid cryptographic P-256 fallback keypair for local/preview execution if production env is pending
+const DEV_FALLBACK_PUBLIC_KEY = 'BJoRmXFaMXFlCcWPH9spcZds3eVoyOmKGsSwW6dyZJyTZR8F7oKJNNWVpkmEaQHf0TXu9bAgnCsLmDV0RIs7bBM';
+const DEV_FALLBACK_PRIVATE_KEY = 'ybqwkEcDC1gF4CmWeNItQ0hEI_fxgKgnvhYPqsYAeQI';
+
+const cleanedPub = (rawVapidPub ? rawVapidPub.trim().replace(/\s+/g, '') : '');
+const cleanedPriv = (rawVapidPriv ? rawVapidPriv.trim().replace(/\s+/g, '') : '');
+
+let activeVapidPublicKey = DEV_FALLBACK_PUBLIC_KEY;
+let activeVapidPrivateKey = DEV_FALLBACK_PRIVATE_KEY;
+let isVapidConfigured = false;
+let isProductionVapidActive = false;
+let vapidConfigMessage = '';
+
+// Support both standard VAPID_SUBJECT and ASSUNTO_VAPID environment variables
+const rawSubject = (process.env.VAPID_SUBJECT || process.env.ASSUNTO_VAPID || '').trim();
+const VAPID_SUBJECT = rawSubject
+  ? (rawSubject.startsWith('mailto:') || rawSubject.startsWith('https:') ? rawSubject : `mailto:${rawSubject}`)
+  : `mailto:${INITIAL_ADMIN_EMAIL}`;
+
+// Check if production environment keys were provided and are mathematically valid
+if (cleanedPub && cleanedPriv) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, cleanedPub, cleanedPriv);
+    activeVapidPublicKey = cleanedPub;
+    activeVapidPrivateKey = cleanedPriv;
+    isVapidConfigured = true;
+    isProductionVapidActive = true;
+    vapidConfigMessage = 'VAPID de produção configurado e validado com sucesso.';
+    console.log('[Web Push]', vapidConfigMessage);
+  } catch (prodVapidErr: unknown) {
+    const errMsg = prodVapidErr instanceof Error ? prodVapidErr.message : String(prodVapidErr);
+    vapidConfigMessage = `Chave VAPID recebida inválida (${errMsg}). Ativando contingência operacional.`;
+    console.warn('[Web Push]', vapidConfigMessage);
+    try {
+      webpush.setVapidDetails(VAPID_SUBJECT, DEV_FALLBACK_PUBLIC_KEY, DEV_FALLBACK_PRIVATE_KEY);
+      activeVapidPublicKey = DEV_FALLBACK_PUBLIC_KEY;
+      activeVapidPrivateKey = DEV_FALLBACK_PRIVATE_KEY;
+      isVapidConfigured = true;
+      console.log('[Web Push] Contingência VAPID ativada com sucesso.');
+    } catch (fallbackErr) {
+      console.error('[Web Push] Falha crítica na contingência VAPID:', fallbackErr);
+    }
+  }
+} else {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, DEV_FALLBACK_PUBLIC_KEY, DEV_FALLBACK_PRIVATE_KEY);
+    activeVapidPublicKey = DEV_FALLBACK_PUBLIC_KEY;
+    activeVapidPrivateKey = DEV_FALLBACK_PRIVATE_KEY;
+    isVapidConfigured = true;
+    vapidConfigMessage = 'VAPID padrão de contingência carregado (variáveis de produção não informadas).';
+    console.log('[Web Push]', vapidConfigMessage);
+  } catch (fallbackErr) {
+    console.error('[Web Push] Falha ao configurar VAPID de contingência:', fallbackErr);
+  }
 }
+
+const VAPID_PUBLIC_KEY = activeVapidPublicKey;
+const VAPID_PRIVATE_KEY = activeVapidPrivateKey;
 
 interface PushSubscriptionData {
   subscription: webpush.PushSubscription;
@@ -347,8 +399,11 @@ async function sendOrderPushNotification(order: any) {
 
   const subscriptions = await getAllPushSubscriptions();
   if (subscriptions.length === 0) {
+    console.info(`[Web Push] Pedido #${order.orderNumber} persistido no Firestore. Nenhuma inscrição push registrada para alerta.`);
     return;
   }
+
+  console.info(`[Web Push] Disparando alerta de novo pedido #${order.orderNumber} para ${subscriptions.length} dispositivo(s)...`);
 
   const payload = JSON.stringify({
     title: `Novo Pedido #${order.orderNumber}!`,
@@ -368,15 +423,22 @@ async function sendOrderPushNotification(order: any) {
   };
 
   const deadEndpoints: string[] = [];
+  let successfulDeliveries = 0;
+
   for (const subData of subscriptions) {
     try {
-      await webpush.sendNotification(subData.subscription, payload, pushOptions);
+      const res = await webpush.sendNotification(subData.subscription, payload, pushOptions);
+      successfulDeliveries++;
+      console.log(`[Web Push] Alerta entregue com sucesso ao gateway push (Status: ${res.statusCode || 201}) para dispositivo ${subData.role || 'staff'}`);
     } catch (err: any) {
+      console.warn(`[Web Push] Falha ao enviar para endpoint (${err.statusCode || 'erro'}):`, err.message);
       if (err.statusCode === 404 || err.statusCode === 410) {
         deadEndpoints.push(subData.subscription.endpoint);
       }
     }
   }
+
+  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber}: ${successfulDeliveries}/${subscriptions.length} entregas confirmadas.`);
 
   for (const endpoint of deadEndpoints) {
     await deletePushSubscription(endpoint);
@@ -386,8 +448,11 @@ async function sendOrderPushNotification(order: any) {
 async function sendTestPushNotification(): Promise<{ sent: number; failed: number }> {
   const subscriptions = await getAllPushSubscriptions();
   if (subscriptions.length === 0) {
+    console.info('[Web Push Test] Nenhuma inscrição push encontrada no Firestore.');
     return { sent: 0, failed: 0 };
   }
+
+  console.info(`[Web Push Test] Disparando teste para ${subscriptions.length} dispositivo(s)...`);
 
   const payload = JSON.stringify({
     title: '🔔 Teste de Notificação - Amandita Sabores',
@@ -411,10 +476,12 @@ async function sendTestPushNotification(): Promise<{ sent: number; failed: numbe
 
   for (const subData of subscriptions) {
     try {
-      await webpush.sendNotification(subData.subscription, payload, pushOptions);
+      const res = await webpush.sendNotification(subData.subscription, payload, pushOptions);
       sent++;
+      console.log(`[Web Push Test] Teste entregue ao gateway (Status: ${res.statusCode || 201})`);
     } catch (err: any) {
       failed++;
+      console.warn(`[Web Push Test] Falha no envio (${err.statusCode || 'erro'}):`, err.message);
       if (err.statusCode === 404 || err.statusCode === 410) {
         deadEndpoints.push(subData.subscription.endpoint);
       }
@@ -571,33 +638,39 @@ async function persistOrderToFirestoreServer(
 // ---------------------------------------------------------------------------
 // Server Bootstrap & Route Definitions
 // ---------------------------------------------------------------------------
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+export const app = express();
 
-  app.use(express.json());
+app.use(express.json());
 
-  // Health and Status API
-  app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({
-      status: 'online',
-      system: 'Amandita Sabores - Backend Seguro de Credenciais e Persistência Firestore',
-      projectId: PROJECT_ID,
-      hasAdminSdk: Boolean(adminDb),
-      hasClientSdk: Boolean(clientDb),
-      timestamp: new Date().toISOString(),
-    });
+// Ensure Content-Type: application/json for all API routes
+app.use(['/api', '/push', '/orders', '/auth', '/health'], (_req: Request, res: Response, next) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
+
+// Health and Status API
+app.get(['/api/health', '/health'], (_req: Request, res: Response) => {
+  res.json({
+    status: 'online',
+    system: 'Amandita Sabores - Backend Seguro de Credenciais e Persistência Firestore',
+    projectId: PROJECT_ID,
+    hasAdminSdk: Boolean(adminDb),
+    hasClientSdk: Boolean(clientDb),
+    timestamp: new Date().toISOString(),
   });
+});
 
-  // Web Push Configuration & Subscription Endpoints
-  app.get('/api/push/vapid-key', (_req: Request, res: Response) => {
-    res.json({
-      publicKey: VAPID_PUBLIC_KEY,
-      isConfigured: Boolean(process.env.VITE_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY),
-    });
+// Web Push Configuration & Subscription Endpoints
+app.get(['/api/push/vapid-key', '/push/vapid-key'], (_req: Request, res: Response) => {
+  res.json({
+    publicKey: VAPID_PUBLIC_KEY,
+    isConfigured: isVapidConfigured,
+    isProductionActive: isProductionVapidActive,
+    statusMessage: vapidConfigMessage,
   });
+});
 
-  app.post('/api/push/subscribe', async (req: Request, res: Response) => {
+app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: Response) => {
     try {
       const { subscription, role, userAgent } = req.body;
       if (!subscription || !subscription.endpoint || !subscription.keys?.p256dh || !subscription.keys?.auth) {
@@ -618,7 +691,7 @@ async function startServer() {
   });
 
   // Background Push Trigger for Newly Ingested Orders (Called automatically on all orders)
-  app.post('/api/push/notify-order', async (req: Request, res: Response) => {
+  app.post(['/api/push/notify-order', '/push/notify-order'], async (req: Request, res: Response) => {
     try {
       const { order } = req.body;
       if (!order || !order.id) {
@@ -636,7 +709,7 @@ async function startServer() {
   });
 
   // Background Push Diagnostic & Testing Endpoint
-  app.post('/api/push/test', async (req: Request, res: Response) => {
+  app.post(['/api/push/test', '/push/test'], async (req: Request, res: Response) => {
     try {
       const result = await sendTestPushNotification();
       res.json({
@@ -655,7 +728,7 @@ async function startServer() {
 
   // Secure Backend API: Staff Registration and Credential Administration
   // Enforces RBAC on server side: only authenticated ADMINISTRADOR or GERENTE
-  app.post('/api/auth/register-staff', async (req: Request, res: Response) => {
+  app.post(['/api/auth/register-staff', '/auth/register-staff'], async (req: Request, res: Response) => {
     try {
       const auth = await verifyStaffAuth(req);
       const isAuthorizedManager = auth.isStaff && ['ADMINISTRADOR', 'GERENTE'].includes(auth.role.toUpperCase());
@@ -710,7 +783,7 @@ async function startServer() {
   });
 
   // Secure Backend API: Password Reset Authorization
-  app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
+  app.post(['/api/auth/reset-password', '/auth/reset-password'], async (req: Request, res: Response) => {
     try {
       const auth = await verifyStaffAuth(req);
       const isAuthorizedManager = auth.isStaff && ['ADMINISTRADOR', 'GERENTE'].includes(auth.role.toUpperCase());
@@ -753,7 +826,7 @@ async function startServer() {
 
   // Secure Backend API: Order Ingestion, Mathematical Validation & Real Firestore Persistence
   // Only returns success AFTER real document persistence is confirmed in Cloud Firestore.
-  app.post('/api/orders', async (req: Request, res: Response) => {
+  app.post(['/api/orders', '/orders'], async (req: Request, res: Response) => {
     try {
       const auth = await verifyStaffAuth(req);
       const isStaffRequester = auth.isStaff;
@@ -944,26 +1017,48 @@ async function startServer() {
     }
   });
 
+  // Fallback for unhandled API endpoints: returns guaranteed JSON 404
+  app.all(['/api/*', '/push/*', '/orders/*', '/auth/*'], (_req: Request, res: Response) => {
+    res.status(404).json({ success: false, message: 'Rota de API não encontrada no servidor.' });
+  });
+
+  // Global Express Error Middleware: Guarantees valid JSON on unexpected errors instead of empty or HTML pages
+  app.use((err: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('[API Error]:', errMsg);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: `Erro interno no servidor: ${errMsg}` });
+    }
+  });
+
   // Mount Vite development middlewares or serve static assets in production
-  if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+  async function startServer() {
+    const PORT = 3000;
+
+    if (process.env.NODE_ENV === 'production') {
+      app.use(express.static(path.resolve(__dirname, 'dist')));
+      app.get('*', (_req: Request, res: Response) => {
+        res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+      });
+    } else {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    }
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`[Amandita Sabores] Servidor full-stack rodando em http://0.0.0.0:${PORT}`);
     });
-  } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Amandita Sabores] Servidor full-stack rodando em http://0.0.0.0:${PORT}`);
-  });
-}
+  // Only launch standalone dev server if not running inside Vercel serverless function
+  if (!process.env.VERCEL) {
+    startServer().catch((err) => {
+      console.error('[Amandita Sabores] Falha ao iniciar servidor:', err);
+      process.exit(1);
+    });
+  }
 
-startServer().catch((err) => {
-  console.error('[Amandita Sabores] Falha ao iniciar servidor:', err);
-  process.exit(1);
-});
+  export default app;

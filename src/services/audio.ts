@@ -5,6 +5,8 @@
 class SoundService {
   private audioCtx: AudioContext | null = null;
   private isSoundEnabled: boolean = true;
+  private _newOrderVolume: number = 0.8; // 0.0 to 1.0 (default 80%)
+  private _isNewOrderMuted: boolean = false;
 
   constructor() {
     // Check localStorage preference safely
@@ -13,6 +15,17 @@ class SoundService {
         const saved = localStorage.getItem('gestaofood_sound_enabled');
         if (saved !== null) {
           this.isSoundEnabled = saved === 'true';
+        }
+        const savedVol = localStorage.getItem('gf_new_order_volume');
+        if (savedVol !== null) {
+          const parsed = parseFloat(savedVol);
+          if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+            this._newOrderVolume = parsed;
+          }
+        }
+        const savedMuted = localStorage.getItem('gf_new_order_muted');
+        if (savedMuted !== null) {
+          this._isNewOrderMuted = savedMuted === 'true';
         }
       } catch {
         // fallback
@@ -41,12 +54,49 @@ class SoundService {
     localStorage.setItem('gestaofood_sound_enabled', String(enabled));
   }
 
+  public getNewOrderVolume(): number {
+    return this._newOrderVolume;
+  }
+
+  public setNewOrderVolume(vol: number) {
+    const clamped = Math.max(0, Math.min(1, vol));
+    this._newOrderVolume = clamped;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('gf_new_order_volume', String(clamped));
+    }
+  }
+
+  public isNewOrderMuted(): boolean {
+    return this._isNewOrderMuted;
+  }
+
+  public setNewOrderMuted(muted: boolean) {
+    this._isNewOrderMuted = muted;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('gf_new_order_muted', String(muted));
+    }
+  }
+
+  /**
+   * Força teste imediato do som no volume configurado (para botão 'Testar Som')
+   */
+  public testNewOrderAlert() {
+    this.initContext();
+    const effectiveVol = this._isNewOrderMuted ? 0.8 : this._newOrderVolume;
+    this.playNewOrderTone(effectiveVol);
+  }
+
   /**
    * Pleasant 3-note melodic doorbell chime for new orders:
    * E5 (659Hz) -> G#5 (830Hz) -> B5 (987Hz)
    */
   public playNewOrderAlert() {
-    if (!this.isSoundEnabled) return;
+    if (!this.isSoundEnabled || this._isNewOrderMuted || this._newOrderVolume <= 0) return;
+    this.playNewOrderTone(this._newOrderVolume);
+  }
+
+  private playNewOrderTone(volume: number) {
+    if (volume <= 0) return;
     try {
       this.initContext();
       if (!this.audioCtx) return;
@@ -58,6 +108,8 @@ class SoundService {
         { freq: 987.77, time: 0.44, duration: 0.45 },
       ];
 
+      const peakGain = Math.max(0.005, 0.35 * volume);
+
       notes.forEach(({ freq, time, duration }) => {
         if (!this.audioCtx) return;
         const osc = this.audioCtx.createOscillator();
@@ -66,9 +118,9 @@ class SoundService {
         osc.type = 'sine';
         osc.frequency.setValueAtTime(freq, now + time);
 
-        // Natural exponential decay envelope
+        // Natural exponential decay envelope scaled by volume
         gain.gain.setValueAtTime(0.001, now + time);
-        gain.gain.exponentialRampToValueAtTime(0.35, now + time + 0.03);
+        gain.gain.exponentialRampToValueAtTime(peakGain, now + time + 0.03);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + time + duration);
 
         osc.connect(gain);

@@ -31,12 +31,15 @@ import {
   AlertTriangle,
   Store,
   X,
-  Bell
+  Bell,
+  Volume2,
+  VolumeX
 } from 'lucide-react';
 import { FirebaseStatusModal } from './FirebaseStatusModal';
 import { PrinterSettings } from './PrinterSettings';
 import { PWAInstallButton } from '../common/PWAInstallButton';
 import { pushNotificationService } from '../../services/pushNotification';
+import { soundService } from '../../services/audio';
 
 interface StoreSettingsProps {
   currentUser?: User | null;
@@ -105,6 +108,24 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
   const [isTestingPush, setIsTestingPush] = useState(false);
   const [pushFeedback, setPushFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
+  // New Order Alert Sound Volume & Mute State
+  const [orderVolume, setOrderVolume] = useState<number>(() => soundService.getNewOrderVolume());
+  const [isOrderMuted, setIsOrderMuted] = useState<boolean>(() => soundService.isNewOrderMuted());
+
+  const handleVolumeChange = (newVol: number) => {
+    setOrderVolume(newVol);
+    soundService.setNewOrderVolume(newVol);
+  };
+
+  const handleToggleMuteOrder = (muted: boolean) => {
+    setIsOrderMuted(muted);
+    soundService.setNewOrderMuted(muted);
+  };
+
+  const handleTestAudio = () => {
+    soundService.testNewOrderAlert();
+  };
+
   useEffect(() => {
     pushNotificationService.getStatus().then((st) => {
       setPushStatus({
@@ -144,16 +165,59 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     setIsTestingPush(true);
     setPushFeedback(null);
     try {
-      const res = await fetch('/api/push/test', { method: 'POST' });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setPushFeedback({ type: 'success', message: data.message });
+      const res = await fetch('/api/push/test', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+      });
+
+      // Safely read response text first to eliminate "Unexpected end of JSON input" errors
+      const rawText = await res.text().catch(() => '');
+      let data: any = null;
+      if (rawText && rawText.trim()) {
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          // Body is not JSON (e.g., HTML fallback or plain text error)
+        }
+      }
+
+      if (res.ok && data && data.success) {
+        setPushFeedback({
+          type: 'success',
+          message: data.message || 'Notificação de teste enviada com sucesso!',
+        });
+      } else if (data && data.message) {
+        setPushFeedback({
+          type: 'error',
+          message: `Servidor (HTTP ${res.status}): ${data.message}`,
+        });
+      } else if (!res.ok) {
+        let diagnosis = '';
+        if (res.status === 404 || res.status === 405) {
+          diagnosis = 'A rota /api/push/test não foi encontrada no servidor da Vercel. Verifique se a pasta /api está implantada.';
+        } else if (res.status === 502 || res.status === 504) {
+          diagnosis = 'O gateway da Vercel retornou timeout ou indisponibilidade temporária.';
+        } else if (!rawText || !rawText.trim()) {
+          diagnosis = 'O servidor retornou resposta vazia (sem corpo de dados).';
+        } else {
+          diagnosis = rawText.slice(0, 120);
+        }
+        setPushFeedback({
+          type: 'error',
+          message: `Erro HTTP ${res.status} (${res.statusText || 'Falha na requisição'}): ${diagnosis}`,
+        });
       } else {
-        setPushFeedback({ type: 'error', message: data.message || 'Falha ao despachar notificação de teste.' });
+        setPushFeedback({
+          type: 'error',
+          message: `Resposta inesperada do servidor (HTTP ${res.status}). O servidor não retornou conteúdo JSON válido.`,
+        });
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      setPushFeedback({ type: 'error', message: `Erro ao testar push: ${msg}` });
+      setPushFeedback({ type: 'error', message: `Erro de rede ao comunicar com o servidor: ${msg}` });
     } finally {
       setIsTestingPush(false);
     }
@@ -518,6 +582,21 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 />
               </div>
             </div>
+
+            {/* Texto do Rodapé do Cupom Térmico */}
+            <div className="pt-3 border-t border-slate-100">
+              <label className="block text-xs font-bold text-slate-700 mb-1.5">Texto do rodapé do cupom</label>
+              <input
+                type="text"
+                placeholder="Ex: Instagram: @amanditasabores ou @nomedoperfil"
+                value={config.receiptFooterText || ''}
+                onChange={(e) => setConfig({ ...config, receiptFooterText: e.target.value })}
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium text-slate-800"
+              />
+              <span className="text-[10px] text-slate-400 mt-1 block">
+                Texto exibido no final de cada comprovante impresso (térmico e visual). Se deixado em branco, a linha do rodapé não será impressa.
+              </span>
+            </div>
           </div>
         </div>
 
@@ -704,6 +783,57 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
             </button>
           </div>
         )}
+
+        {/* CONTROLE DE VOLUME DO SOM DAS NOTIFICAÇÕES DE NOVOS PEDIDOS */}
+        <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Volume2 className="w-4 h-4 text-amber-600" />
+              <h4 className="text-xs font-bold text-slate-800">Controle de volume do som das notificações</h4>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={isOrderMuted}
+                  onChange={(e) => handleToggleMuteOrder(e.target.checked)}
+                  className="rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                />
+                <span className={isOrderMuted ? 'font-bold text-rose-600' : ''}>Silenciar som de pedidos</span>
+              </label>
+              <button
+                type="button"
+                onClick={handleTestAudio}
+                className="px-2.5 py-1 text-xs font-bold rounded-lg bg-amber-500 hover:bg-amber-600 text-white flex items-center gap-1 transition cursor-pointer shadow-xs"
+              >
+                <Volume2 className="w-3.5 h-3.5" />
+                <span>Testar som</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <VolumeX className={`w-4 h-4 ${isOrderMuted || orderVolume === 0 ? 'text-rose-500' : 'text-slate-400'}`} />
+            <input
+              type="range"
+              min="0"
+              max="100"
+              step="5"
+              disabled={isOrderMuted}
+              value={isOrderMuted ? 0 : Math.round(orderVolume * 100)}
+              onChange={(e) => handleVolumeChange(parseInt(e.target.value, 10) / 100)}
+              className="w-full accent-amber-600 cursor-pointer disabled:opacity-40"
+            />
+            <Volume2 className="w-4 h-4 text-slate-500" />
+            <span className="font-mono font-bold text-xs text-slate-700 min-w-[40px] text-right">
+              {isOrderMuted ? '0%' : `${Math.round(orderVolume * 100)}%`}
+            </span>
+          </div>
+
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            Controle exclusivo para o toque de alerta de novos pedidos no balcão e na cozinha. Outros sons do sistema (como confirmações e ações) não são alterados. Funciona tanto no celular quanto no computador e salva sua preferência automaticamente.
+          </p>
+        </div>
 
         {/* Guia Android Tela Bloqueada / Economia de Bateria */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-600">

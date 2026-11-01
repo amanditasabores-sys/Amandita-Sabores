@@ -217,21 +217,15 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         ? (condoCustom.trim() || street.trim() || 'Outro Condomínio / Endereço')
         : (condoType ? `Condomínio ${condoType}` : (condoCustom.trim() || street.trim() || 'Entrega'));
 
-      const numStr = apto.trim()
-        ? `Ap ${apto.trim()}`
-        : (bloco.trim() ? `Bloco ${bloco.trim()}` : (number.trim() || 'S/N'));
-
-      const complementParts: string[] = [];
-      if (bloco.trim()) complementParts.push(`Bloco: ${bloco.trim()}`);
-      if (apto.trim()) complementParts.push(`Ap: ${apto.trim()}`);
-      if (complement.trim()) complementParts.push(complement.trim());
-
       formattedAddress = {
-        street: condoTitle,
-        number: numStr,
+        condominium: condoType && condoType !== 'Outros' ? `Condomínio ${condoType}` : (condoCustom.trim() || undefined),
+        street: street.trim() || condoTitle,
+        number: number.trim() || (apto.trim() || bloco.trim() ? undefined : 'S/N'),
+        block: bloco.trim() || undefined,
+        apartment: apto.trim() || undefined,
         neighborhood: condoType ? `Condomínio ${condoType}` : (neighborhood.trim() || 'Bairro'),
-        complement: complementParts.join(' - ') || undefined,
-        city: config.city || 'João Pessoa',
+        complement: complement.trim() || undefined,
+        city: config.city || 'Campina Grande',
         reference: reference.trim() || undefined,
       };
     }

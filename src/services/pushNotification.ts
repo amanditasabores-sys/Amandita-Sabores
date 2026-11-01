@@ -4,14 +4,29 @@
  */
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
-  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const cleanBase64 = base64String.trim().replace(/\s+/g, '');
+  const padding = '='.repeat((4 - (cleanBase64.length % 4)) % 4);
+  const base64 = (cleanBase64 + padding).replace(/-/g, '+').replace(/_/g, '/');
   const rawData = window.atob(base64);
   const outputArray = new Uint8Array(rawData.length);
   for (let i = 0; i < rawData.length; ++i) {
     outputArray[i] = rawData.charCodeAt(i);
   }
   return outputArray;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer | null): string {
+  if (!buffer) return '';
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function cleanBase64Key(key: string): string {
+  return key.trim().replace(/\s+/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 export interface PushStatus {
@@ -84,27 +99,51 @@ class PushNotificationService {
       try {
         const resKey = await fetch('/api/push/vapid-key');
         if (resKey.ok) {
-          const data = await resKey.json();
-          vapidPublicKey = data.publicKey || '';
+          const rawKeyText = await resKey.text().catch(() => '');
+          if (rawKeyText && rawKeyText.trim()) {
+            try {
+              const data = JSON.parse(rawKeyText);
+              vapidPublicKey = (data.publicKey || '').trim().replace(/\s+/g, '');
+            } catch {}
+          }
         }
-      } catch {
-        // Fallback
+      } catch (keyErr) {
+        console.warn('[Push Service] Falha ao consultar vapid-key:', keyErr);
+      }
+
+      if (!vapidPublicKey) {
+        return {
+          success: false,
+          message: 'Chave pública VAPID não configurada no servidor backend.',
+        };
       }
 
       const reg = await navigator.serviceWorker.ready;
       let subscription = await reg.pushManager.getSubscription();
 
-      if (!subscription && vapidPublicKey) {
+      // Check if existing subscription key differs from current server VAPID key
+      if (subscription) {
+        const existingKey = arrayBufferToBase64(subscription.options.applicationServerKey);
+        const expectedKey = cleanBase64Key(vapidPublicKey);
+        if (existingKey && expectedKey && existingKey !== expectedKey) {
+          console.info('[Push Service] Chave VAPID anterior divergia da atual. Renovando inscrição para garantir entrega...');
+          await subscription.unsubscribe().catch(() => {});
+          subscription = null;
+        }
+      }
+
+      if (!subscription) {
+        const appServerKey = urlBase64ToUint8Array(vapidPublicKey);
         subscription = await reg.pushManager.subscribe({
           userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(vapidPublicKey) as unknown as BufferSource,
+          applicationServerKey: appServerKey as unknown as BufferSource,
         });
       }
 
       if (subscription) {
         this.currentSubscription = subscription;
-        // Register subscription with server
-        await fetch('/api/push/subscribe', {
+        // Register subscription with server and verify database confirmation
+        const regRes = await fetch('/api/push/subscribe', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -112,7 +151,19 @@ class PushNotificationService {
             role,
             userAgent: navigator.userAgent,
           }),
-        }).catch(() => {});
+        });
+
+        if (!regRes.ok) {
+          const rawErrText = await regRes.text().catch(() => '');
+          let errData: any = {};
+          if (rawErrText && rawErrText.trim()) {
+            try { errData = JSON.parse(rawErrText); } catch {}
+          }
+          return {
+            success: false,
+            message: errData.message || `Servidor não pôde confirmar a gravação da inscrição (HTTP ${regRes.status}).`,
+          };
+        }
 
         return {
           success: true,

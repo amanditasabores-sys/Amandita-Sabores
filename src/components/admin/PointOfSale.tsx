@@ -278,20 +278,15 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
           ? (deliveryCondoCustom.trim() || 'Outro Condomínio / Endereço')
           : (deliveryCondo ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || 'Entrega'));
 
-        const numStr = deliveryAp.trim()
-          ? `Ap ${deliveryAp.trim()}`
-          : (deliveryBloco.trim() ? `Bloco ${deliveryBloco.trim()}` : 'S/N');
-
-        const complementParts: string[] = [];
-        if (deliveryBloco.trim()) complementParts.push(`Bloco: ${deliveryBloco.trim()}`);
-        if (deliveryAp.trim()) complementParts.push(`Ap: ${deliveryAp.trim()}`);
-
         formattedAddress = {
+          condominium: deliveryCondo && deliveryCondo !== 'Outros' ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || undefined),
           street: condoTitle,
-          number: numStr,
+          number: (deliveryAp.trim() || deliveryBloco.trim()) ? undefined : 'S/N',
+          block: deliveryBloco.trim() || undefined,
+          apartment: deliveryAp.trim() || undefined,
           neighborhood: deliveryCondo ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || 'Bairro'),
-          complement: complementParts.join(' - ') || undefined,
-          city: config.city || 'João Pessoa',
+          complement: undefined,
+          city: config.city || 'Campina Grande',
           reference: deliveryReference.trim() || undefined,
         };
       }

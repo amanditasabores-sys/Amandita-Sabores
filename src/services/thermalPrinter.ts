@@ -8,7 +8,7 @@
  * 3. Spooler do Sistema / Navegador (58mm): Impressão gráfica com largura e margens de 58mm.
  */
 
-import { Order } from '../types';
+import { Order, CustomerAddress } from '../types';
 import { formatCurrency, formatDateTime } from '../utils/formatters';
 
 export type PrinterPaperWidth = '58mm' | '80mm';
@@ -481,9 +481,150 @@ class ThermalPrinterService {
   }
 
   /**
+   * Monta o endereço de entrega deduplicando campos para garantir que
+   * condomínio, bloco, apartamento, número e complemento não apareçam repetidos.
+   */
+  public formatReceiptAddressLines(addr?: CustomerAddress): string[] {
+    if (!addr) return [];
+    const lines: string[] = [];
+
+    const condRaw = (addr.condominium || '').trim();
+    const streetRaw = (addr.street || '').trim();
+    const numRaw = (addr.number || '').trim();
+    const blockRaw = (addr.block || '').trim();
+    const aptRaw = (addr.apartment || '').trim();
+    const compRaw = (addr.complement || '').trim();
+    const neighRaw = (addr.neighborhood || '').trim();
+    const cityRaw = (addr.city || '').trim();
+    const refRaw = (addr.reference || '').trim();
+
+    let printedCond = false;
+    let effectiveBlock = blockRaw;
+    let effectiveApt = aptRaw;
+
+    // Detect if apartment or block is embedded in number or complement
+    if (!effectiveApt && /ap(?:to|\.)?\s*[:\-]?\s*([0-9a-zA-Z]+)/i.test(numRaw)) {
+      const match = numRaw.match(/ap(?:to|\.)?\s*[:\-]?\s*([0-9a-zA-Z]+)/i);
+      if (match) effectiveApt = match[1];
+    }
+    if (!effectiveBlock && /bloco\s*[:\-]?\s*([0-9a-zA-Z]+)/i.test(numRaw)) {
+      const match = numRaw.match(/bloco\s*[:\-]?\s*([0-9a-zA-Z]+)/i);
+      if (match) effectiveBlock = match[1];
+    }
+    if (!effectiveApt && /ap(?:to|\.)?\s*[:\-]?\s*([0-9a-zA-Z]+)/i.test(compRaw)) {
+      const match = compRaw.match(/ap(?:to|\.)?\s*[:\-]?\s*([0-9a-zA-Z]+)/i);
+      if (match) effectiveApt = match[1];
+    }
+    if (!effectiveBlock && /bloco\s*[:\-]?\s*([0-9a-zA-Z]+)/i.test(compRaw)) {
+      const match = compRaw.match(/bloco\s*[:\-]?\s*([0-9a-zA-Z]+)/i);
+      if (match) effectiveBlock = match[1];
+    }
+
+    // 1. Condomínio (se informado)
+    if (condRaw) {
+      const cleanCond = condRaw.replace(/^condom[íi]nio\s*/i, '').trim();
+      lines.push(...this.wrapText(`Cond: ${cleanCond}`, 32, '  '));
+      printedCond = true;
+    }
+
+    // 2. Rua / Logradouro / Identificação Principal
+    if (streetRaw) {
+      const isSameAsCondo = condRaw && (
+        streetRaw.toLowerCase().includes(condRaw.toLowerCase()) || 
+        condRaw.toLowerCase().includes(streetRaw.toLowerCase())
+      );
+      if (!isSameAsCondo || !printedCond) {
+        lines.push(...this.wrapText(streetRaw, 32, '  '));
+        if (/condom[íi]nio/i.test(streetRaw)) {
+          printedCond = true;
+        }
+      }
+    }
+
+    // 3. Número predial / residencial (se não for apenas 'Ap ...' ou 'Bloco ...' que já isolamos)
+    if (numRaw) {
+      const isOnlyApOrBloco = /^(?:ap(?:to|\.)?\s*[:\-]?\s*[0-9a-zA-Z]+|bloco\s*[:\-]?\s*[0-9a-zA-Z]+|s\/?n)$/i.test(numRaw.trim());
+      if (!isOnlyApOrBloco) {
+        lines.push(`  Numero: ${this.sanitizeText(numRaw)}`);
+      } else if (/^s\/?n$/i.test(numRaw.trim()) && !effectiveApt && !effectiveBlock) {
+        lines.push(`  Numero: S/N`);
+      }
+    }
+
+    // 4. Bloco e Apartamento (exibido exatamente uma vez)
+    const blockAptParts: string[] = [];
+    if (effectiveBlock) {
+      blockAptParts.push(`Bloco: ${effectiveBlock.replace(/^bloco\s*/i, '').trim()}`);
+    }
+    if (effectiveApt) {
+      blockAptParts.push(`Apto: ${effectiveApt.replace(/^ap(?:to|\.)?\s*/i, '').trim()}`);
+    }
+    if (blockAptParts.length > 0) {
+      lines.push(`  ${blockAptParts.join(' - ')}`);
+    }
+
+    // 5. Complemento (remove redundâncias de Bloco e Ap já impressos)
+    if (compRaw) {
+      let cleanComp = compRaw;
+      if (effectiveBlock) {
+        cleanComp = cleanComp.replace(new RegExp(`bloco\\s*[:\\-]?\\s*${effectiveBlock}`, 'ig'), '');
+      }
+      if (effectiveApt) {
+        cleanComp = cleanComp.replace(new RegExp(`ap(?:to|\\.)?\\s*[:\\-]?\\s*${effectiveApt}`, 'ig'), '');
+      }
+      cleanComp = cleanComp.replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '').trim();
+      if (cleanComp) {
+        lines.push(...this.wrapText(`Compl: ${cleanComp}`, 32, '  '));
+      }
+    }
+
+    // 6. Bairro (se não for redundante com condomínio ou placeholder 'Bairro')
+    if (neighRaw && neighRaw !== 'Bairro') {
+      const isSameAsCondo = condRaw && neighRaw.toLowerCase().includes(condRaw.toLowerCase());
+      if (!isSameAsCondo) {
+        lines.push(`  Bairro: ${this.sanitizeText(neighRaw)}`);
+      }
+    }
+
+    // 7. Cidade
+    if (cityRaw) {
+      lines.push(`  Cidade: ${this.sanitizeText(cityRaw)}`);
+    }
+
+    // 8. Ponto de Referência
+    if (refRaw) {
+      lines.push(...this.wrapText(`Ref: ${refRaw}`, 32, '  '));
+    }
+
+    return lines;
+  }
+
+  /**
+   * Recupera o texto customizado do rodapé do cupom configurado na loja.
+   * Se vazio, retorna string vazia para omitir a linha do rodapé.
+   */
+  public getEffectiveFooterText(explicitFooter?: string): string {
+    if (explicitFooter !== undefined) {
+      return explicitFooter.trim();
+    }
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const raw = localStorage.getItem('gf_restaurant_config');
+        if (raw) {
+          const cfg = JSON.parse(raw);
+          if (cfg && cfg.receiptFooterText !== undefined) {
+            return (cfg.receiptFooterText || '').trim();
+          }
+        }
+      } catch {}
+    }
+    return '';
+  }
+
+  /**
    * Gera o texto plano do comprovante formatado exatamente em 32 colunas (58 mm)
    */
-  public generateReceiptPlainText(order: Order, options?: { isReprint?: boolean }): string {
+  public generateReceiptPlainText(order: Order, options?: { isReprint?: boolean; footerText?: string }): string {
     const isReprint = Boolean(options?.isReprint);
     const dateFormatted = formatDateTime(order.createdAt);
     const separator = '--------------------------------';
@@ -522,46 +663,10 @@ class ThermalPrinterService {
 
     // ENDEREÇO DE ENTREGA (Exclusivo para modalidade DELIVERY - nunca inventar dados)
     if (isDelivery && order.customer.address) {
-      const addr = order.customer.address;
       lines.push(separator);
       lines.push('ENDERECO DE ENTREGA:');
-
-      if (addr.condominium && addr.condominium.trim()) {
-        const condLines = this.wrapText(`Cond: ${addr.condominium.trim()}`, 32, '  ');
-        lines.push(...condLines);
-      }
-
-      const blockApt = [
-        addr.block && addr.block.trim() ? `Bloco: ${addr.block.trim()}` : '',
-        addr.apartment && addr.apartment.trim() ? `Apto: ${addr.apartment.trim()}` : ''
-      ].filter(Boolean).join(' - ');
-      if (blockApt) {
-        lines.push(`  ${blockApt}`);
-      }
-
-      if (addr.street && addr.street.trim()) {
-        const streetStr = `${addr.street.trim()}${addr.number && addr.number.trim() ? `, ${addr.number.trim()}` : ''}`;
-        const streetLines = this.wrapText(streetStr, 32, '  ');
-        lines.push(...streetLines);
-      }
-
-      if (addr.complement && addr.complement.trim()) {
-        const compLines = this.wrapText(`Compl: ${addr.complement.trim()}`, 32, '  ');
-        lines.push(...compLines);
-      }
-
-      if (addr.neighborhood && addr.neighborhood.trim()) {
-        lines.push(`  Bairro: ${this.sanitizeText(addr.neighborhood.trim())}`);
-      }
-
-      if (addr.city && addr.city.trim()) {
-        lines.push(`  Cidade: ${this.sanitizeText(addr.city.trim())}`);
-      }
-
-      if (addr.reference && addr.reference.trim()) {
-        const refLines = this.wrapText(`Ref: ${addr.reference.trim()}`, 32, '  ');
-        lines.push(...refLines);
-      }
+      const addressLines = this.formatReceiptAddressLines(order.customer.address);
+      lines.push(...addressLines);
     }
 
     // ITENS DO PEDIDO
@@ -633,7 +738,10 @@ class ThermalPrinterService {
 
     lines.push(separator);
     lines.push(this.centerText('Obrigado pela preferencia!'));
-    lines.push(this.centerText('amanditasabores.com.br'));
+    const footerText = this.getEffectiveFooterText(options?.footerText);
+    if (footerText) {
+      lines.push(this.centerText(footerText));
+    }
     lines.push('');
     lines.push('');
     lines.push('');
@@ -644,7 +752,7 @@ class ThermalPrinterService {
   /**
    * Gera comandos binários ESC/POS para impressoras térmicas de 58 mm
    */
-  public generateReceiptEscPos(order: Order, options?: { isReprint?: boolean }): Uint8Array {
+  public generateReceiptEscPos(order: Order, options?: { isReprint?: boolean; footerText?: string }): Uint8Array {
     const ESC = 0x1b;
     const GS = 0x1d;
     const LF = 0x0a;
@@ -713,47 +821,13 @@ class ThermalPrinterService {
 
     // Endereço de Entrega (Exclusivo para modalidade DELIVERY - nunca inventar dados)
     if (isDelivery && order.customer.address) {
-      const addr = order.customer.address;
       appendLine('--------------------------------');
       append(ESC, 0x45, 0x01); // Bold ON
       appendLine('ENDERECO DE ENTREGA:');
       append(ESC, 0x45, 0x00); // Bold OFF
-
-      if (addr.condominium && addr.condominium.trim()) {
-        const condLines = this.wrapText(`Cond: ${addr.condominium.trim()}`, 32, '  ');
-        for (const cl of condLines) appendLine(cl);
-      }
-
-      const blockApt = [
-        addr.block && addr.block.trim() ? `Bloco: ${addr.block.trim()}` : '',
-        addr.apartment && addr.apartment.trim() ? `Apto: ${addr.apartment.trim()}` : ''
-      ].filter(Boolean).join(' - ');
-      if (blockApt) {
-        appendLine(`  ${blockApt}`);
-      }
-
-      if (addr.street && addr.street.trim()) {
-        const streetStr = `${addr.street.trim()}${addr.number && addr.number.trim() ? `, ${addr.number.trim()}` : ''}`;
-        const streetLines = this.wrapText(streetStr, 32, '  ');
-        for (const sl of streetLines) appendLine(sl);
-      }
-
-      if (addr.complement && addr.complement.trim()) {
-        const compLines = this.wrapText(`Compl: ${addr.complement.trim()}`, 32, '  ');
-        for (const cl of compLines) appendLine(cl);
-      }
-
-      if (addr.neighborhood && addr.neighborhood.trim()) {
-        appendLine(`  Bairro: ${this.sanitizeText(addr.neighborhood.trim())}`);
-      }
-
-      if (addr.city && addr.city.trim()) {
-        appendLine(`  Cidade: ${this.sanitizeText(addr.city.trim())}`);
-      }
-
-      if (addr.reference && addr.reference.trim()) {
-        const refLines = this.wrapText(`Ref: ${addr.reference.trim()}`, 32, '  ');
-        for (const rl of refLines) appendLine(rl);
+      const addressLines = this.formatReceiptAddressLines(order.customer.address);
+      for (const al of addressLines) {
+        appendLine(al);
       }
     }
 
@@ -834,7 +908,10 @@ class ThermalPrinterService {
     appendLine('--------------------------------');
     append(ESC, 0x61, 0x01); // Center
     appendLine('Obrigado pela preferencia!');
-    appendLine('amanditasabores.com.br');
+    const footerText = this.getEffectiveFooterText(options?.footerText);
+    if (footerText) {
+      appendLine(footerText);
+    }
 
     // 9. Avanço de Papel (Feed 4 linhas) & Corte
     append(ESC, 0x64, 0x04); // Feed 4 lines

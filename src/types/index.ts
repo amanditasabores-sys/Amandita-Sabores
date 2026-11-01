@@ -205,6 +205,7 @@ export interface RestaurantConfig {
   avgDeliveryTimeMinutes: number;
   isOpen: boolean;
   customPublicUrl?: string; // Optional override for shared URL
+  receiptFooterText?: string; // Texto configurável do rodapé do cupom térmico (ex: @nomedoperfil)
 }
 
 export type CashMovementType = 'SANGRIA' | 'VALE' | 'SUPRIMENTO' | 'VENDA' | 'AJUSTE';

@@ -421,6 +421,7 @@ export const INITIAL_CONFIG: RestaurantConfig = {
   avgPrepTimeMinutes: 15,
   avgDeliveryTimeMinutes: 25,
   isOpen: true,
+  receiptFooterText: 'Instagram: @amanditasabores',
 };
 
 export const INITIAL_USERS: User[] = [
