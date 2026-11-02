@@ -86,6 +86,40 @@ export interface MenuItem {
   addons?: MenuItemAddon[];
 }
 
+export interface ComboComponent {
+  menuItemId: string;
+  name: string;
+  quantity: number;
+  originalPrice: number;
+}
+
+export interface Combo {
+  id: string;
+  name: string;
+  description: string;
+  imageUrl?: string;
+  category: string; // e.g. 'Combos'
+  items: ComboComponent[];
+  originalPrice: number; // Sum of component individual prices
+  comboPrice: number; // Special promotional price
+  active: boolean; // Active / Inactive
+  available: boolean; // Components available in stock
+  featured?: boolean;
+  tags?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface DailyMenuConfig {
+  enabled: boolean;
+  publishedAt?: string;
+  referenceDate?: string;
+  selectedItemIds: string[];
+  selectedComboIds: string[];
+  draftItemIds?: string[];
+  draftComboIds?: string[];
+}
+
 export interface OrderItem {
   id: string;
   menuItemId: string;
@@ -95,6 +129,9 @@ export interface OrderItem {
   addons?: MenuItemAddon[];
   notes?: string;
   subtotal: number;
+  isCombo?: boolean;
+  comboId?: string;
+  comboComponents?: ComboComponent[];
 }
 
 export interface CustomerAddress {
@@ -206,6 +243,7 @@ export interface RestaurantConfig {
   isOpen: boolean;
   customPublicUrl?: string; // Optional override for shared URL
   receiptFooterText?: string; // Texto configurável do rodapé do cupom térmico (ex: @nomedoperfil)
+  dailyMenu?: DailyMenuConfig; // Configuração do cardápio do dia publicado
 }
 
 export type CashMovementType = 'SANGRIA' | 'VALE' | 'SUPRIMENTO' | 'VENDA' | 'AJUSTE';

@@ -11,9 +11,17 @@ import {
   X, 
   Clock, 
   Sparkles, 
-  Image as ImageIcon 
+  Image as ImageIcon,
+  Layers,
+  Calendar,
+  Tag,
+  Package,
+  Utensils
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
+import { ComboManagerTab } from './menu/ComboManagerTab';
+import { DailyMenuTab } from './menu/DailyMenuTab';
+import { CategoryListTab } from './menu/CategoryListTab';
 
 const PRESET_IMAGES = [
   { label: 'Cuscuz Nordestino', url: 'https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80' },
@@ -28,6 +36,7 @@ export const MenuManagement: React.FC = () => {
   const [items, setItems] = useState<MenuItem[]>(() => store.getMenuItems());
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('TODAS');
+  const [activeSection, setActiveSection] = useState<'produtos' | 'categorias' | 'combos' | 'cardapio-do-dia'>('produtos');
 
   // Modal create/edit state
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -163,9 +172,76 @@ export const MenuManagement: React.FC = () => {
   });
 
   return (
-    <div className="space-y-4">
-      {/* Action & Filter Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs">
+    <div className="space-y-5">
+      {/* 4-Tab Navigation Header (Produtos, Categorias, Combos, Cardápio do Dia) */}
+      <div className="bg-[#FFFDF9] rounded-2xl p-1.5 sm:p-2 border border-[#E8DFD5] shadow-xs flex items-center gap-1.5 overflow-x-auto scrollbar-none">
+        <button
+          type="button"
+          onClick={() => setActiveSection('produtos')}
+          className={`flex items-center gap-2 px-3.5 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition shrink-0 cursor-pointer ${
+            activeSection === 'produtos'
+              ? 'bg-[#2C1810] text-white shadow-xs'
+              : 'text-[#8C5E47] hover:text-[#2C1810] hover:bg-[#FAF7F2]'
+          }`}
+        >
+          <Utensils className="w-4 h-4 text-[#C86D3B]" />
+          <span>1. Produtos ({items.length})</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSection('categorias')}
+          className={`flex items-center gap-2 px-3.5 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition shrink-0 cursor-pointer ${
+            activeSection === 'categorias'
+              ? 'bg-[#2C1810] text-white shadow-xs'
+              : 'text-[#8C5E47] hover:text-[#2C1810] hover:bg-[#FAF7F2]'
+          }`}
+        >
+          <Tag className="w-4 h-4 text-[#C86D3B]" />
+          <span>2. Categorias</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSection('combos')}
+          className={`flex items-center gap-2 px-3.5 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition shrink-0 cursor-pointer ${
+            activeSection === 'combos'
+              ? 'bg-[#2C1810] text-white shadow-xs'
+              : 'text-[#8C5E47] hover:text-[#2C1810] hover:bg-[#FAF7F2]'
+          }`}
+        >
+          <Layers className="w-4 h-4 text-[#C86D3B]" />
+          <span>3. Combos</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSection('cardapio-do-dia')}
+          className={`flex items-center gap-2 px-3.5 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-bold transition shrink-0 cursor-pointer ${
+            activeSection === 'cardapio-do-dia'
+              ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
+              : 'text-[#8C5E47] hover:text-[#2C1810] hover:bg-[#FAF7F2]'
+          }`}
+        >
+          <Calendar className="w-4 h-4" />
+          <span>4. Cardápio do Dia</span>
+        </button>
+      </div>
+
+      {/* SUB-SECTION 2: CATEGORIAS */}
+      {activeSection === 'categorias' && <CategoryListTab />}
+
+      {/* SUB-SECTION 3: COMBOS */}
+      {activeSection === 'combos' && <ComboManagerTab />}
+
+      {/* SUB-SECTION 4: CARDÁPIO DO DIA */}
+      {activeSection === 'cardapio-do-dia' && <DailyMenuTab />}
+
+      {/* SUB-SECTION 1: PRODUTOS (CATÁLOGO INDIVIDUAL) */}
+      {activeSection === 'produtos' && (
+        <div className="space-y-4">
+          {/* Action & Filter Header */}
+          <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs">
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 flex-1 min-w-0 sm:min-w-[280px]">
           <div className="relative flex-1 max-w-md">
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
@@ -470,6 +546,9 @@ export const MenuManagement: React.FC = () => {
           </div>
         </div>
       )}
+        </div>
+      )}
+
       {/* CONFIRM MODAL FOR DELETE MENU ITEM */}
       {itemToDelete && (
         <ConfirmModal

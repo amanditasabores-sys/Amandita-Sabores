@@ -18,6 +18,7 @@ import {
   Lock,
   ShieldCheck
 } from 'lucide-react';
+import { AmanditaLogo } from '../common/AmanditaLogo';
 
 interface OrderTrackingViewProps {
   orderId: string;
@@ -216,9 +217,12 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({
                 <ArrowLeft className="w-5 h-5" />
               </button>
             )}
-            <div className="min-w-0">
-              <h1 className="font-bold text-xs sm:text-sm tracking-tight truncate">{config.name}</h1>
-              <p className="text-[10px] sm:text-[11px] text-amber-400 font-mono truncate">Rastreamento de Pedido {order.orderNumber}</p>
+            <div className="flex items-center gap-2.5 min-w-0">
+              <AmanditaLogo variant="icon" size="sm" theme="dark" className="shrink-0" />
+              <div className="min-w-0">
+                <h1 className="font-bold text-xs sm:text-sm tracking-tight truncate">{config.name}</h1>
+                <p className="text-[10px] sm:text-[11px] text-amber-400 font-mono truncate">Rastreamento de Pedido {order.orderNumber}</p>
+              </div>
             </div>
           </div>
           <button

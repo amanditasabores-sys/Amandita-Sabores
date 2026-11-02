@@ -170,6 +170,17 @@ export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orde
                                 </p>
                               )}
 
+                              {item.isCombo && item.comboComponents && item.comboComponents.length > 0 && (
+                                <div className="mt-1 pl-2 border-l-2 border-[#C86D3B] space-y-0.5 text-xs">
+                                  <span className="font-bold text-[10px] uppercase text-[#C86D3B] block">Componentes do Combo:</span>
+                                  {item.comboComponents.map((comp, cIdx) => (
+                                    <p key={cIdx} className="font-medium text-[#2C1810]">
+                                      • {comp.quantity * item.quantity}x {comp.name}
+                                    </p>
+                                  ))}
+                                </div>
+                              )}
+
                               {item.notes && (
                                 <div className="mt-1 p-1.5 bg-amber-100/70 border border-amber-300 rounded text-xs font-bold text-amber-950 flex items-center gap-1">
                                   <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0" />

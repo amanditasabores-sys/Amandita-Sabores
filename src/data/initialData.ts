@@ -1,4 +1,4 @@
-import { MenuItem, RestaurantConfig, User, Order, MenuItemAddon } from '../types/index';
+import { MenuItem, RestaurantConfig, User, Order, MenuItemAddon, Combo, DailyMenuConfig } from '../types/index';
 
 // Oficial additions as shown in the cardápio image:
 // "ADICIONAIS - R$ 3,00: Escolha qualquer um dos recheios abaixo:
@@ -695,3 +695,68 @@ export const INITIAL_ORDERS: Order[] = [
     ]
   }
 ];
+
+export const INITIAL_COMBOS: Combo[] = [
+  {
+    id: 'combo-cafe-nordestino',
+    name: 'Combo Café Nordestino',
+    description: '1 Cuscuz quentinho com ovos caipiras + 1 Café com leite 200ml cremoso.',
+    imageUrl: 'https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80',
+    category: 'Combos',
+    items: [
+      { menuItemId: 'cuscuz-ovos', name: 'Cuscuz com ovos', quantity: 1, originalPrice: 8.00 },
+      { menuItemId: 'bebida-cafe-leite', name: 'Café com leite — 200 ml', quantity: 1, originalPrice: 5.00 },
+    ],
+    originalPrice: 13.00,
+    comboPrice: 10.90,
+    active: true,
+    available: true,
+    featured: true,
+    tags: ['Especial Café', 'Mais Vendido'],
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: 'combo-amandita-tarde',
+    name: 'Combo Amandita da Tarde',
+    description: '1 Tapioca de frango com requeijão + 1 Suco de Laranja 400ml natural geladinho.',
+    imageUrl: 'https://images.unsplash.com/photo-1544025162-d76694265947?auto=format&fit=crop&w=700&q=80',
+    category: 'Combos',
+    items: [
+      { menuItemId: 'tapioca-frango-requeijao', name: 'Tapioca de frango com requeijão', quantity: 1, originalPrice: 12.00 },
+      { menuItemId: 'bebida-suco-laranja', name: 'Suco de laranja — 400 ml', quantity: 1, originalPrice: 7.00 },
+    ],
+    originalPrice: 19.00,
+    comboPrice: 15.90,
+    active: true,
+    available: true,
+    featured: true,
+    tags: ['Lanche da Tarde', 'Super Desconto'],
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: 'combo-dupla-sabores',
+    name: 'Combo Dupla Amandita Sabores',
+    description: '2 Cuscuz Gostosinho (carne moída, queijo, ovo e verdura) + 2 Refrigerantes lata gelados.',
+    imageUrl: 'https://images.unsplash.com/photo-1586190848861-99aa4a171e90?auto=format&fit=crop&w=700&q=80',
+    category: 'Combos',
+    items: [
+      { menuItemId: 'cuscuz-gostosinho', name: 'Gostosinho (Carne moída, queijo, ovo e verdura)', quantity: 2, originalPrice: 15.00 },
+      { menuItemId: 'bebida-refrigerante-lata', name: 'Refrigerante lata — 350 ml', quantity: 2, originalPrice: 5.00 },
+    ],
+    originalPrice: 40.00,
+    comboPrice: 32.90,
+    active: true,
+    available: true,
+    featured: false,
+    tags: ['Para Compartilhar', 'Refeição Completa'],
+    createdAt: new Date().toISOString(),
+  },
+];
+
+export const INITIAL_DAILY_MENU: DailyMenuConfig = {
+  enabled: false,
+  selectedItemIds: [],
+  selectedComboIds: [],
+  referenceDate: new Date().toISOString().split('T')[0],
+};
+

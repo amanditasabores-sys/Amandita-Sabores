@@ -10,6 +10,7 @@ import { CashierScreen } from './components/staff/CashierScreen';
 import { AttendantScreen } from './components/staff/AttendantScreen';
 import { AuthModal } from './components/auth/AuthModal';
 import { pushNotificationService } from './services/pushNotification';
+import { AmanditaLogo } from './components/common/AmanditaLogo';
 import { 
   ShieldCheck, 
   UtensilsCrossed, 
@@ -406,30 +407,10 @@ export default function App() {
         </aside>
       )}
 
-      {/* STAFF PREVIEW HELPER BAR (ONLY VISIBLE TO LOGGED IN STAFF PREVIEWING THE PUBLIC MENU) */}
-      {currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin') && currentView === 'cardapio' && (
-        <aside aria-label="Aviso de Pré-visualização Staff" className="sticky top-0 z-50 w-full bg-[#1F100B] text-white border-b border-amber-600/40 px-3 py-1.5 text-xs flex items-center justify-between shadow-md">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span className="font-bold text-amber-300">Modo de Visualização do Cardápio Público</span>
-            <span className="text-[#D9C7B8] hidden sm:inline text-[11px]">· Sessão ativa: {currentUser.name || currentUser.username} ({currentUser.role})</span>
-          </div>
-          <button
-            onClick={() => navigateTo('admin')}
-            className="px-2.5 py-1 bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white rounded-lg font-bold text-[11px] hover:opacity-95 transition cursor-pointer flex items-center gap-1.5"
-          >
-            <ShieldCheck className="w-3.5 h-3.5" />
-            <span>Voltar ao Painel ADM</span>
-          </button>
-        </aside>
-      )}
-
-      {/* VIEW 1: CLIENT PUBLIC MENU */}
+      {/* VIEW 1: CLIENT PUBLIC MENU (TRULY INDEPENDENT FROM ADMIN SESSION) */}
       {currentView === 'cardapio' && (
         <CustomerMenu
           onNavigateToTracking={(orderId, trackingCode) => navigateTo('rastreio', orderId, trackingCode)}
-          onNavigateToAdmin={() => navigateTo('admin')}
-          onOpenStaffLogin={() => setIsAuthModalOpen(true)}
         />
       )}
 
@@ -489,8 +470,8 @@ export default function App() {
             <div className="min-h-[85vh] flex flex-col items-center justify-center p-4">
               <div className="bg-[#FFFDF9] rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-xl border border-[#E8DFD5]">
                 <div className="text-center mb-5">
-                  <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-[#C86D3B]/10 text-[#C86D3B] flex items-center justify-center mx-auto mb-3 font-bold border border-[#C86D3B]/20">
-                    <ShieldCheck className="w-7 h-7 sm:w-8 sm:h-8" />
+                  <div className="flex justify-center mb-3">
+                    <AmanditaLogo variant="icon" size="lg" theme="light" />
                   </div>
                   <h2 className="text-xl sm:text-2xl font-black text-[#2C1810]">Acesso do Colaborador</h2>
                   <p className="text-xs text-[#8C5E47] mt-1.5 leading-relaxed">

@@ -11,12 +11,15 @@ import {
   CashMovementType,
   UserAccessLog,
   PublicOrderTracking,
-  UserRole
+  UserRole,
+  Combo,
+  ComboComponent,
+  DailyMenuConfig
 } from '../types';
 import { soundService } from './audio';
 import { thermalPrinterService } from './thermalPrinter';
 import { generatePixCopiaECola } from '../utils/pix';
-import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_USERS, INITIAL_ORDERS, OFFICIAL_ADDONS } from '../data/initialData';
+import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_USERS, INITIAL_ORDERS, OFFICIAL_ADDONS, INITIAL_COMBOS, INITIAL_DAILY_MENU } from '../data/initialData';
 import { 
   db, 
   auth, 
@@ -102,6 +105,179 @@ class StoreService {
     } catch {
       return [];
     }
+  }
+
+  // ==========================================
+  // COMBOS API (LOCAL CACHE + FIRESTORE INTEGRATION)
+  // ==========================================
+  public getCombos(): Combo[] {
+    try {
+      const data = localStorage.getItem('gf_combos');
+      let combosList: Combo[] = [];
+      if (data) {
+        try {
+          const parsed = JSON.parse(data);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            combosList = parsed;
+          }
+        } catch {}
+      }
+
+      if (combosList.length === 0) {
+        combosList = [...INITIAL_COMBOS];
+      }
+
+      // Check current availability of component items
+      const catalogItems = this.getMenuItems();
+      const catalogMap = new Map(catalogItems.map((i) => [i.id, i]));
+
+      return combosList.map((combo) => {
+        // Validate if all component items are available
+        const allComponentsAvailable = combo.items.every((comp) => {
+          const found = catalogMap.get(comp.menuItemId);
+          return found && found.available !== false;
+        });
+
+        // Calculate current reference sum of components
+        const currentSum = combo.items.reduce((acc, comp) => {
+          const found = catalogMap.get(comp.menuItemId);
+          const unit = found ? found.price : comp.originalPrice;
+          return acc + (unit * comp.quantity);
+        }, 0);
+
+        return {
+          ...combo,
+          originalPrice: currentSum > 0 ? currentSum : combo.originalPrice,
+          available: combo.active !== false && allComponentsAvailable,
+        };
+      });
+    } catch {
+      return INITIAL_COMBOS;
+    }
+  }
+
+  public saveCombo(combo: Combo): void {
+    if (!this.canUserManageMenu()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para gerenciar combos.');
+      return;
+    }
+
+    const combos = this.getCombos();
+    const index = combos.findIndex((c) => c.id === combo.id);
+    if (index >= 0) {
+      combos[index] = { ...combo, updatedAt: new Date().toISOString() };
+    } else {
+      combos.push({ ...combo, createdAt: new Date().toISOString() });
+    }
+    localStorage.setItem('gf_combos', JSON.stringify(combos));
+    this.notify('COMBOS_UPDATED', combo);
+
+    // Also register combo in the menu items store so it is synced and visible
+    const menuItemRepresentation: MenuItem = {
+      id: combo.id,
+      name: combo.name,
+      description: combo.description,
+      category: 'Combos',
+      price: combo.comboPrice,
+      prepTimeMinutes: 20,
+      imageUrl: combo.imageUrl || 'https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80',
+      available: combo.available && combo.active !== false,
+      featured: combo.featured,
+      tags: combo.tags || ['Combo', 'Especial'],
+      addons: [],
+    };
+    this.saveMenuItem(menuItemRepresentation);
+  }
+
+  public deleteCombo(id: string): void {
+    if (!this.canUserManageMenu()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para excluir combos.');
+      return;
+    }
+
+    const combos = this.getCombos().filter((c) => c.id !== id);
+    localStorage.setItem('gf_combos', JSON.stringify(combos));
+    this.deleteMenuItem(id);
+    this.notify('COMBOS_UPDATED', { id });
+  }
+
+  public duplicateCombo(id: string): Combo | null {
+    if (!this.canUserManageMenu()) return null;
+    const combos = this.getCombos();
+    const source = combos.find((c) => c.id === id);
+    if (!source) return null;
+
+    const newCombo: Combo = {
+      ...source,
+      id: `combo-${Date.now()}`,
+      name: `${source.name} (Cópia)`,
+      createdAt: new Date().toISOString(),
+      updatedAt: undefined,
+    };
+    this.saveCombo(newCombo);
+    return newCombo;
+  }
+
+  public toggleComboActive(id: string): void {
+    if (!this.canUserManageMenu()) return;
+    const combos = this.getCombos();
+    const target = combos.find((c) => c.id === id);
+    if (target) {
+      target.active = !target.active;
+      this.saveCombo(target);
+    }
+  }
+
+  // ==========================================
+  // CARDÁPIO DO DIA API (SELEÇÃO DIÁRIA DE PRODUTOS)
+  // ==========================================
+  public getDailyMenuConfig(): DailyMenuConfig {
+    try {
+      const data = localStorage.getItem('gf_daily_menu');
+      if (data) {
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed.enabled === 'boolean') {
+          return parsed;
+        }
+      }
+      return INITIAL_DAILY_MENU;
+    } catch {
+      return INITIAL_DAILY_MENU;
+    }
+  }
+
+  public saveDailyMenuConfig(config: DailyMenuConfig): void {
+    if (!this.canUserManageMenu()) {
+      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para gerenciar o cardápio do dia.');
+      return;
+    }
+    localStorage.setItem('gf_daily_menu', JSON.stringify(config));
+    this.notify('DAILY_MENU_UPDATED', config);
+  }
+
+  public publishDailyMenu(selectedItemIds: string[], selectedComboIds: string[]): void {
+    if (!this.canUserManageMenu()) return;
+    const today = new Date().toISOString().split('T')[0];
+    const newConfig: DailyMenuConfig = {
+      enabled: true,
+      publishedAt: new Date().toISOString(),
+      referenceDate: today,
+      selectedItemIds: Array.from(new Set(selectedItemIds)),
+      selectedComboIds: Array.from(new Set(selectedComboIds)),
+      draftItemIds: selectedItemIds,
+      draftComboIds: selectedComboIds,
+    };
+    this.saveDailyMenuConfig(newConfig);
+  }
+
+  public unpublishDailyMenu(): void {
+    if (!this.canUserManageMenu()) return;
+    const current = this.getDailyMenuConfig();
+    const newConfig: DailyMenuConfig = {
+      ...current,
+      enabled: false,
+    };
+    this.saveDailyMenuConfig(newConfig);
   }
 
   private savePendingSyncOrders(orders: Order[]): void {

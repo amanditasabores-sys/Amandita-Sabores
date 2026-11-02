@@ -697,6 +697,15 @@ class ThermalPrinterService {
         }
       }
 
+      // Componentes de combo
+      if (it.isCombo && it.comboComponents && it.comboComponents.length > 0) {
+        for (const comp of it.comboComponents) {
+          const compText = `  > ${comp.quantity * it.quantity}x ${comp.name}`;
+          const wrapped = this.wrapText(compText, 30, '   ');
+          lines.push(...wrapped);
+        }
+      }
+
       // Observações do item
       if (it.notes && it.notes.trim()) {
         const noteText = `Obs: ${it.notes.trim()}`;
@@ -856,6 +865,14 @@ class ThermalPrinterService {
         for (const ad of it.addons) {
           const adText = `+ ${ad.name} (R$ ${ad.price.toFixed(2)})`;
           const wrapped = this.wrapText(adText, 30, '  ');
+          for (const wl of wrapped) appendLine(wl);
+        }
+      }
+
+      if (it.isCombo && it.comboComponents && it.comboComponents.length > 0) {
+        for (const comp of it.comboComponents) {
+          const compText = `  > ${comp.quantity * it.quantity}x ${comp.name}`;
+          const wrapped = this.wrapText(compText, 30, '   ');
           for (const wl of wrapped) appendLine(wl);
         }
       }

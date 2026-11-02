@@ -1,159 +1,140 @@
 import React from 'react';
 
+export const OFFICIAL_LOGO_PATH = '/assets/logo-amandita-oficial.jpg';
+
 interface AmanditaLogoProps {
-  variant?: 'full' | 'icon' | 'badge';
+  variant?: 'full' | 'icon' | 'badge' | 'hero';
   size?: 'sm' | 'md' | 'lg' | 'xl';
   theme?: 'dark' | 'light' | 'colored';
   className?: string;
+  showSlogan?: boolean;
 }
 
+/**
+ * Official Brand Logo Component for Amandita Sabores
+ * Strictly renders the official artwork from /assets/logo-amandita-oficial.jpg
+ * Preserving:
+ * - Central daisy flower
+ * - Original Amandita typography & heart detail
+ * - 'S A B O R E S' mark
+ * - 'Feito com amor, servido com sabor.' slogan
+ * - Original proportions and colors without cropping or AI redrawing.
+ */
 export const AmanditaLogo: React.FC<AmanditaLogoProps> = ({
   variant = 'full',
   size = 'md',
   theme = 'colored',
   className = '',
+  showSlogan = true,
 }) => {
   // Dimensions based on size
   const iconDimensions = {
-    sm: 'w-7 h-7',
-    md: 'w-9 h-9',
-    lg: 'w-12 h-12',
-    xl: 'w-16 h-16',
+    sm: 'w-8 h-8',
+    md: 'w-10 h-10',
+    lg: 'w-14 h-14',
+    xl: 'w-20 h-20',
   }[size];
 
-  const textSize = {
-    sm: 'text-sm',
-    md: 'text-base',
-    lg: 'text-xl',
-    xl: 'text-2xl',
+  const fullDimensions = {
+    sm: 'h-10 w-auto',
+    md: 'h-14 w-auto',
+    lg: 'h-24 w-auto',
+    xl: 'h-36 w-auto',
   }[size];
 
-  const subtextSize = {
-    sm: 'text-[9px]',
-    md: 'text-[10px]',
-    lg: 'text-xs',
-    xl: 'text-sm',
-  }[size];
-
-  // Artisanal Emblem SVG
-  const LogoIcon = (
-    <div
-      className={`${iconDimensions} relative shrink-0 rounded-2xl flex items-center justify-center shadow-xs transition-transform ${
-        theme === 'light'
-          ? 'bg-amber-100 text-[#361E15] border border-amber-200/50'
-          : theme === 'dark'
-          ? 'bg-[#2C1810] text-[#E89255] border border-[#C86D3B]/40'
-          : 'bg-gradient-to-br from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-[#FFF7ED] border border-[#C86D3B]/50'
-      }`}
-    >
-      <svg
-        viewBox="0 0 100 100"
-        fill="none"
-        xmlns="http://www.w3.org/2000/svg"
-        className="w-[78%] h-[78%]"
-      >
-        {/* Outer artisanal dotted border */}
-        <circle cx="50" cy="50" r="45" stroke="currentColor" strokeWidth="1.8" strokeDasharray="3 3" opacity="0.65" />
-        <circle cx="50" cy="50" r="41" stroke="currentColor" strokeWidth="1.2" opacity="0.85" />
-        
-        {/* Steam / Aroma waves above dish */}
-        <path
-          d="M40 32C39 26 44 23 42 17"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          opacity="0.9"
-        />
-        <path
-          d="M50 30C49 22 55 19 53 14"
-          stroke="currentColor"
-          strokeWidth="2.8"
-          strokeLinecap="round"
-        />
-        <path
-          d="M60 32C61 26 56 23 58 17"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          opacity="0.9"
-        />
-
-        {/* Artisanal Cloche / Pan / Cuscuz steaming shape */}
-        <path
-          d="M26 54C26 40 37 36 50 36C63 36 74 40 74 54H26Z"
-          fill="currentColor"
-          fillOpacity="0.22"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinejoin="round"
-        />
-
-        {/* Base dish / board */}
-        <path
-          d="M20 57C20 55.5 22 54 25 54H75C78 54 80 55.5 80 57C80 60 74 62 50 62C26 62 20 60 20 57Z"
-          fill="currentColor"
-          stroke="currentColor"
-          strokeWidth="2"
-        />
-
-        {/* Decorative Wheat / Flour Ears */}
-        <path
-          d="M32 74C37 70 42 70 47 73M53 73C58 70 63 70 68 74"
-          stroke="currentColor"
-          strokeWidth="1.8"
-          strokeLinecap="round"
-        />
-        <circle cx="50" cy="73" r="2.5" fill="currentColor" />
-        
-        {/* Small warm heart in center */}
-        <path
-          d="M50 48C50 48 46 44 43 46C40 48 41 51 50 55C59 51 60 48 57 46C54 44 50 48 50 48Z"
-          fill="currentColor"
-        />
-      </svg>
-    </div>
-  );
-
+  // In icon variant, render the circular emblem cleanly framed
   if (variant === 'icon') {
-    return <div className={`inline-flex items-center ${className}`}>{LogoIcon}</div>;
+    return (
+      <div 
+        className={`inline-flex items-center justify-center shrink-0 rounded-2xl overflow-hidden shadow-xs border transition-transform ${
+          theme === 'light' 
+            ? 'bg-[#FDFBF7] border-amber-200/60' 
+            : theme === 'dark'
+            ? 'bg-[#2C1810] border-[#C86D3B]/40'
+            : 'bg-[#FAF7F2] border-[#E8DFD5]'
+        } ${iconDimensions} ${className}`}
+        title="Amandita Sabores - Feito com amor, servido com sabor."
+      >
+        <img
+          src={OFFICIAL_LOGO_PATH}
+          alt="Amandita Sabores"
+          className="w-full h-full object-cover object-center scale-110"
+          loading="eager"
+        />
+      </div>
+    );
   }
 
+  // Hero variant: Large featured emblem (perfect for customer menu header or welcome)
+  if (variant === 'hero') {
+    return (
+      <div className={`flex flex-col items-center justify-center text-center ${className}`}>
+        <div className="relative p-1.5 sm:p-2 bg-[#FAF7F2] rounded-3xl shadow-md border border-[#E8DFD5] overflow-hidden max-w-[200px] sm:max-w-[240px]">
+          <img
+            src={OFFICIAL_LOGO_PATH}
+            alt="Amandita Sabores - Feito com amor, servido com sabor"
+            className="w-full h-auto object-contain rounded-2xl"
+            loading="eager"
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // Badge variant: circular/pill stamp with official emblem
+  if (variant === 'badge') {
+    return (
+      <div className={`inline-flex items-center gap-2 p-1.5 bg-[#FAF7F2] rounded-2xl border border-[#E8DFD5] shadow-xs ${className}`}>
+        <img
+          src={OFFICIAL_LOGO_PATH}
+          alt="Amandita Sabores"
+          className="w-9 h-9 object-cover rounded-xl"
+        />
+        <div className="flex flex-col leading-tight pr-2">
+          <span className="font-serif font-black text-xs text-[#2C1810] tracking-tight">Amandita</span>
+          <span className="text-[9px] font-bold tracking-widest text-[#C86D3B] uppercase">Sabores</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Default 'full' variant: Clean display of the official logo artwork with natural proportions
   return (
     <div className={`inline-flex items-center gap-3 ${className}`}>
-      {LogoIcon}
-      <div className="flex flex-col text-left leading-none">
-        <div className="flex items-center gap-1.5">
+      <div className="shrink-0 rounded-2xl overflow-hidden bg-[#FAF7F2] border border-[#E8DFD5] shadow-xs p-0.5">
+        <img
+          src={OFFICIAL_LOGO_PATH}
+          alt="Amandita Sabores - Feito com amor, servido com sabor"
+          className={`${fullDimensions} object-contain rounded-xl`}
+          loading="eager"
+        />
+      </div>
+      <div className="flex flex-col text-left leading-tight">
+        <div className="flex items-baseline gap-1.5">
           <span
-            className={`font-black tracking-tight ${textSize} ${
-              theme === 'light'
-                ? 'text-white'
-                : theme === 'dark'
-                ? 'text-[#FFF7ED]'
-                : 'text-[#361E15]'
+            className={`font-serif font-black tracking-tight text-base sm:text-lg ${
+              theme === 'light' ? 'text-white' : theme === 'dark' ? 'text-[#FAF7F2]' : 'text-[#2C1810]'
             }`}
-            style={{ fontFamily: "'Plus Jakarta Sans', Georgia, serif" }}
           >
             Amandita
           </span>
           <span
-            className={`font-extrabold italic tracking-wider ${textSize} ${
-              theme === 'light'
-                ? 'text-amber-300'
-                : 'text-[#C86D3B]'
+            className={`font-sans font-bold tracking-widest text-xs uppercase ${
+              theme === 'light' ? 'text-amber-300' : 'text-[#C86D3B]'
             }`}
           >
             Sabores
           </span>
         </div>
-        <span
-          className={`font-medium tracking-widest uppercase mt-0.5 ${subtextSize} ${
-            theme === 'light'
-              ? 'text-amber-200/80'
-              : 'text-[#8C5E47]'
-          }`}
-        >
-          Tradição & Afeto Artesanal
-        </span>
+        {showSlogan && (
+          <span
+            className={`italic text-[11px] sm:text-xs mt-0.5 ${
+              theme === 'light' ? 'text-amber-100/90' : 'text-[#8C5E47]'
+            }`}
+          >
+            Feito com amor, servido com sabor.
+          </span>
+        )}
       </div>
     </div>
   );
