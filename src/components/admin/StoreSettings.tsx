@@ -165,16 +165,59 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     setIsTestingPush(true);
     setPushFeedback(null);
     try {
-      const res = await fetch('/api/push/test', { method: 'POST' });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setPushFeedback({ type: 'success', message: data.message });
+      const res = await fetch('/api/push/test', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+      });
+
+      // Safely read response text first to eliminate "Unexpected end of JSON input" errors
+      const rawText = await res.text().catch(() => '');
+      let data: any = null;
+      if (rawText && rawText.trim()) {
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          // Body is not JSON (e.g., HTML fallback or plain text error)
+        }
+      }
+
+      if (res.ok && data && data.success) {
+        setPushFeedback({
+          type: 'success',
+          message: data.message || 'Notificação de teste enviada com sucesso!',
+        });
+      } else if (data && data.message) {
+        setPushFeedback({
+          type: 'error',
+          message: `Servidor (HTTP ${res.status}): ${data.message}`,
+        });
+      } else if (!res.ok) {
+        let diagnosis = '';
+        if (res.status === 404 || res.status === 405) {
+          diagnosis = 'A rota /api/push/test não foi encontrada no servidor da Vercel. Verifique se a pasta /api está implantada.';
+        } else if (res.status === 502 || res.status === 504) {
+          diagnosis = 'O gateway da Vercel retornou timeout ou indisponibilidade temporária.';
+        } else if (!rawText || !rawText.trim()) {
+          diagnosis = 'O servidor retornou resposta vazia (sem corpo de dados).';
+        } else {
+          diagnosis = rawText.slice(0, 120);
+        }
+        setPushFeedback({
+          type: 'error',
+          message: `Erro HTTP ${res.status} (${res.statusText || 'Falha na requisição'}): ${diagnosis}`,
+        });
       } else {
-        setPushFeedback({ type: 'error', message: data.message || 'Falha ao despachar notificação de teste.' });
+        setPushFeedback({
+          type: 'error',
+          message: `Resposta inesperada do servidor (HTTP ${res.status}). O servidor não retornou conteúdo JSON válido.`,
+        });
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      setPushFeedback({ type: 'error', message: `Erro ao testar push: ${msg}` });
+      setPushFeedback({ type: 'error', message: `Erro de rede ao comunicar com o servidor: ${msg}` });
     } finally {
       setIsTestingPush(false);
     }

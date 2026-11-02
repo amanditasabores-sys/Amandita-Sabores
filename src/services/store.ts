@@ -178,14 +178,18 @@ class StoreService {
             headers: authHeaders,
             body: JSON.stringify({ order }),
           });
-          const data = await res.json();
+          const rawText = await res.text().catch(() => '');
+          let data: any = {};
+          if (rawText && rawText.trim()) {
+            try { data = JSON.parse(rawText); } catch {}
+          }
           if (res.ok && data.success) {
             this.removeOrderFromSyncQueue(order.id);
             this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
             this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
             return { success: true };
           } else {
-            const errorMsg = data.message || `Erro ${res.status} no backend`;
+            const errorMsg = data.message || `Erro ${res.status} no backend (${rawText.slice(0, 60)})`;
             console.warn('[Firestore] Backend recusou persistência do pedido ' + order.id + ':', errorMsg);
             this.queueOrderForSync(order);
             this.updateLocalOrderSyncStatus(order.id, 'PENDING');
@@ -242,14 +246,18 @@ class StoreService {
             headers: authHeaders,
             body: JSON.stringify({ order }),
           });
-          const fallbackData = await fallbackRes.json();
+          const rawFallbackText = await fallbackRes.text().catch(() => '');
+          let fallbackData: any = {};
+          if (rawFallbackText && rawFallbackText.trim()) {
+            try { fallbackData = JSON.parse(rawFallbackText); } catch {}
+          }
           if (fallbackRes.ok && fallbackData.success) {
             this.removeOrderFromSyncQueue(order.id);
             this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
             this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
             return { success: true };
           } else {
-            console.warn('[Firestore] Backend fallback não persistiu o pedido ' + order.id + ':', fallbackData.message);
+            console.warn('[Firestore] Backend fallback não persistiu o pedido ' + order.id + ':', fallbackData.message || rawFallbackText.slice(0, 60));
           }
         } catch {
           // Handled below

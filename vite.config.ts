@@ -147,6 +147,7 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_FIREBASE_STORAGE_BUCKET': JSON.stringify(firebaseStorageBucket),
       'import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID': JSON.stringify(firebaseMessagingSenderId),
       'import.meta.env.VITE_INITIAL_ADMIN_EMAIL': JSON.stringify(initialAdminEmail),
+      'import.meta.env.VITE_VAPID_PUBLIC_KEY': JSON.stringify(process.env.VAPID_PUBLIC_KEY || process.env.VITE_FIREBASE_VAPID_KEY || env.VAPID_PUBLIC_KEY || env.VITE_FIREBASE_VAPID_KEY || ''),
     },
     resolve: {
       alias: {
@@ -156,8 +157,7 @@ export default defineConfig(({ mode }) => {
     server: {
       host: '0.0.0.0',
       port: 3000,
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      hmr: false,
     },
   };
 });
