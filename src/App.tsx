@@ -4,6 +4,7 @@ import { User } from './types';
 import { AdminDashboard } from './components/admin/AdminDashboard';
 import { CustomerMenu } from './components/menu/CustomerMenu';
 import { DeliveryPortal } from './components/delivery/DeliveryPortal';
+import { DeliveryLoginScreen } from './components/delivery/DeliveryLoginScreen';
 import { OrderTrackingView } from './components/tracking/OrderTrackingView';
 import { KitchenScreen } from './components/staff/KitchenScreen';
 import { CashierScreen } from './components/staff/CashierScreen';
@@ -108,6 +109,9 @@ export default function App() {
   const isViewAllowedForUser = (view: AppView, user: User | null): boolean => {
     // Public customer views
     if (view === 'cardapio' || view === 'rastreio') return true;
+
+    // The dedicated delivery screen handles its own authentication flow
+    if (view === 'entregador' && !user) return true;
 
     // Unauthenticated visitors have NO permission for internal modules
     if (!user) return false;
@@ -449,12 +453,25 @@ export default function App() {
 
       {/* VIEW 6: PORTAL DO ENTREGADOR */}
       {currentView === 'entregador' && (
-        <DeliveryPortal
-          initialOrderId={selectedOrderId}
-          currentUser={currentUser}
-          onLogout={handleLogout}
-          onNavigateToAdmin={() => navigateTo('admin')}
-        />
+        currentUser ? (
+          <DeliveryPortal
+            initialOrderId={selectedOrderId}
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigateToAdmin={currentUser.role === 'ENTREGADOR' ? undefined : () => navigateTo('admin')}
+          />
+        ) : (
+          <DeliveryLoginScreen
+            onLoginSuccess={(loggedUser) => {
+              setCurrentUser(loggedUser);
+              if (loggedUser.role === 'ENTREGADOR' || loggedUser.role === 'ADMINISTRADOR' || loggedUser.role === 'GERENTE') {
+                setCurrentView('entregador');
+              } else {
+                navigateTo(getDefaultViewForRole(loggedUser.role));
+              }
+            }}
+          />
+        )
       )}
 
       {/* VIEW 7: PAINEL ADMINISTRATIVO (ADMIN OU LOGIN DE FUNCIONÁRIO) */}

@@ -101,8 +101,10 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [tempAddons, setTempAddons] = useState<MenuItemAddon[]>([]);
   const [tempNotes, setTempNotes] = useState('');
 
-  // Sale finalized modal
+  // Sale finalized modal & feedback state
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
+  const [saleError, setSaleError] = useState<string | null>(null);
+  const [saleSuccessBanner, setSaleSuccessBanner] = useState<{ orderNumber: string; total: number; order: Order } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [printableOrder, setPrintableOrder] = useState<Order | null>(null);
 
@@ -268,6 +270,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       }
     }
 
+    setSaleError(null);
     setIsSubmitting(true);
 
     try {
@@ -318,17 +321,39 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         store.addCashMovement(
           'VENDA',
           totalAmount,
-          `Venda PDV Balcão ${newOrder.orderNumber} - ${customerName}`,
+          `Venda PDV Balcão ${newOrder.orderNumber} - ${customerName || 'Balcão'}`,
           operatorName,
           paymentMethod
         );
       }
 
-      setCompletedOrder(newOrder);
+      // Auto-print thermal receipt if configured for counter orders
+      try {
+        const printerCfg = thermalPrinterService.getConfig();
+        if (printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA') {
+          thermalPrinterService.printOrder(newOrder).catch(() => {});
+        }
+      } catch {}
+
+      // Clean all inputs and temporary cart once write is confirmed
       handleClearCart();
       setIsCartDrawerOpen(false);
       reloadData();
       if (onOrderCreated) onOrderCreated();
+
+      // Show clear, accessible confirmation feedback with instant thermal print access
+      setSaleSuccessBanner({
+        orderNumber: newOrder.orderNumber,
+        total: newOrder.totalAmount,
+        order: newOrder,
+      });
+      setTimeout(() => setSaleSuccessBanner(null), 6000);
+
+      // Return immediately to the clean new sale screen without freezing
+      setCompletedOrder(null);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSaleError(`Falha ao registrar venda: ${msg}. Os produtos e dados preenchidos foram preservados.`);
     } finally {
       setIsSubmitting(false);
     }
@@ -833,6 +858,14 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             </div>
           </div>
 
+          {/* Error notice if submission failed (preserves all data) */}
+          {saleError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2 animate-in fade-in">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{saleError}</span>
+            </div>
+          )}
+
           {/* Action buttons */}
           <div className="space-y-2">
             <button
@@ -860,6 +893,41 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
+      {/* Toast Banner for Confirmed Sale */}
+      {saleSuccessBanner && (
+        <div className="fixed top-20 inset-x-0 z-50 max-w-lg mx-auto px-4 pointer-events-none animate-in slide-in-from-top-4 duration-200">
+          <div className="bg-emerald-950/95 backdrop-blur-md text-white p-4 rounded-2xl shadow-2xl border border-emerald-500/40 flex items-center justify-between gap-3 pointer-events-auto">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-9 h-9 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
+                <CheckCircle2 className="w-5 h-5" />
+              </div>
+              <div className="min-w-0">
+                <h4 className="font-black text-sm text-white">Venda {saleSuccessBanner.orderNumber} Registrada com Sucesso!</h4>
+                <p className="text-xs text-emerald-200 font-mono">{formatCurrency(saleSuccessBanner.total)} · Pedido enviado para a Cozinha</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => thermalPrinterService.printOrder(saleSuccessBanner.order, { forceReprint: true })}
+                className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded-xl text-xs font-bold transition flex items-center gap-1 cursor-pointer"
+                title="Imprimir Cupom Térmico 58mm"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Imprimir 58mm</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSaleSuccessBanner(null)}
+                className="p-1.5 text-emerald-300 hover:text-white rounded-lg hover:bg-emerald-900 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Banner & Tabs */}
       <div className="bg-[#FFFDF9] rounded-2xl p-4 sm:p-5 border border-[#E8DFD5] shadow-xs flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3 min-w-0 flex-1">

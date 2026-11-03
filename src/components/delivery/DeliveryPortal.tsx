@@ -35,12 +35,30 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
   currentUser,
   onLogout
 }) => {
+  const isDriverRole = currentUser?.role === 'ENTREGADOR';
+
   const [driverName, setDriverName] = useState(() => {
+    if (currentUser?.role === 'ENTREGADOR') {
+      return currentUser.name || currentUser.username;
+    }
     return currentUser?.name || currentUser?.username || localStorage.getItem('gf_driver_name') || 'Rodrigo Motoboy';
   });
+
   const [driverPhone, setDriverPhone] = useState(() => {
+    if (currentUser?.role === 'ENTREGADOR') {
+      return currentUser.phone || '';
+    }
     return currentUser?.phone || localStorage.getItem('gf_driver_phone') || '(11) 97771-2233';
   });
+
+  // Keep state in sync with authenticated user
+  useEffect(() => {
+    if (currentUser?.role === 'ENTREGADOR') {
+      setDriverName(currentUser.name || currentUser.username);
+      setDriverPhone(currentUser.phone || '');
+    }
+  }, [currentUser]);
+
   const [isEditingProfile, setIsEditingProfile] = useState(false);
 
   const [activeOrder, setActiveOrder] = useState<Order | null>(null);
@@ -58,22 +76,49 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
   const loadData = () => {
     const orders = store.getOrders();
+    const currentDriverId = currentUser?.id;
+    const cleanCurrentDriver = (driverName || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+
     // Orders ready or in transit (pending delivery completion)
-    const ready = orders.filter((o) => o.status === 'PRONTO' || o.status === 'EM_ROTA');
+    const ready = orders.filter((o) => {
+      if (o.status !== 'PRONTO' && o.status !== 'EM_ROTA') return false;
+      if (o.fulfillmentType !== 'DELIVERY' && !o.customer?.address) return false;
+
+      // When logged in as delivery driver, show only own assigned deliveries or unassigned ready deliveries
+      if (isDriverRole) {
+        if (o.deliveryPerson) {
+          const isSameId = currentDriverId && (o.deliveryPerson.id === currentDriverId || o.deliveryPerson.id === `driver-${currentDriverId}`);
+          const cleanOrderDriver = (o.deliveryPerson.name || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+          const isSameName = cleanOrderDriver && (
+            cleanOrderDriver === cleanCurrentDriver ||
+            cleanOrderDriver.includes(cleanCurrentDriver) ||
+            cleanCurrentDriver.includes(cleanOrderDriver)
+          );
+          return Boolean(isSameId || isSameName);
+        }
+        // Unassigned PRONTO deliveries can be accepted by driver
+        return o.status === 'PRONTO';
+      }
+
+      return true;
+    });
     setReadyOrders(ready);
 
-    // Delivered deliveries (completed)
-    const cleanCurrentDriver = (driverName || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+    // Delivered deliveries (completed by this driver)
     const done = orders.filter((o) => {
       if (o.status !== 'ENTREGUE') return false;
-      if (!o.deliveryPerson) return true; // Modality delivery marked delivered
-      const cleanOrderDriver = (o.deliveryPerson.name || '').toLowerCase().replace(/entregador\s*/g, '').trim();
-      return (
-        !cleanCurrentDriver ||
-        cleanOrderDriver === cleanCurrentDriver ||
-        cleanOrderDriver.includes(cleanCurrentDriver) ||
-        cleanCurrentDriver.includes(cleanOrderDriver)
-      );
+      if (isDriverRole) {
+        if (!o.deliveryPerson) return false;
+        const isSameId = currentDriverId && (o.deliveryPerson.id === currentDriverId || o.deliveryPerson.id === `driver-${currentDriverId}`);
+        const cleanOrderDriver = (o.deliveryPerson.name || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+        const isSameName = cleanOrderDriver && (
+          cleanOrderDriver === cleanCurrentDriver ||
+          cleanOrderDriver.includes(cleanCurrentDriver) ||
+          cleanCurrentDriver.includes(cleanOrderDriver)
+        );
+        return Boolean(isSameId || isSameName);
+      }
+      return true;
     });
 
     setDeliveredOrders(done);
@@ -245,12 +290,14 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
               </h1>
               <p className="text-[11px] sm:text-xs text-slate-400 flex items-center gap-1 truncate">
                 <span className="truncate">{driverName}</span>
-                <button
-                  onClick={() => setIsEditingProfile(true)}
-                  className="text-amber-400 hover:underline text-[11px] ml-1 shrink-0"
-                >
-                  (Alterar)
-                </button>
+                {!isDriverRole && (
+                  <button
+                    onClick={() => setIsEditingProfile(true)}
+                    className="text-amber-400 hover:underline text-[11px] ml-1 shrink-0"
+                  >
+                    (Alterar)
+                  </button>
+                )}
               </p>
             </div>
           </div>

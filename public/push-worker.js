@@ -20,10 +20,11 @@ self.addEventListener('push', function (event) {
     renotify: true,
     requireInteraction: true, // Mantém notificação visível na tela de bloqueio até interação
     silent: false,
+    timestamp: payload.timestamp || Date.now(),
     data: {
       url: payload.url || '/?view=producao',
       orderId: payload.orderId || '',
-      timestamp: Date.now()
+      timestamp: payload.timestamp || Date.now()
     },
     actions: [
       { action: 'open_kds', title: 'Ver na Cozinha' },

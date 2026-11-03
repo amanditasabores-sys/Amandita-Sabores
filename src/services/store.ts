@@ -551,9 +551,12 @@ class StoreService {
         this.broadcastChannel = new BroadcastChannel('gestaofood_sync_channel');
         this.broadcastChannel.onmessage = (event) => {
           if (event.data?.type === 'ORDER_CREATED') {
-            const current = this.getCurrentUser();
-            if (current && this.isAuthorizedStaffRole(current.role)) {
-              soundService.playNewOrderAlert();
+            // Strictly isolate public customer views: customers NEVER hear internal kitchen/cashier bells
+            if (!this.isPublicCustomerContext()) {
+              const current = this.getCurrentUser();
+              if (current && this.isAuthorizedStaffRole(current.role)) {
+                soundService.playNewOrderAlert();
+              }
             }
           }
           window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: event.data }));
@@ -1767,13 +1770,8 @@ class StoreService {
     const isStaffSession = activeStaffUser && this.isAuthorizedStaffRole(activeStaffUser.role);
 
     // CRITICAL: Public customer sessions must NEVER play staff kitchen/cashier alarms!
-    if (isStaffSession) {
-      if (isCustomerMenuOrder) {
-        this.recordUnseenCustomerOrder(newOrder.id);
-        soundService.startPersistentOrderAlert(3500);
-      } else {
-        soundService.playNewOrderAlert();
-      }
+    if (!this.isPublicCustomerContext() && isStaffSession) {
+      soundService.playNewOrderAlert();
     }
 
     this.notify('ORDER_CREATED', newOrder);
@@ -1792,15 +1790,6 @@ class StoreService {
     this.queueOrderForSync(newOrder);
     if (autoPersist) {
       this.persistOrderToFirestore(newOrder).catch(() => {});
-    }
-
-    // Always dispatch background Push Notification to backend for subscribed staff devices
-    if (typeof window !== 'undefined') {
-      fetch('/api/push/notify-order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order: newOrder }),
-      }).catch(() => {});
     }
 
     return newOrder;

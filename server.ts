@@ -397,13 +397,28 @@ async function sendOrderPushNotification(order: any) {
   }
   sentNotificationOrderIds.add(order.id);
 
-  const subscriptions = await getAllPushSubscriptions();
-  if (subscriptions.length === 0) {
+  const allSubscriptions = await getAllPushSubscriptions();
+  if (allSubscriptions.length === 0) {
     console.info(`[Web Push] Pedido #${order.orderNumber} persistido no Firestore. Nenhuma inscrição push registrada para alerta.`);
     return;
   }
 
-  console.info(`[Web Push] Disparando alerta de novo pedido #${order.orderNumber} para ${subscriptions.length} dispositivo(s)...`);
+  // STRICT PRIVACY SHIELD: Filter subscriptions exclusively to authorized staff roles
+  // Anonymous customer devices that might have subscribed must NEVER receive internal order notifications
+  const staffSubscriptions = allSubscriptions.filter((s) => {
+    const r = (s.role || '').toUpperCase();
+    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE', 'ENTREGADOR', 'STAFF'].includes(r);
+  });
+
+  if (staffSubscriptions.length === 0) {
+    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição de funcionário autorizada ativa.`);
+    return;
+  }
+
+  console.info(`[Web Push] Disparando alerta de novo pedido #${order.orderNumber} para ${staffSubscriptions.length} dispositivo(s) da equipe...`);
+
+  // Chronological integrity: respect order's real creation time so Android/iOS sorts correctly
+  const orderTimestamp = order.createdAt ? new Date(order.createdAt).getTime() : Date.now();
 
   const payload = JSON.stringify({
     title: `Novo Pedido #${order.orderNumber}!`,
@@ -412,8 +427,9 @@ async function sendOrderPushNotification(order: any) {
     badge: '/favicon-32x32.png',
     tag: `order-${order.id}`,
     orderId: order.id,
+    orderNumber: order.orderNumber,
     url: '/?view=producao',
-    timestamp: Date.now(),
+    timestamp: orderTimestamp,
   });
 
   const pushOptions = {
@@ -425,11 +441,11 @@ async function sendOrderPushNotification(order: any) {
   const deadEndpoints: string[] = [];
   let successfulDeliveries = 0;
 
-  for (const subData of subscriptions) {
+  for (const subData of staffSubscriptions) {
     try {
       const res = await webpush.sendNotification(subData.subscription, payload, pushOptions);
       successfulDeliveries++;
-      console.log(`[Web Push] Alerta entregue com sucesso ao gateway push (Status: ${res.statusCode || 201}) para dispositivo ${subData.role || 'staff'}`);
+      console.log(`[Web Push] Alerta entregue ao gateway push (Status: ${res.statusCode || 201}) para dispositivo ${subData.role || 'staff'}`);
     } catch (err: any) {
       console.warn(`[Web Push] Falha ao enviar para endpoint (${err.statusCode || 'erro'}):`, err.message);
       if (err.statusCode === 404 || err.statusCode === 410) {
@@ -438,7 +454,7 @@ async function sendOrderPushNotification(order: any) {
     }
   }
 
-  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber}: ${successfulDeliveries}/${subscriptions.length} entregas confirmadas.`);
+  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber}: ${successfulDeliveries}/${staffSubscriptions.length} entregas confirmadas.`);
 
   for (const endpoint of deadEndpoints) {
     await deletePushSubscription(endpoint);

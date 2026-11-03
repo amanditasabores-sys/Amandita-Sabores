@@ -81,15 +81,35 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [sortBy, setSortBy] = useState<'relevance' | 'price_asc' | 'price_desc'>('relevance');
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
 
-  // Mode: Daily Menu vs Full Catalog (defaults to Daily Menu if active)
-  const [viewScope, setViewScope] = useState<'daily' | 'full'>(() => {
-    const dc = store.getDailyMenuConfig();
-    return dc.enabled && (dc.selectedItemIds.length > 0 || dc.selectedComboIds.length > 0) ? 'daily' : 'full';
+  // Cart state persisted to storage so browsing and page changes do not lose items
+  const [cart, setCart] = useState<OrderItem[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('gf_customer_cart');
+        if (saved) return JSON.parse(saved);
+      } catch {}
+    }
+    return [];
   });
-
-  // Cart state
-  const [cart, setCart] = useState<OrderItem[]>([]);
   const [isCartOpen, setIsCartOpen] = useState(false);
+  const [cartToast, setCartToast] = useState<{ message: string; submessage?: string } | null>(null);
+
+  // Sync cart to storage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('gf_customer_cart', JSON.stringify(cart));
+      } catch {}
+    }
+  }, [cart]);
+
+  // Strict check: Daily menu is ONLY active when published with at least 1 item or combo
+  const isDailyMenuPublished = Boolean(
+    dailyConfig &&
+    dailyConfig.enabled &&
+    ((dailyConfig.selectedItemIds && dailyConfig.selectedItemIds.length > 0) ||
+     (dailyConfig.selectedComboIds && dailyConfig.selectedComboIds.length > 0))
+  );
 
   // Customization Modal for individual items
   const [selectedItemForModal, setSelectedItemForModal] = useState<MenuItem | null>(null);
@@ -117,38 +137,48 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('PIX');
   const [paymentChangeFor, setPaymentChangeFor] = useState('');
 
-  // Available categories list
+  // Available categories list - strictly derived from published daily items & combos
   const categories = useMemo(() => {
+    if (!isDailyMenuPublished) return ['TODAS'];
     const set = new Set<string>();
-    if (combos.some((c) => c.active !== false)) {
+
+    const publishedComboSet = new Set(dailyConfig.selectedComboIds || []);
+    const publishedItemSet = new Set(dailyConfig.selectedItemIds || []);
+
+    if (combos.some((c) => c.active !== false && publishedComboSet.has(c.id))) {
       set.add('Combos & Ofertas');
     }
+
     menuItems.forEach((item) => {
-      if (item.category && item.category !== 'Combos') {
+      if (publishedItemSet.has(item.id) && item.category && item.category !== 'Combos') {
         set.add(item.category);
       }
     });
+
     return ['TODAS', ...Array.from(set)];
-  }, [menuItems, combos]);
+  }, [menuItems, combos, dailyConfig, isDailyMenuPublished]);
 
-  // Tags list
+  // Tags list - strictly derived from published items & combos
   const allTags = useMemo(() => {
+    if (!isDailyMenuPublished) return ['TODOS'];
     const set = new Set<string>();
-    menuItems.forEach((i) => i.tags?.forEach((t) => set.add(t)));
-    combos.forEach((c) => c.tags?.forEach((t) => set.add(t)));
+    const publishedComboSet = new Set(dailyConfig.selectedComboIds || []);
+    const publishedItemSet = new Set(dailyConfig.selectedItemIds || []);
+
+    menuItems.forEach((i) => {
+      if (publishedItemSet.has(i.id)) i.tags?.forEach((t) => set.add(t));
+    });
+    combos.forEach((c) => {
+      if (publishedComboSet.has(c.id)) c.tags?.forEach((t) => set.add(t));
+    });
     return ['TODOS', ...Array.from(set)];
-  }, [menuItems, combos]);
+  }, [menuItems, combos, dailyConfig, isDailyMenuPublished]);
 
-  // Filtered Combos
+  // Filtered Combos: ONLY active combos published in Cardápio do Dia
   const filteredCombos = useMemo(() => {
-    // Only active combos
-    let list = combos.filter((c) => c.active !== false);
-
-    // If Daily Menu filter is enabled and scope is 'daily', restrict to published combos
-    if (dailyConfig.enabled && viewScope === 'daily') {
-      const allowedSet = new Set(dailyConfig.selectedComboIds);
-      list = list.filter((c) => allowedSet.has(c.id));
-    }
+    if (!isDailyMenuPublished) return [];
+    const allowedSet = new Set(dailyConfig.selectedComboIds || []);
+    let list = combos.filter((c) => c.active !== false && allowedSet.has(c.id));
 
     // Category filter
     if (selectedCategory !== 'TODAS' && selectedCategory !== 'Combos & Ofertas') {
@@ -171,22 +201,22 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     }
 
     return list;
-  }, [combos, dailyConfig, viewScope, selectedCategory, selectedTag, searchQuery]);
+  }, [combos, dailyConfig, isDailyMenuPublished, selectedCategory, selectedTag, searchQuery]);
 
-  // Filtered Items (Excluding combos category, which are handled in filteredCombos)
+  // Filtered Items: ONLY items published in Cardápio do Dia
   const filteredItems = useMemo(() => {
+    if (!isDailyMenuPublished) return [];
+    const allowedSet = new Set(dailyConfig.selectedItemIds || []);
+
     let list = menuItems.filter((item) => {
-      // Exclude items already categorized as combos
+      // Exclude items categorized as combos (handled in filteredCombos)
       if (item.category === 'Combos') return false;
 
-      // Only available items (default to true if available property is not explicitly false)
+      // Only available items
       if (item.available === false) return false;
 
-      // Daily menu filter
-      if (dailyConfig.enabled && viewScope === 'daily') {
-        const allowedSet = new Set(dailyConfig.selectedItemIds);
-        if (!allowedSet.has(item.id)) return false;
-      }
+      // Strict daily menu restriction: must be selected by admin
+      if (!allowedSet.has(item.id)) return false;
 
       // Category filter
       if (selectedCategory === 'Combos & Ofertas') return false;
@@ -199,7 +229,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         return false;
       }
 
-      // Advanced text search: name, description, category, tags
+      // Search query
       if (searchQuery.trim()) {
         const query = searchQuery.toLowerCase().trim();
         const matchesName = item.name.toLowerCase().includes(query);
@@ -222,11 +252,10 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       if (!a.featured && b.featured) return 1;
       return 0;
     });
-  }, [menuItems, dailyConfig, viewScope, selectedCategory, selectedTag, searchQuery, sortBy]);
+  }, [menuItems, dailyConfig, isDailyMenuPublished, selectedCategory, selectedTag, searchQuery, sortBy]);
 
   // Cart operations
   const handleAddToCart = (item: MenuItem) => {
-    // Check if item has addons or options, or if user clicked to customize
     handleOpenItemModal(item);
   };
 
@@ -260,7 +289,12 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       return [...prev, cartItem];
     });
 
-    setIsCartOpen(true);
+    // Notify user with feedback toast without interrupting browsing
+    setCartToast({
+      message: `✓ Combo "${combo.name}" adicionado ao pedido!`,
+      submessage: 'Continue escolhendo outros itens ou finalize quando desejar.',
+    });
+    setTimeout(() => setCartToast(null), 3000);
   };
 
   const handleOpenItemModal = (item: MenuItem) => {
@@ -289,8 +323,16 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     };
 
     setCart((prev) => [...prev, orderItem]);
+    const addedName = selectedItemForModal.name;
+    const addedQty = modalQuantity;
     setSelectedItemForModal(null);
-    setIsCartOpen(true);
+
+    // Notify user with feedback toast without interrupting browsing
+    setCartToast({
+      message: `✓ ${addedQty}x "${addedName}" adicionado ao pedido!`,
+      submessage: 'Continue escolhendo outros itens ou finalize quando desejar.',
+    });
+    setTimeout(() => setCartToast(null), 3000);
   };
 
   const handleUpdateCartQuantity = (cartItemId: string, newQty: number) => {
@@ -405,12 +447,21 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         ? `Retirada no Balcão (${config.address})`
         : `${order.customer.address?.street}, ${order.customer.address?.number || 'S/N'}${order.customer.address?.block ? ` · Bloco ${order.customer.address.block}` : ''}${order.customer.address?.apartment ? ` · Ap ${order.customer.address.apartment}` : ''} - ${order.customer.address?.neighborhood || ''}`;
 
+      const paymentMethodFormatted = 
+        paymentMethod === 'PIX'
+          ? 'PIX Instantâneo'
+          : paymentMethod === 'DINHEIRO'
+          ? `Dinheiro (Troco para ${paymentChangeFor ? formatCurrency(parseFloat(paymentChangeFor) || 0) : 'Sem troco'})`
+          : paymentMethod === 'CARTAO_CREDITO'
+          ? 'Cartão de Crédito na Entrega / Balcão'
+          : 'Cartão de Débito na Entrega / Balcão';
+
       const waText = generateWhatsAppOrderMessage({
         orderNumber: order.orderNumber,
         customerName: order.customer.name,
         itemsList,
         total: order.totalAmount,
-        paymentMethod: paymentMethod === 'PIX' ? 'PIX' : paymentMethod === 'DINHEIRO' ? `Dinheiro (Troco para ${paymentChangeFor || 'Sem troco'})` : 'Cartão na Entrega / Balcão',
+        paymentMethod: paymentMethodFormatted,
         address: addressText,
         trackingUrl,
       });
@@ -422,6 +473,9 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       setCreatedOrderNumber(order.orderNumber);
       setWhatsappShareUrl(waUrl);
       setCart([]);
+      if (typeof window !== 'undefined') {
+        try { localStorage.removeItem('gf_customer_cart'); } catch {}
+      }
       setIsCartOpen(false);
     } catch (orderErr) {
       setFormError('Não foi possível registrar seu pedido. Por favor, tente novamente ou contate nosso WhatsApp.');
@@ -603,56 +657,94 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         </div>
       </header>
 
-      {/* DAILY MENU NOTICE / SCOPE SWITCHER (IF DAILY MENU IS ACTIVE) */}
-      {dailyConfig.enabled && (
-        <div className="w-full max-w-4xl mx-auto px-3.5 sm:px-4 pt-4">
-          <div className="bg-gradient-to-r from-[#FFFDF9] to-[#FDF8F3] rounded-2xl p-3.5 sm:p-4 border border-[#E8DFD5] shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <div className="p-2 bg-[#721C24] text-white rounded-xl shadow-xs">
-                <Sparkles className="w-4 h-4 text-amber-300" />
-              </div>
-              <div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h3 className="font-serif font-black text-xs sm:text-sm text-[#2C1810]">
-                    Cardápio do Dia Selecionado
-                  </h3>
-                  <span className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
-                    Especial de Hoje
-                  </span>
-                </div>
-                <p className="text-[11px] text-[#8C5E47] mt-0.5">
-                  Receitas frescas selecionadas com carinho pela chef para este dia.
-                </p>
-              </div>
+      {/* Toast Notification when adding items to cart */}
+      {cartToast && (
+        <div className="fixed top-20 inset-x-0 z-50 max-w-md mx-auto px-4 pointer-events-none animate-in slide-in-from-top-4 duration-200">
+          <div className="bg-[#2C1810]/95 backdrop-blur-md text-white p-3.5 rounded-2xl shadow-2xl border border-[#C86D3B]/40 flex items-center justify-between gap-3 pointer-events-auto">
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-bold text-white truncate">{cartToast.message}</p>
+              {cartToast.submessage && (
+                <p className="text-[11px] text-[#D9C7B8] mt-0.5 truncate">{cartToast.submessage}</p>
+              )}
             </div>
-
-            <div className="flex items-center gap-1 p-1 bg-white border border-[#E8DFD5] rounded-xl shrink-0 w-full sm:w-auto">
-              <button
-                type="button"
-                onClick={() => setViewScope('daily')}
-                className={`flex-1 sm:flex-none px-3 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer ${
-                  viewScope === 'daily'
-                    ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-2xs'
-                    : 'text-[#8C5E47] hover:text-[#2C1810]'
-                }`}
-              >
-                Cardápio do Dia
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewScope('full')}
-                className={`flex-1 sm:flex-none px-3 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer ${
-                  viewScope === 'full'
-                    ? 'bg-[#2C1810] text-white shadow-2xs'
-                    : 'text-[#8C5E47] hover:text-[#2C1810]'
-                }`}
-              >
-                Ver Catálogo Completo
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setCartToast(null);
+                setIsCartOpen(true);
+              }}
+              className="px-3 py-1.5 bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white rounded-xl text-xs font-bold shrink-0 hover:opacity-95 shadow-xs cursor-pointer"
+            >
+              Ver Pedido
+            </button>
           </div>
         </div>
       )}
+
+      {!isDailyMenuPublished ? (
+        <div className="w-full max-w-lg mx-auto px-4 py-12 text-center">
+          <div className="bg-[#FFFDF9] rounded-3xl p-8 sm:p-10 border border-[#E8DFD5] shadow-xl space-y-5 animate-in fade-in">
+            <div className="flex justify-center">
+              <AmanditaLogo variant="full" size="lg" theme="light" />
+            </div>
+
+            <div className="space-y-2">
+              <span className="px-3 py-1 rounded-full text-[11px] font-black bg-amber-100 text-amber-900 border border-amber-300 inline-flex items-center gap-1.5">
+                <Clock className="w-3.5 h-3.5 text-amber-700" />
+                <span>Cardápio em Preparação</span>
+              </span>
+              <h2 className="font-serif font-black text-xl sm:text-2xl text-[#2C1810]">
+                Cardápio do Dia Indisponível
+              </h2>
+              <p className="text-xs sm:text-sm text-[#8C5E47] leading-relaxed">
+                Nossa equipe está selecionando e preparando os pratos especiais de hoje com todo amor e carinho.
+                Por favor, volte em breve para conferir ou entre em contato diretamente conosco pelo WhatsApp!
+              </p>
+            </div>
+
+            {config.whatsapp && (
+              <a
+                href={`https://wa.me/${config.whatsapp}?text=${encodeURIComponent('Olá! Gostaria de saber mais sobre o cardápio de hoje do Amandita Sabores.')}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center justify-center gap-2 w-full py-3.5 px-4 bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white font-extrabold rounded-2xl text-xs sm:text-sm shadow-md hover:opacity-95 transition"
+              >
+                <Phone className="w-4 h-4" />
+                <span>Falar no WhatsApp do Amandita</span>
+              </a>
+            )}
+
+            <div className="pt-4 border-t border-[#E8DFD5] text-[11px] text-[#A6806C] space-y-0.5">
+              <p className="font-bold text-[#2C1810]">{config.address}</p>
+              <p>{config.phone}</p>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* DAILY MENU NOTICE (CLEAN, NO TOGGLE) */}
+          <div className="w-full max-w-4xl mx-auto px-3.5 sm:px-4 pt-4">
+            <div className="bg-gradient-to-r from-[#FFFDF9] to-[#FDF8F3] rounded-2xl p-3.5 sm:p-4 border border-[#E8DFD5] shadow-xs flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-[#721C24] text-white rounded-xl shadow-xs">
+                  <Sparkles className="w-4 h-4 text-amber-300" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="font-serif font-black text-xs sm:text-sm text-[#2C1810]">
+                      Cardápio do Dia
+                    </h3>
+                    <span className="px-2 py-0.5 rounded-full text-[9px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                      Especial de Hoje
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-[#8C5E47] mt-0.5">
+                    Receitas frescas selecionadas com carinho pela chef para este dia.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
 
       {/* MAIN CONTENT AREA */}
       <main className="w-full max-w-4xl mx-auto px-3.5 sm:px-4 pt-5 space-y-6">
@@ -788,9 +880,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
               <span className="w-2.5 h-2.5 rounded-full bg-[#C86D3B]"></span>
               <h2 className="font-serif font-black text-sm sm:text-base text-[#2C1810] tracking-tight">
                 {selectedCategory === 'TODAS'
-                  ? viewScope === 'daily'
-                    ? 'Pratos Selecionados para Hoje'
-                    : 'Cardápio Completo'
+                  ? 'Pratos Selecionados para Hoje'
                   : selectedCategory}
               </h2>
             </div>
@@ -806,7 +896,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
               <p className="text-xs text-[#8C5E47] mt-1 mb-4">
                 {searchQuery
                   ? `Nenhum resultado para "${searchQuery}".`
-                  : 'Tente alternar para o catálogo completo ou selecione outra categoria.'}
+                  : 'Nenhum prato disponível nesta categoria no cardápio de hoje.'}
               </p>
               <button
                 type="button"
@@ -814,11 +904,10 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   setSearchQuery('');
                   setSelectedCategory('TODAS');
                   setSelectedTag('TODOS');
-                  setViewScope('full');
                 }}
                 className="px-4 py-2 bg-[#2C1810] text-white rounded-xl text-xs font-bold transition hover:bg-[#3D2314] cursor-pointer"
               >
-                Limpar Filtros & Ver Todos
+                Limpar Filtros
               </button>
             </div>
           ) : (
@@ -864,7 +953,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                         {formatCurrency(item.price)}
                       </span>
                       <span className="text-[10px] sm:text-[11px] text-[#8C5E47] flex items-center gap-1 font-medium">
-                        <Clock className="w-3 h-3" />
+                        <Clock className="w-3.5 h-3.5 text-[#C86D3B]" />
                         ~{item.prepTimeMinutes}m
                       </span>
                     </div>
@@ -883,6 +972,8 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
           )}
         </section>
       </main>
+      </>
+      )}
 
       {/* FOOTER (CLEAN BRANDING EXCLUSIVELY FOR CUSTOMERS) */}
       <footer className="mt-16 py-8 border-t border-[#E8DFD5] text-center text-xs text-[#8C5E47] space-y-1.5 px-4">
@@ -1320,11 +1411,23 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                       <label className="text-xs font-bold uppercase tracking-wider text-[#3D2314] block mb-1.5">
                         Forma de Pagamento
                       </label>
-                      <div className="grid grid-cols-2 gap-1.5">
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setPaymentMethod('DINHEIRO')}
+                          className={`p-2.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                            paymentMethod === 'DINHEIRO'
+                              ? 'bg-[#2C1810] text-white shadow-2xs'
+                              : 'bg-[#FAF7F2] text-[#8C5E47] border border-[#E8DFD5]'
+                          }`}
+                        >
+                          <span>💵 Dinheiro</span>
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => setPaymentMethod('PIX')}
-                          className={`p-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer ${
+                          className={`p-2.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
                             paymentMethod === 'PIX'
                               ? 'bg-[#2C1810] text-white shadow-2xs'
                               : 'bg-[#FAF7F2] text-[#8C5E47] border border-[#E8DFD5]'
@@ -1337,26 +1440,27 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                         <button
                           type="button"
                           onClick={() => setPaymentMethod('CARTAO_CREDITO')}
-                          className={`p-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer ${
-                            paymentMethod === 'CARTAO_CREDITO' || paymentMethod === 'CARTAO_DEBITO'
+                          className={`p-2.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                            paymentMethod === 'CARTAO_CREDITO'
                               ? 'bg-[#2C1810] text-white shadow-2xs'
                               : 'bg-[#FAF7F2] text-[#8C5E47] border border-[#E8DFD5]'
                           }`}
                         >
                           <CreditCard className="w-3.5 h-3.5" />
-                          <span>Cartão</span>
+                          <span>Cartão de Crédito</span>
                         </button>
 
                         <button
                           type="button"
-                          onClick={() => setPaymentMethod('DINHEIRO')}
-                          className={`p-2 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer col-span-2 ${
-                            paymentMethod === 'DINHEIRO'
+                          onClick={() => setPaymentMethod('CARTAO_DEBITO')}
+                          className={`p-2.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                            paymentMethod === 'CARTAO_DEBITO'
                               ? 'bg-[#2C1810] text-white shadow-2xs'
                               : 'bg-[#FAF7F2] text-[#8C5E47] border border-[#E8DFD5]'
                           }`}
                         >
-                          <span>Dinheiro</span>
+                          <CreditCard className="w-3.5 h-3.5" />
+                          <span>Cartão de Débito</span>
                         </button>
                       </div>
 
