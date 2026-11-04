@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { store } from '../../services/store';
 import { thermalPrinterService } from '../../services/thermalPrinter';
 import { MenuItem, Order, OrderItem, PaymentMethod, User, MenuItemAddon } from '../../types';
@@ -102,9 +102,10 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [tempNotes, setTempNotes] = useState('');
 
   // Sale finalized modal & feedback state
+  const submittingRef = useRef(false);
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
   const [saleError, setSaleError] = useState<string | null>(null);
-  const [saleSuccessBanner, setSaleSuccessBanner] = useState<{ orderNumber: string; total: number; order: Order } | null>(null);
+  const [saleSuccessBanner, setSaleSuccessBanner] = useState<{ orderNumber: string; total: number; order: Order; printed?: boolean } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [printableOrder, setPrintableOrder] = useState<Order | null>(null);
 
@@ -258,9 +259,9 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     setCashTendered('');
   };
 
-  // Submit sale with idempotency lock
+  // Submit sale with strict idempotency lock and safe financial ordering
   const handleFinalizeSale = async () => {
-    if (cart.length === 0 || isSubmitting) return;
+    if (cart.length === 0 || isSubmitting || submittingRef.current) return;
 
     if (paymentMethod === 'DINHEIRO') {
       const tendered = parseFloat(cashTendered) || 0;
@@ -270,11 +271,12 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       }
     }
 
+    submittingRef.current = true;
     setSaleError(null);
     setIsSubmitting(true);
 
     try {
-      // Build formatted address for delivery
+      // Build formatted address for delivery if applicable
       let formattedAddress = undefined;
       if (fulfillmentType === 'DELIVERY') {
         const condoTitle = deliveryCondo === 'Outros'
@@ -294,6 +296,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         };
       }
 
+      // Step 1: Record Order
       const syncResult = await store.createOrderAsync({
         fulfillmentType,
         customer: {
@@ -315,7 +318,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       });
       const newOrder = syncResult.order;
 
-      // Record automatically into active cash register shift if open
+      // Step 2: Record Cash Register Movement if cash shift is open
       const shift = store.getCurrentCashShift();
       if (shift && shift.status === 'ABERTO') {
         store.addCashMovement(
@@ -323,39 +326,46 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
           totalAmount,
           `Venda PDV Balcão ${newOrder.orderNumber} - ${customerName || 'Balcão'}`,
           operatorName,
-          paymentMethod
+          paymentMethod,
+          newOrder.id,
+          newOrder.orderNumber
         );
       }
 
-      // Auto-print thermal receipt if configured for counter orders
-      try {
-        const printerCfg = thermalPrinterService.getConfig();
-        if (printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA') {
-          thermalPrinterService.printOrder(newOrder).catch(() => {});
-        }
-      } catch {}
-
-      // Clean all inputs and temporary cart once write is confirmed
+      // Step 3: Clear cart and inputs immediately so sale is committed and cannot be re-submitted
       handleClearCart();
       setIsCartDrawerOpen(false);
       reloadData();
       if (onOrderCreated) onOrderCreated();
+      setCompletedOrder(null);
 
-      // Show clear, accessible confirmation feedback with instant thermal print access
+      // Step 4: Auto-print thermal receipt AFTER sale and cash shift are confirmed
+      let printSuccess = false;
+      try {
+        const printerCfg = thermalPrinterService.getConfig();
+        if (printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA') {
+          await thermalPrinterService.printOrder(newOrder);
+          printSuccess = true;
+        }
+      } catch (printErr) {
+        console.warn('Falha na impressão do cupom térmico (a venda permanece registrada com sucesso):', printErr);
+        printSuccess = false;
+      }
+
+      // Step 5: Show clear confirmation feedback with instant reprint access
       setSaleSuccessBanner({
         orderNumber: newOrder.orderNumber,
         total: newOrder.totalAmount,
         order: newOrder,
+        printed: printSuccess,
       });
-      setTimeout(() => setSaleSuccessBanner(null), 6000);
-
-      // Return immediately to the clean new sale screen without freezing
-      setCompletedOrder(null);
+      setTimeout(() => setSaleSuccessBanner(null), 8000);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setSaleError(`Falha ao registrar venda: ${msg}. Os produtos e dados preenchidos foram preservados.`);
     } finally {
       setIsSubmitting(false);
+      submittingRef.current = false;
     }
   };
 
@@ -903,7 +913,10 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               </div>
               <div className="min-w-0">
                 <h4 className="font-black text-sm text-white">Venda {saleSuccessBanner.orderNumber} Registrada com Sucesso!</h4>
-                <p className="text-xs text-emerald-200 font-mono">{formatCurrency(saleSuccessBanner.total)} · Pedido enviado para a Cozinha</p>
+                <p className="text-xs text-emerald-200 font-mono">
+                  {formatCurrency(saleSuccessBanner.total)} · Pedido enviado para a Cozinha
+                  {saleSuccessBanner.printed ? ' · Cupom Impresso' : ' · Cupom não impresso'}
+                </p>
               </div>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
@@ -914,7 +927,9 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                 title="Imprimir Cupom Térmico 58mm"
               >
                 <Printer className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Imprimir 58mm</span>
+                <span className="hidden sm:inline">
+                  {saleSuccessBanner.printed ? 'Reimprimir Cupom' : 'Imprimir Cupom'}
+                </span>
               </button>
               <button
                 type="button"

@@ -94,8 +94,25 @@ export default function App() {
     }
   };
 
-  const [selectedOrderId, setSelectedOrderId] = useState<string>('ord-1002');
+  const [selectedOrderId, setSelectedOrderId] = useState<string>('');
   const [selectedTrackingCode, setSelectedTrackingCode] = useState<string>('');
+
+  // Independent delivery driver session (strictly isolated from administrative currentUser)
+  const [deliveryUser, setDeliveryUser] = useState<User | null>(() => {
+    try {
+      const raw = localStorage.getItem('gf_delivery_user');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as User;
+      const current = store.getUserById(parsed.id);
+      if (!current || current.status === 'DESATIVADO' || current.status === 'BLOQUEADO') {
+        localStorage.removeItem('gf_delivery_user');
+        return null;
+      }
+      return current;
+    } catch {
+      return null;
+    }
+  });
 
   const getDefaultViewForRole = (role?: string): AppView => {
     const norm = role?.toUpperCase();
@@ -110,18 +127,24 @@ export default function App() {
     // Public customer views
     if (view === 'cardapio' || view === 'rastreio') return true;
 
-    // The dedicated delivery screen handles its own authentication flow
-    if (view === 'entregador' && !user) return true;
+    // Dedicated delivery screen manages its independent delivery authentication
+    if (view === 'entregador') return true;
 
     // Unauthenticated visitors have NO permission for internal modules
     if (!user) return false;
+
+    // Inactive or blocked users are rejected
+    if (user.status === 'DESATIVADO' || user.status === 'BLOQUEADO') {
+      return false;
+    }
 
     const role = user.role?.toUpperCase();
     if (role === 'ADMINISTRADOR' || role === 'GERENTE' || user.username === 'admin') {
       return true; // Full access across all modules
     }
 
-    if (role === 'ENTREGADOR') return view === 'entregador';
+    // Delivery drivers cannot access internal administrative modules (PDV, Caixa, Cozinha, etc.)
+    if (role === 'ENTREGADOR') return false;
     if (role === 'COZINHA') return view === 'producao';
     if (role === 'CAIXA') return view === 'caixa';
     if (role === 'ATENDENTE') return view === 'atendente';
@@ -217,18 +240,48 @@ export default function App() {
     const handleHashChange = () => updateViewFromUrl();
 
     const handleStateChanged = () => {
-      const updatedUser = store.getCurrentUser();
-      setCurrentUser(updatedUser);
+      const activeUser = store.getCurrentUser();
+      if (activeUser) {
+        const fresh = store.getUserById(activeUser.id) || activeUser;
+        if (fresh.status === 'DESATIVADO' || fresh.status === 'BLOQUEADO') {
+          store.logout();
+          setCurrentUser(null);
+          setSecurityNotice('Sua conta de colaborador foi desativada ou bloqueada pela administração.');
+        } else {
+          setCurrentUser(fresh);
+        }
+      } else {
+        setCurrentUser(null);
+      }
+
+      // Check dedicated delivery session status
+      const rawDev = localStorage.getItem('gf_delivery_user');
+      if (rawDev) {
+        try {
+          const parsed = JSON.parse(rawDev) as User;
+          const freshDev = store.getUserById(parsed.id);
+          if (freshDev && (freshDev.status === 'DESATIVADO' || freshDev.status === 'BLOQUEADO')) {
+            localStorage.removeItem('gf_delivery_user');
+            setDeliveryUser(null);
+            setSecurityNotice('Acesso de entregador revogado ou desativado pela administração.');
+          }
+        } catch {
+          // ignore
+        }
+      }
     };
 
     window.addEventListener('popstate', handlePopState);
     window.addEventListener('hashchange', handleHashChange);
     window.addEventListener('gestaofood_state_changed', handleStateChanged);
 
+    const deactivationPoll = setInterval(handleStateChanged, 4000);
+
     return () => {
       window.removeEventListener('popstate', handlePopState);
       window.removeEventListener('hashchange', handleHashChange);
       window.removeEventListener('gestaofood_state_changed', handleStateChanged);
+      clearInterval(deactivationPoll);
     };
   }, []);
 
@@ -301,12 +354,13 @@ export default function App() {
   };
 
   // Only Administrator or Gerente can see the global navigation toolbar,
-  // and NEVER on public customer views (cardapio or rastreio)
+  // and NEVER on customer views (cardapio/rastreio) or driver portal (entregador)
   const isGlobalToolbarVisible = Boolean(
     currentUser && 
     (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin') &&
     currentView !== 'cardapio' &&
-    currentView !== 'rastreio'
+    currentView !== 'rastreio' &&
+    currentView !== 'entregador'
   );
 
   return (
@@ -451,24 +505,22 @@ export default function App() {
         />
       )}
 
-      {/* VIEW 6: PORTAL DO ENTREGADOR */}
+      {/* VIEW 6: PORTAL DO ENTREGADOR (SESSÃO EXCLUSIVA DO ENTREGADOR) */}
       {currentView === 'entregador' && (
-        currentUser ? (
+        deliveryUser ? (
           <DeliveryPortal
-            initialOrderId={selectedOrderId}
-            currentUser={currentUser}
-            onLogout={handleLogout}
-            onNavigateToAdmin={currentUser.role === 'ENTREGADOR' ? undefined : () => navigateTo('admin')}
+            initialOrderId={selectedOrderId || undefined}
+            currentUser={deliveryUser}
+            onLogout={() => {
+              localStorage.removeItem('gf_delivery_user');
+              setDeliveryUser(null);
+            }}
           />
         ) : (
           <DeliveryLoginScreen
             onLoginSuccess={(loggedUser) => {
-              setCurrentUser(loggedUser);
-              if (loggedUser.role === 'ENTREGADOR' || loggedUser.role === 'ADMINISTRADOR' || loggedUser.role === 'GERENTE') {
-                setCurrentView('entregador');
-              } else {
-                navigateTo(getDefaultViewForRole(loggedUser.role));
-              }
+              localStorage.setItem('gf_delivery_user', JSON.stringify(loggedUser));
+              setDeliveryUser(loggedUser);
             }}
           />
         )

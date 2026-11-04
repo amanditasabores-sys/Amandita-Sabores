@@ -16,50 +16,40 @@ import {
   X,
   UserCheck,
   RotateCcw,
-  LogOut,
-  Store
+  LogOut
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { User } from '../../types';
+import { AmanditaLogo } from '../common/AmanditaLogo';
 
 interface DeliveryPortalProps {
   initialOrderId?: string;
-  onNavigateToAdmin?: () => void;
   currentUser?: User | null;
   onLogout?: () => void;
 }
 
 export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({ 
   initialOrderId, 
-  onNavigateToAdmin,
   currentUser,
   onLogout
 }) => {
   const isDriverRole = currentUser?.role === 'ENTREGADOR';
 
   const [driverName, setDriverName] = useState(() => {
-    if (currentUser?.role === 'ENTREGADOR') {
-      return currentUser.name || currentUser.username;
-    }
-    return currentUser?.name || currentUser?.username || localStorage.getItem('gf_driver_name') || 'Rodrigo Motoboy';
+    return currentUser?.name || currentUser?.username || 'Entregador Autorizado';
   });
 
   const [driverPhone, setDriverPhone] = useState(() => {
-    if (currentUser?.role === 'ENTREGADOR') {
-      return currentUser.phone || '';
-    }
-    return currentUser?.phone || localStorage.getItem('gf_driver_phone') || '(11) 97771-2233';
+    return currentUser?.phone || '';
   });
 
-  // Keep state in sync with authenticated user
+  // Keep state strictly in sync with authenticated user
   useEffect(() => {
-    if (currentUser?.role === 'ENTREGADOR') {
+    if (currentUser) {
       setDriverName(currentUser.name || currentUser.username);
       setDriverPhone(currentUser.phone || '');
     }
   }, [currentUser]);
-
-  const [isEditingProfile, setIsEditingProfile] = useState(false);
 
   const [activeOrder, setActiveOrder] = useState<Order | null>(null);
   const [readyOrders, setReadyOrders] = useState<Order[]>([]);
@@ -79,10 +69,10 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
     const currentDriverId = currentUser?.id;
     const cleanCurrentDriver = (driverName || '').toLowerCase().replace(/entregador\s*/g, '').trim();
 
-    // Orders ready or in transit (pending delivery completion)
+    // Orders ready or in transit (pending delivery completion) - STRICTLY DELIVERY ONLY
     const ready = orders.filter((o) => {
       if (o.status !== 'PRONTO' && o.status !== 'EM_ROTA') return false;
-      if (o.fulfillmentType !== 'DELIVERY' && !o.customer?.address) return false;
+      if (o.fulfillmentType !== 'DELIVERY') return false; // Never show Retirada no Balcão
 
       // When logged in as delivery driver, show only own assigned deliveries or unassigned ready deliveries
       if (isDriverRole) {
@@ -104,9 +94,10 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
     });
     setReadyOrders(ready);
 
-    // Delivered deliveries (completed by this driver)
+    // Delivered deliveries (completed by this driver) - STRICTLY DELIVERY ONLY
     const done = orders.filter((o) => {
       if (o.status !== 'ENTREGUE') return false;
+      if (o.fulfillmentType !== 'DELIVERY') return false;
       if (isDriverRole) {
         if (!o.deliveryPerson) return false;
         const isSameId = currentDriverId && (o.deliveryPerson.id === currentDriverId || o.deliveryPerson.id === `driver-${currentDriverId}`);
@@ -126,14 +117,20 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
     if (activeOrder) {
       const refreshed = store.getOrderById(activeOrder.id);
-      if (refreshed) setActiveOrder(refreshed);
+      if (refreshed && refreshed.fulfillmentType === 'DELIVERY') {
+        setActiveOrder(refreshed);
+      } else {
+        setActiveOrder(null);
+      }
     }
   };
 
   useEffect(() => {
     if (initialOrderId) {
       const ord = store.getOrderById(initialOrderId);
-      if (ord) setActiveOrder(ord);
+      if (ord && ord.fulfillmentType === 'DELIVERY') {
+        setActiveOrder(ord);
+      }
     }
     loadData();
 
@@ -148,13 +145,8 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
     };
   }, [initialOrderId]);
 
-  const saveDriverProfile = () => {
-    localStorage.setItem('gf_driver_name', driverName);
-    localStorage.setItem('gf_driver_phone', driverPhone);
-    setIsEditingProfile(false);
-  };
-
   const handleSelectOrder = (order: Order) => {
+    if (order.fulfillmentType !== 'DELIVERY') return;
     setActiveOrder(order);
     setIsScannerOpen(false);
     stopCamera();
@@ -165,11 +157,13 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
     if (!manualCode.trim()) return;
     const clean = manualCode.trim();
     const found = store.getOrderById(clean);
-    if (found) {
+    if (found && found.fulfillmentType === 'DELIVERY') {
       setActiveOrder(found);
       setManualCode('');
       setIsScannerOpen(false);
       stopCamera();
+    } else if (found) {
+      setScannerStatus(`O pedido ${found.orderNumber} é para Retirada no Balcão e não requer entrega.`);
     } else {
       setScannerStatus(`Pedido "${clean}" não encontrado. Verifique o número.`);
     }
@@ -279,7 +273,8 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
       {/* Top Header */}
       <header className="bg-slate-950/80 backdrop-blur border-b border-slate-800 sticky top-0 z-30">
         <div className="max-w-xl mx-auto px-3 sm:px-4 py-2.5 sm:py-3 flex items-center justify-between gap-2 flex-wrap">
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <AmanditaLogo variant="icon" size="sm" theme="dark" />
             <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold shrink-0">
               <Bike className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
@@ -289,35 +284,15 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                 <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono shrink-0">ONLINE</span>
               </h1>
               <p className="text-[11px] sm:text-xs text-slate-400 flex items-center gap-1 truncate">
-                <span className="truncate">{driverName}</span>
-                {!isDriverRole && (
-                  <button
-                    onClick={() => setIsEditingProfile(true)}
-                    className="text-amber-400 hover:underline text-[11px] ml-1 shrink-0"
-                  >
-                    (Alterar)
-                  </button>
-                )}
+                <span className="truncate text-slate-300 font-medium">{driverName}</span>
+                {currentUser?.role ? (
+                  <span className="text-slate-500 text-[10px]">({currentUser.role})</span>
+                ) : null}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {onNavigateToAdmin && (currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE') && (
-              <button
-                onClick={() => {
-                  onNavigateToAdmin();
-                  window.dispatchEvent(new CustomEvent('switch_to_pdv'));
-                }}
-                className="px-2.5 sm:px-3 py-1.5 sm:py-2 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition border border-emerald-500/40 cursor-pointer flex items-center gap-1.5"
-                title="Voltar diretamente ao PDV / Painel de Controle"
-              >
-                <Store className="w-3.5 h-3.5 text-[#E89255]" />
-                <span className="hidden sm:inline">PDV / Painel</span>
-                <span className="sm:hidden">PDV</span>
-              </button>
-            )}
-
             <button
               onClick={() => {
                 if (isScannerOpen) {
@@ -347,47 +322,6 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
         </div>
       </header>
 
-      {/* Driver Profile Edit Modal */}
-      {isEditingProfile && (
-        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
-          <div className="bg-slate-800 border border-slate-700 rounded-2xl max-w-sm w-full p-5 space-y-4">
-            <h3 className="font-bold text-white text-base">Identificação do Entregador</h3>
-            <div>
-              <label className="text-xs text-slate-300 block mb-1">Seu Nome / Apelido</label>
-              <input
-                type="text"
-                value={driverName}
-                onChange={(e) => setDriverName(e.target.value)}
-                className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-sm text-white"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-slate-300 block mb-1">Seu Telefone / WhatsApp</label>
-              <input
-                type="text"
-                value={driverPhone}
-                onChange={(e) => setDriverPhone(e.target.value)}
-                className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-sm text-white"
-              />
-            </div>
-            <div className="flex gap-2 pt-2">
-              <button
-                onClick={() => setIsEditingProfile(false)}
-                className="flex-1 py-2 bg-slate-700 rounded-xl text-xs font-semibold text-slate-300"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={saveDriverProfile}
-                className="flex-1 py-2 bg-amber-500 text-slate-950 rounded-xl text-xs font-bold"
-              >
-                Salvar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Driver Shift Summary stats */}
       <div className="max-w-xl mx-auto px-4 pt-4">
         <div className="grid grid-cols-2 gap-2 p-3 bg-slate-800/60 border border-slate-800 rounded-xl">
@@ -405,7 +339,7 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
               <Bike className="w-5 h-5" />
             </div>
             <div>
-              <span className="text-[11px] text-slate-400">Prontos no Balcão</span>
+              <span className="text-[11px] text-slate-400">Aguardando Entrega</span>
               <p className="text-lg font-bold text-amber-400">{readyOrders.length} aguardando</p>
             </div>
           </div>

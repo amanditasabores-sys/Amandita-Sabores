@@ -1777,9 +1777,11 @@ class StoreService {
     this.notify('ORDER_CREATED', newOrder);
 
     // Auto-print on 58mm thermal printer if order is RETIRADA and auto-print is enabled
+    // Only auto-print here for customer web orders. PDV sales handle printing explicitly in PointOfSale after cash movement confirmation.
     try {
+      const isPdvOrStaffContext = isStaffSession || newOrder.status === 'EM_PREPARO' || (newOrder.movements[0]?.author && !newOrder.movements[0]?.author.includes('Cardápio Web'));
       const printerCfg = thermalPrinterService.getConfig();
-      if (printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA' && !thermalPrinterService.hasOrderBeenPrinted(newOrder.id)) {
+      if (!isPdvOrStaffContext && printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA' && !thermalPrinterService.hasOrderBeenPrinted(newOrder.id)) {
         thermalPrinterService.printOrder(newOrder).catch(() => {});
       }
     } catch {
@@ -2344,9 +2346,14 @@ class StoreService {
 
   public saveCurrentCashShift(shift: CashRegisterShift | null): void {
     if (shift) {
-      localStorage.setItem('gf_current_cash_shift', JSON.stringify(shift));
+      const cleanShift = this.cleanForFirestore(shift);
+      try {
+        localStorage.setItem('gf_current_cash_shift', JSON.stringify(cleanShift));
+      } catch {
+        // storage fallback
+      }
       if (db) {
-        setDoc(doc(db, 'cash_shifts', shift.id), shift).catch((err) => {
+        setDoc(doc(db, 'cash_shifts', shift.id), cleanShift).catch((err) => {
           handleFirestoreError(err, OperationType.WRITE, `cash_shifts/${shift.id}`);
         });
       }
@@ -2416,15 +2423,18 @@ class StoreService {
       finalCalculatedBalance: expectedCashInDrawer,
       finalCountedCash: countedCash,
       difference,
-      notes: notes || undefined,
     };
+    if (notes && notes.trim()) {
+      closedShift.notes = notes.trim();
+    }
 
     const history = this.getCashShiftHistory();
     history.unshift(closedShift);
     localStorage.setItem('gf_cash_shifts_history', JSON.stringify(history));
 
     if (db) {
-      setDoc(doc(db, 'cash_shifts', closedShift.id), closedShift).catch((err) => {
+      const cleanClosed = this.cleanForFirestore(closedShift);
+      setDoc(doc(db, 'cash_shifts', closedShift.id), cleanClosed).catch((err) => {
         handleFirestoreError(err, OperationType.WRITE, `cash_shifts/${closedShift.id}`);
       });
     }
@@ -2439,7 +2449,9 @@ class StoreService {
     description: string,
     author: string,
     paymentMethod: PaymentMethod = 'DINHEIRO',
-    employeeName?: string
+    employeeName?: string,
+    orderId?: string,
+    orderNumber?: string
   ): CashMovement | null {
     if (!this.canUserManageCash()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para movimentações de caixa.');
@@ -2450,15 +2462,24 @@ class StoreService {
     if (!shift || shift.status !== 'ABERTO') return null;
 
     const movement: CashMovement = {
-      id: `cash-mov-${Date.now()}`,
+      id: `cash-mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       timestamp: new Date().toISOString(),
       type,
       amount: Math.abs(amount),
       paymentMethod,
       description: description.trim(),
-      employeeName: employeeName?.trim() || undefined,
       author,
     };
+
+    if (employeeName && employeeName.trim()) {
+      movement.employeeName = employeeName.trim();
+    }
+    if (orderId && orderId.trim()) {
+      movement.orderId = orderId.trim();
+    }
+    if (orderNumber && orderNumber.trim()) {
+      movement.orderNumber = orderNumber.trim();
+    }
 
     shift.movements.push(movement);
     this.saveCurrentCashShift(shift);
