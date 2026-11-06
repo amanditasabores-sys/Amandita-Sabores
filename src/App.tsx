@@ -505,12 +505,14 @@ export default function App() {
         />
       )}
 
-      {/* VIEW 6: PORTAL DO ENTREGADOR (SESSÃO EXCLUSIVA DO ENTREGADOR) */}
+      {/* VIEW 6: PORTAL DO ENTREGADOR (SESSÃO EXCLUSIVA DO ENTREGADOR OU MODO SUPERVISÃO ADMIN) */}
       {currentView === 'entregador' && (
-        deliveryUser ? (
+        (deliveryUser || (currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE'))) ? (
           <DeliveryPortal
             initialOrderId={selectedOrderId || undefined}
-            currentUser={deliveryUser}
+            currentUser={deliveryUser || null}
+            adminUser={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? currentUser : null}
+            onBackToAdmin={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? () => navigateTo('admin') : undefined}
             onLogout={() => {
               localStorage.removeItem('gf_delivery_user');
               setDeliveryUser(null);
@@ -518,6 +520,8 @@ export default function App() {
           />
         ) : (
           <DeliveryLoginScreen
+            adminUser={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? currentUser : null}
+            onBackToAdmin={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? () => navigateTo('admin') : undefined}
             onLoginSuccess={(loggedUser) => {
               localStorage.setItem('gf_delivery_user', JSON.stringify(loggedUser));
               setDeliveryUser(loggedUser);

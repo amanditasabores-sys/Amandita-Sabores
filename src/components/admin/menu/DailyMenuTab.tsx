@@ -40,15 +40,26 @@ export const DailyMenuTab: React.FC = () => {
   const [viewFilter, setViewFilter] = useState<'all' | 'selected' | 'unselected'>('all');
   const [feedbackMessage, setFeedbackMessage] = useState<{ type: 'success' | 'info'; text: string } | null>(null);
 
-  const reload = () => {
+  const reload = (syncDrafts = false) => {
     setCatalogItems(store.getMenuItems());
     setCombos(store.getCombos());
     const freshConfig = store.getDailyMenuConfig();
     setDailyConfig(freshConfig);
+    if (syncDrafts) {
+      setSelectedItemIds(new Set(freshConfig.draftItemIds || freshConfig.selectedItemIds || []));
+      setSelectedComboIds(new Set(freshConfig.draftComboIds || freshConfig.selectedComboIds || []));
+    }
   };
 
   useEffect(() => {
-    const handleUpdate = () => reload();
+    // Initial sync with server so desktop admin sees whatever mobile admin published or drafted
+    store.syncDailyMenuWithServer(true).then((synced) => {
+      if (synced) {
+        reload(true);
+      }
+    });
+
+    const handleUpdate = () => reload(false);
     window.addEventListener('gestaofood_state_changed', handleUpdate);
     return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
   }, []);

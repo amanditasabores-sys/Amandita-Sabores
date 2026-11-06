@@ -334,7 +334,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
         )}
 
         {activeTab === 'kanban' && (
-          <LiveOrdersKanban orders={orders} onOrderUpdated={refreshOrders} />
+          <LiveOrdersKanban orders={orders} onOrderUpdated={refreshOrders} currentUser={currentUser} />
         )}
 
         {activeTab === 'kds' && (

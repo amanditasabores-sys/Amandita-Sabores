@@ -246,6 +246,9 @@ class StoreService {
     }
   }
 
+  private isSyncingDailyMenu = false;
+  private lastDailyMenuServerSyncTime = 0;
+
   public saveDailyMenuConfig(config: DailyMenuConfig): void {
     if (!this.canUserManageMenu()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para gerenciar o cardápio do dia.');
@@ -253,6 +256,78 @@ class StoreService {
     }
     localStorage.setItem('gf_daily_menu', JSON.stringify(config));
     this.notify('DAILY_MENU_UPDATED', config);
+
+    // 1. Cross-Device Server Persistence: Broadcast to /api/daily-menu so desktop browsers immediately see updates
+    if (typeof window !== 'undefined' && typeof fetch === 'function') {
+      fetch('/api/daily-menu', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config),
+      }).catch((err) => {
+        console.warn('[Daily Menu API Sync] Notice:', err);
+      });
+    }
+
+    // 2. Cloud Firestore Persistence (for authenticated staff / admin)
+    if (db) {
+      setDoc(doc(db, 'configs', 'daily_menu'), this.cleanForFirestore(config), { merge: true }).catch((err) => {
+        console.warn('[Firestore Daily Menu] Set notice:', err);
+      });
+    }
+  }
+
+  /**
+   * Synchronizes the Daily Menu across all devices (mobile phones, desktop computers, customer views).
+   * Fetches latest state from /api/daily-menu. If the current device already had an active menu published locally
+   * but the server didn't have it yet, self-heals by uploading it.
+   */
+  public async syncDailyMenuWithServer(force = false): Promise<DailyMenuConfig | null> {
+    if (typeof window === 'undefined' || typeof fetch !== 'function') return null;
+    const now = Date.now();
+    if (!force && this.isSyncingDailyMenu) return null;
+    if (!force && now - this.lastDailyMenuServerSyncTime < 3000) return null;
+
+    this.isSyncingDailyMenu = true;
+    try {
+      const res = await fetch('/api/daily-menu', {
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const serverConfig = json?.dailyMenu as DailyMenuConfig | undefined;
+        const localConfig = this.getDailyMenuConfig();
+
+        if (serverConfig && serverConfig.enabled) {
+          const changed =
+            !localConfig.enabled ||
+            localConfig.publishedAt !== serverConfig.publishedAt ||
+            (localConfig.selectedItemIds?.length !== serverConfig.selectedItemIds?.length) ||
+            (localConfig.selectedComboIds?.length !== serverConfig.selectedComboIds?.length);
+
+          if (changed) {
+            localStorage.setItem('gf_daily_menu', JSON.stringify(serverConfig));
+            this.notify('DAILY_MENU_UPDATED', serverConfig);
+          }
+          this.lastDailyMenuServerSyncTime = Date.now();
+          return serverConfig;
+        } else if (localConfig && localConfig.enabled && (!serverConfig || !serverConfig.enabled)) {
+          // Self-heal: the active device (e.g. mobile admin) had published the menu locally.
+          // Push it to the server and database so all desktop browsers immediately receive it!
+          await fetch('/api/daily-menu', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(localConfig),
+          }).catch(() => {});
+          this.lastDailyMenuServerSyncTime = Date.now();
+          return localConfig;
+        }
+      }
+    } catch (err) {
+      // Non-blocking fallback for offline environments
+    } finally {
+      this.isSyncingDailyMenu = false;
+    }
+    return null;
   }
 
   public publishDailyMenu(selectedItemIds: string[], selectedComboIds: string[]): void {
@@ -390,15 +465,6 @@ class StoreService {
       this.removeOrderFromSyncQueue(order.id);
       this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
       this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
-
-      // Dispara envio de notificação push em segundo plano aos aparelhos da equipe cadastrados
-      if (typeof window !== 'undefined') {
-        fetch('/api/push/notify-order', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order }),
-        }).catch(() => {});
-      }
 
       return { success: true };
     } catch (err: unknown) {
@@ -568,23 +634,30 @@ class StoreService {
 
     // Initialize public real-time data (Menu & Store Config)
     this.initPublicFirestoreSync();
+    this.syncDailyMenuWithServer(true).catch(() => {});
 
-    // Reconnection listener to flush pending orders automatically when network returns
+    // Reconnection listener to flush pending orders and sync daily menu automatically
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => {
-        console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes...');
+        console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes e sincronizando cardápio...');
         this.flushPendingSyncQueue();
+        this.syncDailyMenuWithServer(true).catch(() => {});
         const current = this.getCurrentUser();
         if (current && this.isAuthorizedStaffRole(current.role)) {
           this.refreshStaffSync();
         }
       });
 
+      window.addEventListener('focus', () => {
+        this.syncDailyMenuWithServer().catch(() => {});
+      });
+
       if (typeof document !== 'undefined') {
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'visible') {
-            console.info('[Store Sync] Retorno do segundo plano: verificando conexões e pendências...');
+            console.info('[Store Sync] Retorno do segundo plano: verificando conexões e cardápio...');
             this.flushPendingSyncQueue();
+            this.syncDailyMenuWithServer(true).catch(() => {});
             const current = this.getCurrentUser();
             if (current && this.isAuthorizedStaffRole(current.role)) {
               this.refreshStaffSync();
@@ -593,10 +666,11 @@ class StoreService {
         });
       }
 
-      // Background heartbeat to retry pending sync queue every 20 seconds
+      // Background heartbeat to retry pending sync queue and keep daily menu synced across all devices
       setInterval(() => {
         this.flushPendingSyncQueue();
-      }, 20000);
+        this.syncDailyMenuWithServer().catch(() => {});
+      }, 10000);
     }
 
     // Condition staff-only listeners to authenticated Firebase Auth sessions with confirmed staff role
@@ -1251,6 +1325,32 @@ class StoreService {
           }
         );
         this.staffUnsubscribers.push(unsubCosts);
+
+        // 5. Synchronize Daily Menu Config in Real Time (Staff / Admin)
+        const unsubDailyMenu = onSnapshot(
+          doc(db, 'configs', 'daily_menu'),
+          (docSnap) => {
+            if (docSnap.exists()) {
+              const remote = docSnap.data() as DailyMenuConfig;
+              if (remote && typeof remote.enabled === 'boolean') {
+                const local = this.getDailyMenuConfig();
+                const changed =
+                  local.enabled !== remote.enabled ||
+                  local.publishedAt !== remote.publishedAt ||
+                  (local.selectedItemIds?.length !== remote.selectedItemIds?.length) ||
+                  (local.selectedComboIds?.length !== remote.selectedComboIds?.length);
+                if (changed) {
+                  localStorage.setItem('gf_daily_menu', JSON.stringify(remote));
+                  this.notify('DAILY_MENU_UPDATED', remote);
+                }
+              }
+            }
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Daily menu notice:', error.message);
+          }
+        );
+        this.staffUnsubscribers.push(unsubDailyMenu);
       }
 
     } catch (err) {
@@ -1714,6 +1814,35 @@ class StoreService {
       ? crypto.randomUUID().replace(/-/g, '')
       : `tk_${Date.now()}_${Math.random().toString(36).substring(2, 12)}`;
 
+    // Resolve fixed default delivery person from administrative settings
+    // Strictly requires active profile with role ENTREGADOR. Never assigns admin or cashier.
+    const cfg = this.getRestaurantConfig();
+    let assignedDriver: { id: string; name: string; phone: string } | undefined = undefined;
+    let initialAssignmentHistory: any[] | undefined = undefined;
+
+    if (!isRetirada && cfg.defaultDeliveryPersonId) {
+      const allUsers = this.getUsers();
+      const driver = allUsers.find(
+        (u) => u.id === cfg.defaultDeliveryPersonId && u.role === 'ENTREGADOR' && u.status === 'ATIVO'
+      );
+      if (driver) {
+        const dName = driver.name || driver.username;
+        assignedDriver = {
+          id: driver.id,
+          name: dName,
+          phone: driver.phone || '',
+        };
+        initialAssignmentHistory = [
+          {
+            assignedAt: now,
+            newDriverId: driver.id,
+            newDriverName: dName,
+            assignedBy: 'Atribuição Automática (Configurações)',
+          }
+        ];
+      }
+    }
+
     const newOrder: Order = {
       ...orderInput,
       id: orderId,
@@ -1723,6 +1852,10 @@ class StoreService {
       deliveryFee: effectiveDeliveryFee,
       totalAmount: effectiveTotal,
       status: orderInput.status || 'NOVO',
+      deliveryPersonId: assignedDriver?.id,
+      deliveryPersonName: assignedDriver?.name,
+      deliveryPerson: assignedDriver,
+      deliveryAssignmentHistory: initialAssignmentHistory,
       trackingCode,
       _cloudSyncStatus: 'PENDING',
       movements: [
@@ -1730,8 +1863,10 @@ class StoreService {
           id: `mov-${Date.now()}`,
           timestamp: now,
           toStatus: orderInput.status || 'NOVO',
-          author: 'Cliente via Cardápio Web',
-          notes: isRetirada ? 'Pedido para retirada no balcão' : 'Pedido para entrega via delivery',
+          author: orderInput.createdBy || (isRetirada ? 'Balcão' : 'Cliente via Cardápio Web'),
+          notes: isRetirada 
+            ? 'Pedido para retirada no balcão' 
+            : (assignedDriver ? `Pedido delivery atribuído a ${assignedDriver.name}` : 'Pedido delivery aguardando atribuição de entregador'),
         }
       ]
     };
@@ -1741,7 +1876,6 @@ class StoreService {
 
     // If payment method is PIX, generate official PIX payload with exact purchase amount
     if (newOrder.paymentMethod === 'PIX') {
-      const cfg = this.getRestaurantConfig();
       if (cfg.pixKey) {
         try {
           newOrder.pixCode = generatePixCopiaECola({
@@ -1762,10 +1896,6 @@ class StoreService {
     const updated = [newOrder, ...orders];
     localStorage.setItem('gf_orders', JSON.stringify(updated));
 
-    // When an order is placed from the cardápio (status NOVO):
-    const isCustomerMenuOrder = (orderInput.status === 'NOVO') || 
-      newOrder.movements[0]?.author?.includes('Cardápio Web');
-
     const activeStaffUser = this.getCurrentUser();
     const isStaffSession = activeStaffUser && this.isAuthorizedStaffRole(activeStaffUser.role);
 
@@ -1777,7 +1907,6 @@ class StoreService {
     this.notify('ORDER_CREATED', newOrder);
 
     // Auto-print on 58mm thermal printer if order is RETIRADA and auto-print is enabled
-    // Only auto-print here for customer web orders. PDV sales handle printing explicitly in PointOfSale after cash movement confirmation.
     try {
       const isPdvOrStaffContext = isStaffSession || newOrder.status === 'EM_PREPARO' || (newOrder.movements[0]?.author && !newOrder.movements[0]?.author.includes('Cardápio Web'));
       const printerCfg = thermalPrinterService.getConfig();
@@ -1792,6 +1921,7 @@ class StoreService {
     this.queueOrderForSync(newOrder);
     if (autoPersist) {
       this.persistOrderToFirestore(newOrder).catch(() => {});
+      this.dispatchOrderPushNotification(newOrder, 'NEW_ORDER');
     }
 
     return newOrder;
@@ -1802,11 +1932,38 @@ class StoreService {
   ): Promise<{ order: Order; synced: boolean; error?: string }> {
     const order = this.createOrder(orderInput, false);
     const res = await this.persistOrderToFirestore(order);
+    this.dispatchOrderPushNotification(order, 'NEW_ORDER');
     return {
       order: this.getOrderById(order.id) || order,
       synced: res.success,
       error: res.error,
     };
+  }
+
+  /**
+   * Dispatches background Web Push notifications restricted to ONLY the 2 authorized events:
+   * Event A: 'NEW_ORDER' (Arrival of a new order)
+   * Event B: 'DELIVERY_CONFIRMED' (Delivery completion confirmed by driver)
+   * Respects independent configuration toggles and prevents intermediate operational spam.
+   */
+  public dispatchOrderPushNotification(order: Order, event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED'): void {
+    if (typeof window === 'undefined' || !order || !order.id) return;
+    const cfg = this.getRestaurantConfig();
+
+    if (event === 'NEW_ORDER' && cfg.notifyNewOrders === false) {
+      return;
+    }
+    if (event === 'DELIVERY_CONFIRMED' && cfg.notifyDeliveryConfirmed === false) {
+      return;
+    }
+
+    fetch('/api/push/notify-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order, event }),
+    }).catch((err) => {
+      console.warn('[Web Push Dispatch Notice]:', err?.message || err);
+    });
   }
 
   // ==========================================
@@ -2148,6 +2305,11 @@ class StoreService {
     this.queueOrderForSync(order);
     this.persistOrderToFirestore(order).catch(() => {});
 
+    // Strictly restrict delivery notification: ONLY when order is confirmed as ENTREGUE (Event B)
+    if (newStatus === 'ENTREGUE') {
+      this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
+    }
+
     return order;
   }
 
@@ -2160,6 +2322,9 @@ class StoreService {
     const order = this.updateOrderStatus(orderId, newStatus, author, notes);
     if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
     const res = await this.persistOrderToFirestore(order);
+    if (newStatus === 'ENTREGUE') {
+      this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
+    }
     return { order, synced: res.success, error: res.error };
   }
 
@@ -2230,22 +2395,71 @@ class StoreService {
     return { order, synced: res.success, error: res.error };
   }
 
-  public assignDeliveryPerson(orderId: string, deliveryPerson: { id: string; name: string; phone: string }): Order | null {
+  public assignDeliveryPerson(
+    orderId: string, 
+    deliveryPerson: { id: string; name: string; phone: string } | null,
+    assignedBy = 'Administração'
+  ): Order | null {
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
     if (!order) return null;
 
+    const previousDriverId = order.deliveryPersonId || order.deliveryPerson?.id;
+    const previousDriverName = order.deliveryPersonName || order.deliveryPerson?.name;
+
+    if (!deliveryPerson) {
+      order.deliveryPersonId = undefined;
+      order.deliveryPersonName = undefined;
+      order.deliveryPerson = undefined;
+      order.updatedAt = new Date().toISOString();
+
+      if (!order.deliveryAssignmentHistory) {
+        order.deliveryAssignmentHistory = [];
+      }
+      order.deliveryAssignmentHistory.push({
+        assignedAt: new Date().toISOString(),
+        previousDriverId,
+        previousDriverName,
+        newDriverId: undefined,
+        newDriverName: undefined,
+        assignedBy,
+      });
+
+      localStorage.setItem('gf_orders', JSON.stringify(orders));
+      this.notify('ORDER_UPDATED', order);
+      this.persistOrderToFirestore(order).catch(() => {});
+      return order;
+    }
+
+    order.deliveryPersonId = deliveryPerson.id;
+    order.deliveryPersonName = deliveryPerson.name;
     order.deliveryPerson = {
-      ...deliveryPerson,
-      assignedAt: new Date().toISOString(),
+      id: deliveryPerson.id,
+      name: deliveryPerson.name,
+      phone: deliveryPerson.phone,
     };
     order.updatedAt = new Date().toISOString();
+
+    if (!order.deliveryAssignmentHistory) {
+      order.deliveryAssignmentHistory = [];
+    }
+    order.deliveryAssignmentHistory.push({
+      assignedAt: new Date().toISOString(),
+      previousDriverId,
+      previousDriverName,
+      newDriverId: deliveryPerson.id,
+      newDriverName: deliveryPerson.name,
+      assignedBy,
+    });
+
     order.movements.push({
       id: `mov-${Date.now()}`,
       timestamp: new Date().toISOString(),
       toStatus: order.status,
-      author: deliveryPerson.name,
-      notes: `Atribuído ao entregador ${deliveryPerson.name}`,
+      author: assignedBy,
+      notes: previousDriverName
+        ? `Reatribuído de ${previousDriverName} para ${deliveryPerson.name} por ${assignedBy}`
+        : `Atribuído ao entregador ${deliveryPerson.name} por ${assignedBy}`,
     });
     order._cloudSyncStatus = 'PENDING';
 

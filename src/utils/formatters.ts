@@ -119,6 +119,8 @@ export function getPaymentMethodLabel(method: PaymentMethod): string {
       return 'Cartão de Débito';
     case 'DINHEIRO':
       return 'Dinheiro';
+    case 'MISTO':
+      return 'Pagamento Misto';
     default:
       return method;
   }

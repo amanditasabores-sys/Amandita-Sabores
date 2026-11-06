@@ -23,18 +23,53 @@ import {
   FileText,
   X
 } from 'lucide-react';
+import { User } from '../../types';
 import { ConfirmModal } from '../common/ConfirmModal';
 
 interface LiveOrdersKanbanProps {
   orders: Order[];
   onOrderUpdated: () => void;
+  currentUser?: User | null;
 }
 
-export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOrderUpdated }) => {
+export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOrderUpdated, currentUser }) => {
   const [selectedOrderForModal, setSelectedOrderForModal] = useState<Order | null>(null);
   const [orderToDelete, setOrderToDelete] = useState<Order | null>(null);
   const [printableOrder, setPrintableOrder] = useState<Order | null>(null);
   const [receiptQrCode, setReceiptQrCode] = useState<string>('');
+  const [users, setUsers] = useState<User[]>(() => store.getUsers());
+
+  React.useEffect(() => {
+    const handleState = () => setUsers(store.getUsers());
+    window.addEventListener('gestaofood_state_changed', handleState);
+    return () => window.removeEventListener('gestaofood_state_changed', handleState);
+  }, []);
+
+  const activeDrivers = users.filter((u) => u.role === 'ENTREGADOR' && u.status === 'ATIVO');
+
+  const handleReassignDriver = (orderId: string, driverId: string) => {
+    const adminName = currentUser?.name || currentUser?.username || 'Administrador';
+    if (!driverId) {
+      store.assignDeliveryPerson(orderId, null, adminName);
+    } else {
+      const driver = activeDrivers.find((d) => d.id === driverId);
+      if (driver) {
+        store.assignDeliveryPerson(
+          orderId,
+          {
+            id: driver.id,
+            name: driver.name || driver.username,
+            phone: driver.phone || '',
+          },
+          adminName
+        );
+      }
+    }
+    onOrderUpdated();
+    if (selectedOrderForModal && selectedOrderForModal.id === orderId) {
+      setSelectedOrderForModal(store.getOrderById(orderId) || null);
+    }
+  };
 
   const config = store.getRestaurantConfig();
 
@@ -222,6 +257,21 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                               : order.customer.address?.neighborhood || 'Entrega'}
                           </span>
                         </p>
+
+                        {order.fulfillmentType === 'DELIVERY' && (
+                          <div className="mt-1 flex items-center gap-1 text-[10px]">
+                            <Bike className="w-3 h-3 text-indigo-600 shrink-0" />
+                            {order.deliveryPersonName || order.deliveryPerson?.name ? (
+                              <span className="font-semibold text-indigo-700 truncate">
+                                {order.deliveryPersonName || order.deliveryPerson?.name}
+                              </span>
+                            ) : (
+                              <span className="font-bold text-amber-700 bg-amber-50 px-1.5 py-0.2 rounded border border-amber-200">
+                                Aguardando Atribuição
+                              </span>
+                            )}
+                          </div>
+                        )}
 
                         {/* Items preview */}
                         <div className="my-2 py-1.5 border-y border-slate-100 text-[11px] text-slate-600 space-y-0.5">
@@ -469,6 +519,90 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                   {selectedOrderForModal.paymentChangeFor ? ` · Troco p/ ${formatCurrency(selectedOrderForModal.paymentChangeFor)}` : ''}
                 </span>
               </div>
+            </div>
+
+            {/* Delivery Assignment & Reassignment (Exclusively for Delivery fulfillment) */}
+            {selectedOrderForModal.fulfillmentType === 'DELIVERY' && (
+              <div className="p-3 bg-indigo-50/70 rounded-xl border border-indigo-100 text-xs space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-indigo-950 flex items-center gap-1.5">
+                    <Bike className="w-4 h-4 text-indigo-600" />
+                    <span>Entregador Responsável</span>
+                  </span>
+                  {selectedOrderForModal.deliveryPersonName || selectedOrderForModal.deliveryPerson?.name ? (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
+                      {selectedOrderForModal.deliveryPersonName || selectedOrderForModal.deliveryPerson?.name}
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                      Aguardando Atribuição
+                    </span>
+                  )}
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-semibold text-slate-700">
+                    Reatribuir a outro entregador ativo:
+                  </label>
+                  <select
+                    value={selectedOrderForModal.deliveryPersonId || selectedOrderForModal.deliveryPerson?.id || ''}
+                    onChange={(e) => handleReassignDriver(selectedOrderForModal.id, e.target.value)}
+                    className="w-full px-2.5 py-2 bg-white border border-slate-300 rounded-lg text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="">Aguardando Atribuição (Nenhum entregador)</option>
+                    {activeDrivers.map((driver) => (
+                      <option key={driver.id} value={driver.id}>
+                        {driver.name || driver.username} {driver.phone ? `(${driver.phone})` : ''} — Ativo
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Assignment History Log */}
+                {selectedOrderForModal.deliveryAssignmentHistory && selectedOrderForModal.deliveryAssignmentHistory.length > 0 && (
+                  <div className="pt-2 border-t border-indigo-100 space-y-1">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-800 block">
+                      Histórico de Atribuições:
+                    </span>
+                    <div className="space-y-1 max-h-24 overflow-y-auto pr-1">
+                      {selectedOrderForModal.deliveryAssignmentHistory.map((rec, idx) => (
+                        <div key={idx} className="text-[10px] text-slate-600 bg-white/80 p-1.5 rounded border border-indigo-100 flex items-start justify-between">
+                          <div>
+                            <span className="font-semibold text-slate-800">
+                              {rec.newDriverName ? `Atribuído a: ${rec.newDriverName}` : 'Desatribuído'}
+                            </span>
+                            {rec.previousDriverName && (
+                              <span className="text-slate-400 block text-[9px]">
+                                Anterior: {rec.previousDriverName}
+                              </span>
+                            )}
+                            <span className="text-[9px] text-slate-500 block">
+                              Por: {rec.assignedBy}
+                            </span>
+                          </div>
+                          <span className="text-[9px] text-slate-400 font-mono">
+                            {formatDateTime(rec.assignedAt)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Audit & Responsibility: Separation of creator / attendant from driver */}
+            <div className="px-3 py-2 bg-slate-50 rounded-xl text-[10px] text-slate-500 flex flex-wrap justify-between gap-2 border border-slate-200/60">
+              <div>
+                <span>Criado por: </span>
+                <strong className="text-slate-700">{selectedOrderForModal.createdBy || 'Sistema (Cardápio Online)'}</strong>
+              </div>
+              {selectedOrderForModal.processedBy && (
+                <div>
+                  <span>Atendente/Caixa: </span>
+                  <strong className="text-slate-700">{selectedOrderForModal.processedBy}</strong>
+                </div>
+              )}
             </div>
 
             {/* Advance Status Controls */}

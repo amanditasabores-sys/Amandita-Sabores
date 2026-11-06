@@ -33,7 +33,8 @@ import {
   X,
   Bell,
   Volume2,
-  VolumeX
+  VolumeX,
+  Bike
 } from 'lucide-react';
 import { FirebaseStatusModal } from './FirebaseStatusModal';
 import { PrinterSettings } from './PrinterSettings';
@@ -48,8 +49,18 @@ interface StoreSettingsProps {
 
 export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNavigateToPdv }) => {
   const [config, setConfig] = useState<RestaurantConfig>(() => store.getRestaurantConfig());
+  const [users, setUsers] = useState<User[]>(() => store.getUsers());
   const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
   const [isSaved, setIsSaved] = useState(false);
+
+  useEffect(() => {
+    const handleStateChange = () => {
+      setUsers(store.getUsers());
+      setConfig(store.getRestaurantConfig());
+    };
+    window.addEventListener('gestaofood_state_changed', handleStateChange);
+    return () => window.removeEventListener('gestaofood_state_changed', handleStateChange);
+  }, []);
 
   // Firebase Live Test
   const [isTestingFirebase, setIsTestingFirebase] = useState(false);
@@ -597,6 +608,31 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 Texto exibido no final de cada comprovante impresso (térmico e visual). Se deixado em branco, a linha do rodapé não será impressa.
               </span>
             </div>
+
+            {/* ENTREGADOR RESPONSÁVEL PELAS ENTREGAS (ENTREGADOR FIXO) */}
+            <div className="pt-3 border-t border-slate-100 space-y-1.5">
+              <label className="block text-xs font-bold text-slate-700 mb-1 flex items-center gap-1.5">
+                <Bike className="w-4 h-4 text-amber-600" />
+                <span>Entregador responsável pelas entregas (Automático)</span>
+              </label>
+              <select
+                value={config.defaultDeliveryPersonId || ''}
+                onChange={(e) => setConfig({ ...config, defaultDeliveryPersonId: e.target.value })}
+                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+              >
+                <option value="">Nenhum (Novos pedidos ficam "Aguardando Atribuição")</option>
+                {users
+                  .filter((u) => u.role === 'ENTREGADOR' && u.status === 'ATIVO')
+                  .map((driver) => (
+                    <option key={driver.id} value={driver.id}>
+                      {driver.name || driver.username} {driver.phone ? `(${driver.phone})` : ''} — Ativo
+                    </option>
+                  ))}
+              </select>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Todas as novas entregas serão atribuídas automaticamente a este entregador. Apenas entregadores <strong>ATIVOS</strong> são listados. O administrador <strong>nunca</strong> é vinculado como entregador. Se desativado ou nenhum for selecionado, o pedido aguarda atribuição manual no Kanban.
+              </p>
+            </div>
           </div>
         </div>
 
@@ -783,6 +819,52 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
             </button>
           </div>
         )}
+
+        {/* SELETORES DE EVENTOS DE NOTIFICAÇÃO PUSH (RESTRIÇÃO EXCLUSIVA A 2 EVENTOS) */}
+        <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-3">
+          <div className="flex items-center gap-2 pb-2 border-b border-slate-200/80">
+            <Bell className="w-4 h-4 text-amber-600" />
+            <h4 className="text-xs font-bold text-slate-800">Eventos de Notificação Push Automática</h4>
+          </div>
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            Configure quais eventos disparam notificações push em segundo plano. As notificações são restritas a estes 2 eventos essenciais, sem alertas intermediários de cozinha ou preparo:
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <label className="flex items-start gap-2.5 p-3 bg-white rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition">
+              <input
+                type="checkbox"
+                checked={config.notifyNewOrders !== false}
+                onChange={(e) => setConfig({ ...config, notifyNewOrders: e.target.checked })}
+                className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+              />
+              <div>
+                <span className="text-xs font-bold text-slate-800 block">
+                  Notificar chegada de novos pedidos
+                </span>
+                <span className="text-[10px] text-slate-500 block leading-tight mt-0.5">
+                  Alerta sonoro e push com número e valor quando um pedido é criado pelo cardápio ou PDV.
+                </span>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-2.5 p-3 bg-white rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition">
+              <input
+                type="checkbox"
+                checked={config.notifyDeliveryConfirmed !== false}
+                onChange={(e) => setConfig({ ...config, notifyDeliveryConfirmed: e.target.checked })}
+                className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+              />
+              <div>
+                <span className="text-xs font-bold text-slate-800 block">
+                  Notificar confirmação de entrega
+                </span>
+                <span className="text-[10px] text-slate-500 block leading-tight mt-0.5">
+                  Notificação push quando o status da entrega for alterado para ENTREGUE.
+                </span>
+              </div>
+            </label>
+          </div>
+        </div>
 
         {/* CONTROLE DE VOLUME DO SOM DAS NOTIFICAÇÕES DE NOVOS PEDIDOS */}
         <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/80 space-y-3">

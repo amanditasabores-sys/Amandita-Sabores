@@ -9,7 +9,7 @@
  */
 
 import { Order, CustomerAddress } from '../types';
-import { formatCurrency, formatDateTime } from '../utils/formatters';
+import { formatCurrency, formatDateTime, getPaymentMethodLabel } from '../utils/formatters';
 
 export type PrinterPaperWidth = '58mm' | '80mm';
 export type PrinterConnectionMode = 'bluetooth_ble' | 'android_rawbt' | 'system_print';
@@ -734,10 +734,28 @@ class ThermalPrinterService {
     lines.push(this.formatLine('TOTAL:', formatCurrency(order.totalAmount)));
     lines.push(separator);
 
-    // FORMA DE PAGAMENTO E SITUAÇÃO
-    lines.push(`FORMA: ${this.sanitizeText(order.paymentMethod)}`);
-    if (order.paymentChangeFor) {
-      lines.push(`TROCO PARA: ${formatCurrency(order.paymentChangeFor)}`);
+    // FORMA DE PAGAMENTO E DETALHAMENTO FINANCEIRO
+    lines.push(`FORMA: ${this.sanitizeText(getPaymentMethodLabel(order.paymentMethod))}`);
+
+    if (order.paymentMethod === 'DINHEIRO') {
+      const received = order.cashReceived !== undefined 
+        ? order.cashReceived 
+        : (order.paymentChangeFor !== undefined ? order.paymentChangeFor : order.totalAmount);
+      const change = order.changeAmount !== undefined
+        ? order.changeAmount
+        : (received > order.totalAmount ? received - order.totalAmount : 0);
+
+      lines.push(this.formatLine('RECEBIDO:', formatCurrency(received)));
+      lines.push(this.formatLine('TROCO:', formatCurrency(change)));
+    } else if (order.paymentMethod === 'MISTO' && order.paymentSplits && order.paymentSplits.length > 0) {
+      lines.push('DETALHAMENTO DO PAGAMENTO:');
+      for (const split of order.paymentSplits) {
+        lines.push(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatCurrency(split.amount)));
+        if (split.method === 'DINHEIRO' && split.cashReceived !== undefined) {
+          lines.push(this.formatLine('  RECEBIDO:', formatCurrency(split.cashReceived)));
+          lines.push(this.formatLine('  TROCO:', formatCurrency(split.change || 0)));
+        }
+      }
     }
 
     const situacao = order.paymentStatus === 'PAGO'
@@ -908,10 +926,28 @@ class ThermalPrinterService {
     append(GS, 0x21, 0x00); // Normal
     append(ESC, 0x45, 0x00); // Bold OFF
 
-    appendLine('--------------------------------');
-    appendLine(`FORMA: ${this.sanitizeText(order.paymentMethod)}`);
-    if (order.paymentChangeFor) {
-      appendLine(`TROCO PARA: ${formatCurrency(order.paymentChangeFor)}`);
+    appendLine(this.config.paperWidth === '80mm' ? '------------------------------------------------' : '--------------------------------');
+    appendLine(`FORMA: ${this.sanitizeText(getPaymentMethodLabel(order.paymentMethod))}`);
+
+    if (order.paymentMethod === 'DINHEIRO') {
+      const received = order.cashReceived !== undefined 
+        ? order.cashReceived 
+        : (order.paymentChangeFor !== undefined ? order.paymentChangeFor : order.totalAmount);
+      const change = order.changeAmount !== undefined
+        ? order.changeAmount
+        : (received > order.totalAmount ? received - order.totalAmount : 0);
+
+      appendLine(this.formatLine('RECEBIDO:', formatCurrency(received)));
+      appendLine(this.formatLine('TROCO:', formatCurrency(change)));
+    } else if (order.paymentMethod === 'MISTO' && order.paymentSplits && order.paymentSplits.length > 0) {
+      appendLine('DETALHAMENTO DO PAGAMENTO:');
+      for (const split of order.paymentSplits) {
+        appendLine(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatCurrency(split.amount)));
+        if (split.method === 'DINHEIRO' && split.cashReceived !== undefined) {
+          appendLine(this.formatLine('  RECEBIDO:', formatCurrency(split.cashReceived)));
+          appendLine(this.formatLine('  TROCO:', formatCurrency(split.change || 0)));
+        }
+      }
     }
 
     append(ESC, 0x45, 0x01); // Bold ON

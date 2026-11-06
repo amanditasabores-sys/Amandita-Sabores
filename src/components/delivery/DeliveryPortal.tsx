@@ -16,7 +16,10 @@ import {
   X,
   UserCheck,
   RotateCcw,
-  LogOut
+  LogOut,
+  ArrowLeft,
+  Shield,
+  ShieldCheck
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { User } from '../../types';
@@ -25,14 +28,19 @@ import { AmanditaLogo } from '../common/AmanditaLogo';
 interface DeliveryPortalProps {
   initialOrderId?: string;
   currentUser?: User | null;
+  adminUser?: User | null;
   onLogout?: () => void;
+  onBackToAdmin?: () => void;
 }
 
 export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({ 
   initialOrderId, 
   currentUser,
-  onLogout
+  adminUser,
+  onLogout,
+  onBackToAdmin
 }) => {
+  const isSupervisor = Boolean(adminUser || currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE');
   const isDriverRole = currentUser?.role === 'ENTREGADOR';
 
   const [driverName, setDriverName] = useState(() => {
@@ -281,18 +289,42 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
             <div className="min-w-0">
               <h1 className="text-xs sm:text-sm font-bold tracking-tight text-white flex items-center gap-1.5 truncate">
                 <span className="truncate">Portal do Entregador</span>
-                <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono shrink-0">ONLINE</span>
+                {isSupervisor && !isDriverRole ? (
+                  <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 text-[10px] font-mono shrink-0 border border-blue-500/40">SUPERVISÃO</span>
+                ) : (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono shrink-0">ONLINE</span>
+                )}
               </h1>
               <p className="text-[11px] sm:text-xs text-slate-400 flex items-center gap-1 truncate">
-                <span className="truncate text-slate-300 font-medium">{driverName}</span>
-                {currentUser?.role ? (
-                  <span className="text-slate-500 text-[10px]">({currentUser.role})</span>
-                ) : null}
+                {isSupervisor && !isDriverRole ? (
+                  <span className="truncate text-amber-200 font-medium">
+                    Supervisão: {adminUser?.name || currentUser?.name || 'Administrador'}
+                  </span>
+                ) : (
+                  <>
+                    <span className="truncate text-slate-300 font-medium">{driverName}</span>
+                    {currentUser?.role ? (
+                      <span className="text-slate-500 text-[10px]">({currentUser.role})</span>
+                    ) : null}
+                  </>
+                )}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {/* Exclusive Administrator Return Button */}
+            {onBackToAdmin && (
+              <button
+                onClick={onBackToAdmin}
+                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 sm:py-2 bg-gradient-to-r from-[#C86D3B] to-[#721C24] hover:opacity-95 text-white rounded-xl text-xs font-bold transition shadow-md shadow-[#C86D3B]/20 cursor-pointer"
+                title="Retornar à Administração sem deslogar"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>Voltar à Administração</span>
+              </button>
+            )}
+
             <button
               onClick={() => {
                 if (isScannerOpen) {
@@ -321,6 +353,29 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
           </div>
         </div>
       </header>
+
+      {/* Supervisor Mode Banner */}
+      {isSupervisor && !isDriverRole && (
+        <div className="max-w-xl mx-auto px-4 pt-3">
+          <div className="p-3 bg-gradient-to-r from-amber-500/15 to-orange-500/10 border border-amber-500/30 rounded-2xl flex items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 text-amber-200">
+              <Shield className="w-4 h-4 text-amber-400 shrink-0" />
+              <div>
+                <span className="font-bold text-amber-300">Modo Supervisão Administrativa:</span>
+                <span className="text-slate-300 block text-[11px]">Você está consultando o fluxo de entregas em tempo real sem ser vinculado como entregador.</span>
+              </div>
+            </div>
+            {onBackToAdmin && (
+              <button
+                onClick={onBackToAdmin}
+                className="shrink-0 px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black rounded-lg text-[11px] transition cursor-pointer"
+              >
+                Voltar
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Driver Shift Summary stats */}
       <div className="max-w-xl mx-auto px-4 pt-4">
@@ -610,25 +665,43 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
               {/* Main Driver Status Action Buttons */}
               <div className="space-y-2 pt-2">
-                {activeOrder.status !== 'EM_ROTA' && activeOrder.status !== 'ENTREGUE' && (
-                  <button
-                    onClick={handleStartDelivery}
-                    className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
-                  >
-                    <Bike className="w-5 h-5" />
-                    <span>Retirar Pedido e Iniciar Rota</span>
-                  </button>
-                )}
+                {isSupervisor && !isDriverRole ? (
+                  <div className="p-3 bg-slate-800/80 border border-slate-700 rounded-xl space-y-2">
+                    <div className="flex items-center gap-2 text-amber-300 text-xs font-bold">
+                      <ShieldCheck className="w-4 h-4 text-amber-400" />
+                      <span>Modo Visualização Administrativa</span>
+                    </div>
+                    <p className="text-xs text-slate-300">
+                      Entregador vinculado ao pedido: <strong className="text-white">{activeOrder.deliveryPersonName || activeOrder.deliveryPerson?.name || 'Aguardando Atribuição'}</strong>.
+                    </p>
+                    <p className="text-[11px] text-slate-400">
+                      A transição operacional de rota e encerramento de entrega pertence ao entregador em campo ou à gestão de pedidos na administração.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    {activeOrder.status !== 'EM_ROTA' && activeOrder.status !== 'ENTREGUE' && (
+                      <button
+                        onClick={handleStartDelivery}
+                        className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Bike className="w-5 h-5" />
+                        <span>Retirar Pedido e Iniciar Rota</span>
+                      </button>
+                    )}
 
-                {activeOrder.status === 'EM_ROTA' && (
-                  <button
-                    onClick={handleCompleteDelivery}
-                    className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
-                  >
-                    <CheckCircle className="w-5 h-5" />
-                    <span>Confirmar Entrega Concluída</span>
-                  </button>
+                    {activeOrder.status === 'EM_ROTA' && (
+                      <button
+                        onClick={handleCompleteDelivery}
+                        className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <CheckCircle className="w-5 h-5" />
+                        <span>Confirmar Entrega Concluída</span>
+                      </button>
+                    )}
+                  </>
                 )}
+              </div>
 
                 {activeOrder.status === 'ENTREGUE' && (
                   <div className="p-4 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-center space-y-2">
@@ -655,7 +728,6 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                 )}
               </div>
             </div>
-          </div>
         ) : (
           /* NO ORDER SELECTED: SHOW TABBED LIST (PENDING OR COMPLETED) */
           <div className="space-y-4">

@@ -10,7 +10,8 @@ export type PaymentMethod =
   | 'PIX' 
   | 'CARTAO_CREDITO' 
   | 'CARTAO_DEBITO' 
-  | 'DINHEIRO';
+  | 'DINHEIRO'
+  | 'MISTO';
 
 export type UserRole = 
   | 'ADMINISTRADOR' 
@@ -178,11 +179,18 @@ export interface Order {
   discount: number;
   totalAmount: number;
   paymentMethod: PaymentMethod;
-  paymentChangeFor?: number; // Para quanto é o troco
+  paymentChangeFor?: number; // Para quanto é o troco (valor entregue pelo cliente)
+  cashReceived?: number; // Valor em dinheiro recebido efetivamente
+  changeAmount?: number; // Troco devolvido ao cliente
+  paymentSplits?: OrderPaymentSplit[]; // Detalhamento quando houver pagamento misto
   paymentStatus: 'PENDENTE' | 'PAGO';
   pixCode?: string; // Código PIX Copia e Cola gerado
   pixQrCodeUrl?: string; // Imagem do QR Code PIX
   status: OrderStatus;
+  createdBy?: string; // Identificador/nome do usuário que criou o pedido
+  processedBy?: string; // Usuário que processou a venda no PDV/caixa
+  deliveryPersonId?: string; // Identificador do entregador responsável
+  deliveryPersonName?: string; // Nome do entregador responsável
   deliveryPerson?: {
     id: string;
     name: string;
@@ -190,12 +198,29 @@ export interface Order {
     assignedAt?: string;
     deliveredAt?: string;
   };
+  deliveryAssignmentHistory?: DeliveryAssignmentRecord[]; // Histórico completo de atribuições e trocas
   operatorName?: string;
   cancellationReason?: string;
   cancelledBy?: string;
   movements: OrderMovementLog[];
   trackingCode?: string; // Código de alta entropia para rastreamento seguro público
   _cloudSyncStatus?: 'SYNCED' | 'PENDING' | 'ERROR';
+}
+
+export interface OrderPaymentSplit {
+  method: PaymentMethod;
+  amount: number;
+  cashReceived?: number;
+  change?: number;
+}
+
+export interface DeliveryAssignmentRecord {
+  assignedAt: string;
+  previousDriverId?: string;
+  previousDriverName?: string;
+  newDriverId?: string;
+  newDriverName?: string;
+  assignedBy: string; // Usuário administrativo responsável pela alteração
 }
 
 export interface PublicOrderTracking {
@@ -244,6 +269,11 @@ export interface RestaurantConfig {
   customPublicUrl?: string; // Optional override for shared URL
   receiptFooterText?: string; // Texto configurável do rodapé do cupom térmico (ex: @nomedoperfil)
   dailyMenu?: DailyMenuConfig; // Configuração do cardápio do dia publicado
+  // Configurações independentes de Notificações Push (restritas exclusivamente a 2 eventos)
+  notifyNewOrders?: boolean; // [ ] Notificar chegada de novos pedidos (padrão true)
+  notifyDeliveryConfirmed?: boolean; // [ ] Notificar confirmação de entrega (padrão true)
+  // Entregador fixo responsável pelas novas entregas (sem rodízio)
+  defaultDeliveryPersonId?: string; // ID do entregador ativo selecionado pela administração
 }
 
 export type CashMovementType = 'SANGRIA' | 'VALE' | 'SUPRIMENTO' | 'VENDA' | 'AJUSTE';

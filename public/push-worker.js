@@ -1,5 +1,13 @@
 // Web Push Background Event Listener for Amandita Sabores
 // Receives push events when the device/browser is in background or closed
+self.addEventListener('install', function (event) {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', function (event) {
+  event.waitUntil(self.clients.claim());
+});
+
 self.addEventListener('push', function (event) {
   if (!event.data) return;
 
@@ -7,29 +15,36 @@ self.addEventListener('push', function (event) {
   try {
     payload = event.data.json();
   } catch (err) {
-    payload = { title: 'Novo Pedido Recebido!', body: event.data.text() };
+    payload = { title: 'Notificação Amandita Sabores', body: event.data.text() };
   }
 
-  const title = payload.title || 'Amandita Sabores - Novo Pedido!';
+  const isDelivery = payload.event === 'DELIVERY_CONFIRMED';
+  const title = payload.title || (isDelivery ? 'Entrega Concluída!' : 'Amandita Sabores - Novo Pedido!');
   const options = {
-    body: payload.body || 'Um novo pedido acabou de entrar no sistema.',
+    body: payload.body || (isDelivery ? 'O pedido foi entregue com sucesso.' : 'Um novo pedido acabou de entrar no sistema.'),
     icon: payload.icon || '/pwa-192x192.png',
     badge: payload.badge || '/favicon-32x32.png',
-    vibrate: [300, 100, 300, 100, 300],
-    tag: payload.tag || ('order-' + (payload.orderId || Date.now())),
+    vibrate: isDelivery ? [200, 100, 200] : [300, 100, 300, 100, 300],
+    tag: payload.tag || ((isDelivery ? 'deliv-' : 'order-') + (payload.orderId || Date.now())),
     renotify: true,
     requireInteraction: true, // Mantém notificação visível na tela de bloqueio até interação
     silent: false,
     timestamp: payload.timestamp || Date.now(),
     data: {
-      url: payload.url || '/?view=producao',
+      url: payload.url || (isDelivery ? '/?view=admin' : '/?view=producao'),
       orderId: payload.orderId || '',
+      event: payload.event || 'NEW_ORDER',
       timestamp: payload.timestamp || Date.now()
     },
-    actions: [
-      { action: 'open_kds', title: 'Ver na Cozinha' },
-      { action: 'close', title: 'Dispensar' }
-    ]
+    actions: isDelivery
+      ? [
+          { action: 'open_orders', title: 'Ver Pedidos' },
+          { action: 'close', title: 'Dispensar' }
+        ]
+      : [
+          { action: 'open_kds', title: 'Ver na Cozinha' },
+          { action: 'close', title: 'Dispensar' }
+        ]
   };
 
   event.waitUntil(self.registration.showNotification(title, options));

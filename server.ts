@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import webpush from 'web-push';
@@ -218,6 +219,37 @@ function jsonToFirestoreDocument(obj: Record<string, unknown>): Record<string, u
   return { fields };
 }
 
+function fromFirestoreValue(val: any): any {
+  if (!val || typeof val !== 'object') return val;
+  if ('stringValue' in val) return val.stringValue;
+  if ('booleanValue' in val) return val.booleanValue;
+  if ('integerValue' in val) return parseInt(val.integerValue, 10);
+  if ('doubleValue' in val) return parseFloat(val.doubleValue);
+  if ('nullValue' in val) return null;
+  if ('arrayValue' in val) {
+    const list = val.arrayValue?.values || [];
+    return list.map(fromFirestoreValue);
+  }
+  if ('mapValue' in val) {
+    const res: Record<string, any> = {};
+    const fields = val.mapValue?.fields || {};
+    for (const [k, v] of Object.entries(fields)) {
+      res[k] = fromFirestoreValue(v);
+    }
+    return res;
+  }
+  return null;
+}
+
+function firestoreDocumentToJson(doc: any): any {
+  if (!doc || !doc.fields) return null;
+  const res: Record<string, any> = {};
+  for (const [k, v] of Object.entries(doc.fields)) {
+    res[k] = fromFirestoreValue(v);
+  }
+  return res;
+}
+
 // ---------------------------------------------------------------------------
 // Helper: Cloud Firestore Persistent Push Subscriptions (Vercel Multi-Worker Safe)
 // ---------------------------------------------------------------------------
@@ -391,15 +423,113 @@ async function deletePushSubscription(endpoint: string): Promise<void> {
   } catch {}
 }
 
-async function sendOrderPushNotification(order: any) {
-  if (!order || !order.id || sentNotificationOrderIds.has(order.id)) {
-    return; // Prevent duplicate notifications
+// ---------------------------------------------------------------------------
+// Persistent Push Dispatch Idempotency (Cross-Instance / Multi-Worker Safe)
+// Prevents duplicate notifications for the same order and event across Vercel serverless containers
+// ---------------------------------------------------------------------------
+const DISPATCHES_CACHE_FILE = path.join(process.cwd(), '.push_dispatches_cache.json');
+let pushDispatchesCache: Set<string> = new Set();
+try {
+  if (fs.existsSync(DISPATCHES_CACHE_FILE)) {
+    const raw = fs.readFileSync(DISPATCHES_CACHE_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      pushDispatchesCache = new Set(arr);
+    }
   }
-  sentNotificationOrderIds.add(order.id);
+} catch {}
 
+function saveDispatchesCacheFile() {
+  try {
+    fs.writeFileSync(DISPATCHES_CACHE_FILE, JSON.stringify(Array.from(pushDispatchesCache)), 'utf8');
+  } catch {}
+}
+
+async function isPushAlreadyDispatched(key: string): Promise<boolean> {
+  if (pushDispatchesCache.has(key)) return true;
+
+  if (adminDb) {
+    try {
+      const snap = await adminDb.collection('push_dispatches').doc(key).get();
+      if (snap.exists) {
+        pushDispatchesCache.add(key);
+        saveDispatchesCacheFile();
+        return true;
+      }
+    } catch {}
+  }
+
+  if (API_KEY && PROJECT_ID) {
+    try {
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+      const res = await fetch(`${baseUrl}/push_dispatches/${key}?key=${API_KEY}`);
+      if (res.ok) {
+        pushDispatchesCache.add(key);
+        saveDispatchesCacheFile();
+        return true;
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
+async function markPushDispatched(key: string, orderId: string, event: string): Promise<void> {
+  pushDispatchesCache.add(key);
+  saveDispatchesCacheFile();
+
+  const record = {
+    id: key,
+    orderId,
+    event,
+    dispatchedAt: new Date().toISOString(),
+  };
+
+  if (adminDb) {
+    try {
+      await adminDb.collection('push_dispatches').doc(key).set(record);
+      return;
+    } catch {}
+  }
+
+  if (API_KEY && PROJECT_ID) {
+    try {
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+      const docPayload = jsonToFirestoreDocument(record);
+      await fetch(`${baseUrl}/push_dispatches/${key}?key=${API_KEY}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(docPayload),
+      });
+    } catch {}
+  }
+}
+
+async function sendOrderPushNotification(order: any, event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' = 'NEW_ORDER') {
+  if (!order || !order.id) {
+    return;
+  }
+
+  // 1. Strictly restrict notifications to ONLY the two authorized business events
+  if (event !== 'NEW_ORDER' && event !== 'DELIVERY_CONFIRMED') {
+    return; // Operational steps (cozinha, preparo, pronto, balcão, etc.) NEVER trigger push
+  }
+
+  // 2. Persistent Cross-Instance Idempotency Lock
+  const idempotencyKey = `notif_${order.id}_${event}`;
+  const alreadySent = await isPushAlreadyDispatched(idempotencyKey);
+  if (alreadySent) {
+    console.info(`[Web Push Idempotency] Notificação '${event}' para pedido #${order.orderNumber} já enviada. Ignorando duplicata.`);
+    return;
+  }
+
+  // Mark immediately as dispatched to avoid race conditions between parallel workers
+  await markPushDispatched(idempotencyKey, order.id, event);
+
+  // 3. Retrieve subscriptions
   const allSubscriptions = await getAllPushSubscriptions();
   if (allSubscriptions.length === 0) {
-    console.info(`[Web Push] Pedido #${order.orderNumber} persistido no Firestore. Nenhuma inscrição push registrada para alerta.`);
+    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição push registrada para alerta.`);
     return;
   }
 
@@ -415,27 +545,46 @@ async function sendOrderPushNotification(order: any) {
     return;
   }
 
-  console.info(`[Web Push] Disparando alerta de novo pedido #${order.orderNumber} para ${staffSubscriptions.length} dispositivo(s) da equipe...`);
-
-  // Chronological integrity: respect order's real creation time so Android/iOS sorts correctly
+  // Chronological integrity: respect order's real creation or delivery time
   const orderTimestamp = order.createdAt ? new Date(order.createdAt).getTime() : Date.now();
 
+  let title = '';
+  let body = '';
+  let tag = '';
+  let targetUrl = '/?view=producao';
+
+  if (event === 'NEW_ORDER') {
+    title = `Novo Pedido #${order.orderNumber}!`;
+    body = `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`;
+    tag = `order-${order.id}`;
+    targetUrl = '/?view=producao';
+  } else {
+    // DELIVERY_CONFIRMED
+    const driverName = order.deliveryPersonName || order.deliveryPerson?.name || 'Entregador';
+    title = `Entrega Concluída! Pedido #${order.orderNumber}`;
+    body = `Entregador ${driverName} confirmou a entrega para ${order.customer?.name || 'Cliente'}.`;
+    tag = `delivery-${order.id}`;
+    targetUrl = '/?view=admin';
+  }
+
+  console.info(`[Web Push] Disparando alerta (${event}) pedido #${order.orderNumber} para ${staffSubscriptions.length} dispositivo(s) da equipe...`);
+
   const payload = JSON.stringify({
-    title: `Novo Pedido #${order.orderNumber}!`,
-    body: `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`,
+    title,
+    body,
     icon: '/pwa-192x192.png',
     badge: '/favicon-32x32.png',
-    tag: `order-${order.id}`,
+    tag,
     orderId: order.id,
     orderNumber: order.orderNumber,
-    url: '/?view=producao',
+    eventType: event,
+    url: targetUrl,
     timestamp: orderTimestamp,
   });
 
   const pushOptions = {
     TTL: 86400, // 24 horas de retenção nos gateways FCM/Apple
     urgency: 'high' as const, // Força acordar o dispositivo mesmo em modo Doze/economia de bateria no Android
-    topic: 'new-orders',
   };
 
   const deadEndpoints: string[] = [];
@@ -445,7 +594,7 @@ async function sendOrderPushNotification(order: any) {
     try {
       const res = await webpush.sendNotification(subData.subscription, payload, pushOptions);
       successfulDeliveries++;
-      console.log(`[Web Push] Alerta entregue ao gateway push (Status: ${res.statusCode || 201}) para dispositivo ${subData.role || 'staff'}`);
+      console.log(`[Web Push] Alerta (${event}) entregue ao gateway push (Status: ${res.statusCode || 201}) para dispositivo ${subData.role || 'staff'}`);
     } catch (err: any) {
       console.warn(`[Web Push] Falha ao enviar para endpoint (${err.statusCode || 'erro'}):`, err.message);
       if (err.statusCode === 404 || err.statusCode === 410) {
@@ -454,7 +603,7 @@ async function sendOrderPushNotification(order: any) {
     }
   }
 
-  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber}: ${successfulDeliveries}/${staffSubscriptions.length} entregas confirmadas.`);
+  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber} (${event}): ${successfulDeliveries}/${staffSubscriptions.length} entregas confirmadas.`);
 
   for (const endpoint of deadEndpoints) {
     await deletePushSubscription(endpoint);
@@ -710,19 +859,35 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
   // Background Push Trigger for Newly Ingested Orders (Called automatically on all orders)
   app.post(['/api/push/notify-order', '/push/notify-order'], async (req: Request, res: Response) => {
     try {
-      const { order } = req.body;
+      const { order, event } = req.body;
       if (!order || !order.id) {
         res.status(400).json({ success: false, message: 'Pedido ausente ou sem identificador.' });
         return;
       }
-      sendOrderPushNotification(order).catch((pushErr) => {
+      const eventType = (event === 'DELIVERY_CONFIRMED' ? 'DELIVERY_CONFIRMED' : 'NEW_ORDER');
+      sendOrderPushNotification(order, eventType).catch((pushErr) => {
         console.warn('[Web Push Notify-Order] Aviso ao despachar push:', pushErr?.message || pushErr);
       });
-      res.json({ success: true, message: 'Notificação push de novo pedido despachada com sucesso aos dispositivos da equipe.' });
+      res.json({ success: true, message: `Notificação push do evento ${eventType} despachada com sucesso aos dispositivos autorizados.` });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, message: msg });
     }
+  });
+
+  // Background Push Status and Diagnostic API
+  app.get(['/api/push/status', '/push/status'], async (_req: Request, res: Response) => {
+    const cfg = getVapidConfig();
+    const subs = await getAllPushSubscriptions();
+    res.json({
+      configured: cfg.isConfigured,
+      active: cfg.isProductionActive,
+      statusMessage: cfg.statusMessage,
+      publicKeyPreview: cfg.publicKey ? `${cfg.publicKey.substring(0, 12)}...` : null,
+      registeredDevicesCount: subs.length,
+      allowedEvents: ['NEW_ORDER', 'DELIVERY_CONFIRMED'],
+      timestamp: new Date().toISOString(),
+    });
   });
 
   // Background Push Diagnostic & Testing Endpoint
@@ -838,6 +1003,111 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, message: `Erro interno no backend: ${msg}` });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Cardápio do Dia: Sincronização em Nuvem Multi-Dispositivo
+  // Permite que a publicação feita pelo celular do administrador se propague
+  // instantaneamente para computadores, clientes e outros dispositivos.
+  // ---------------------------------------------------------------------------
+  let activeDailyMenuCache: any = null;
+  const DAILY_MENU_FILE = path.join(process.cwd(), '.daily_menu_cache.json');
+
+  try {
+    if (fs.existsSync(DAILY_MENU_FILE)) {
+      const raw = fs.readFileSync(DAILY_MENU_FILE, 'utf8');
+      activeDailyMenuCache = JSON.parse(raw);
+    }
+  } catch {}
+
+  app.get(['/api/daily-menu', '/daily-menu'], async (_req: Request, res: Response) => {
+    try {
+      if (activeDailyMenuCache && typeof activeDailyMenuCache.enabled === 'boolean') {
+        res.json({ success: true, dailyMenu: activeDailyMenuCache });
+        return;
+      }
+
+      if (adminDb) {
+        try {
+          const snap = await adminDb.collection('configs').doc('daily_menu').get();
+          if (snap.exists) {
+            activeDailyMenuCache = snap.data();
+            res.json({ success: true, dailyMenu: activeDailyMenuCache });
+            return;
+          }
+        } catch (dbErr) {
+          console.warn('[Daily Menu] Leitura via adminDb:', dbErr);
+        }
+      }
+
+      if (API_KEY && PROJECT_ID) {
+        try {
+          const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+          const restRes = await fetch(`${baseUrl}/configs/daily_menu?key=${API_KEY}`);
+          if (restRes.ok) {
+            const rawDoc = await restRes.json();
+            if (rawDoc && rawDoc.fields) {
+              activeDailyMenuCache = firestoreDocumentToJson(rawDoc);
+              res.json({ success: true, dailyMenu: activeDailyMenuCache });
+              return;
+            }
+          }
+        } catch {}
+      }
+
+      res.json({ success: true, dailyMenu: activeDailyMenuCache || null });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro ao recuperar cardápio do dia: ${msg}` });
+    }
+  });
+
+  app.post(['/api/daily-menu', '/daily-menu'], async (req: Request, res: Response) => {
+    try {
+      const config = req.body;
+      if (!config || typeof config !== 'object') {
+        res.status(400).json({ success: false, message: 'Configuração inválida.' });
+        return;
+      }
+
+      activeDailyMenuCache = {
+        enabled: Boolean(config.enabled),
+        selectedItemIds: Array.isArray(config.selectedItemIds) ? config.selectedItemIds : [],
+        selectedComboIds: Array.isArray(config.selectedComboIds) ? config.selectedComboIds : [],
+        draftItemIds: Array.isArray(config.draftItemIds) ? config.draftItemIds : [],
+        draftComboIds: Array.isArray(config.draftComboIds) ? config.draftComboIds : [],
+        publishedAt: config.publishedAt || new Date().toISOString(),
+        referenceDate: config.referenceDate || new Date().toISOString().split('T')[0],
+        updatedAt: new Date().toISOString(),
+      };
+
+      try {
+        fs.writeFileSync(DAILY_MENU_FILE, JSON.stringify(activeDailyMenuCache, null, 2), 'utf8');
+      } catch {}
+
+      if (adminDb) {
+        try {
+          await adminDb.collection('configs').doc('daily_menu').set(activeDailyMenuCache);
+        } catch (dbErr) {
+          console.warn('[Daily Menu] Persistência via adminDb:', dbErr);
+        }
+      } else if (API_KEY && PROJECT_ID) {
+        try {
+          const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+          const docPayload = jsonToFirestoreDocument(activeDailyMenuCache);
+          await fetch(`${baseUrl}/configs/daily_menu?key=${API_KEY}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(docPayload),
+          });
+        } catch {}
+      }
+
+      res.json({ success: true, message: 'Cardápio do dia sincronizado com sucesso!', dailyMenu: activeDailyMenuCache });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro ao salvar cardápio do dia: ${msg}` });
     }
   });
 

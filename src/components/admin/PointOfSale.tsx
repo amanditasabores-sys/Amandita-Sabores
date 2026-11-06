@@ -311,7 +311,11 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         discount: discountAmount,
         totalAmount,
         paymentMethod,
-        paymentChangeFor: paymentMethod === 'DINHEIRO' && cashTendered ? parseFloat(cashTendered) : undefined,
+        paymentChangeFor: paymentMethod === 'DINHEIRO' ? (parseFloat(cashTendered) || totalAmount) : undefined,
+        cashReceived: paymentMethod === 'DINHEIRO' ? (parseFloat(cashTendered) || totalAmount) : undefined,
+        changeAmount: paymentMethod === 'DINHEIRO' ? Math.max(0, (parseFloat(cashTendered) || totalAmount) - totalAmount) : undefined,
+        createdBy: operatorName || 'Operador PDV',
+        processedBy: operatorName || 'Operador PDV',
         paymentStatus: 'PAGO',
         status: 'EM_PREPARO', // Direct to kitchen
         estimatedDeliveryMinutes: fulfillmentType === 'RETIRADA' ? 15 : config.avgDeliveryTimeMinutes,

@@ -2,13 +2,19 @@ import React, { useState } from 'react';
 import { store } from '../../services/store';
 import { User } from '../../types';
 import { AmanditaLogo } from '../common/AmanditaLogo';
-import { Bike, Lock, User as UserIcon, AlertCircle, ArrowRight } from 'lucide-react';
+import { Bike, Lock, User as UserIcon, AlertCircle, ArrowRight, ArrowLeft } from 'lucide-react';
 
 interface DeliveryLoginScreenProps {
   onLoginSuccess: (user: User) => void;
+  adminUser?: User | null;
+  onBackToAdmin?: () => void;
 }
 
-export const DeliveryLoginScreen: React.FC<DeliveryLoginScreenProps> = ({ onLoginSuccess }) => {
+export const DeliveryLoginScreen: React.FC<DeliveryLoginScreenProps> = ({ 
+  onLoginSuccess,
+  adminUser,
+  onBackToAdmin 
+}) => {
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -64,6 +70,22 @@ export const DeliveryLoginScreen: React.FC<DeliveryLoginScreenProps> = ({ onLogi
   return (
     <div className="min-h-screen bg-gradient-to-b from-[#2C1810] via-[#1F100B] to-[#120805] flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-md bg-[#FFFDF9] rounded-3xl p-6 sm:p-8 shadow-2xl border border-[#E8DFD5] space-y-6 animate-in zoom-in-95 duration-200">
+        {onBackToAdmin && (
+          <div className="flex justify-between items-center pb-2 border-b border-[#E8DFD5]">
+            <button
+              type="button"
+              onClick={onBackToAdmin}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#FAF7F2] hover:bg-[#F3EDE2] text-[#8C5E47] hover:text-[#2C1810] border border-[#E8DFD5] rounded-xl text-xs font-bold transition cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Voltar à Administração</span>
+            </button>
+            <span className="text-[10px] text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+              Admin Conectado
+            </span>
+          </div>
+        )}
+
         {/* Header with Official Logo */}
         <div className="text-center space-y-3">
           <div className="flex justify-center">

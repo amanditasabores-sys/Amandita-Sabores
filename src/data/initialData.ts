@@ -422,6 +422,9 @@ export const INITIAL_CONFIG: RestaurantConfig = {
   avgDeliveryTimeMinutes: 25,
   isOpen: true,
   receiptFooterText: 'Instagram: @amanditasabores',
+  notifyNewOrders: true,
+  notifyDeliveryConfirmed: true,
+  defaultDeliveryPersonId: '',
 };
 
 export const INITIAL_USERS: User[] = [

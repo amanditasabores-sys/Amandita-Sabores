@@ -49,6 +49,21 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
   const [combos, setCombos] = useState<Combo[]>(() => store.getCombos());
   const [dailyConfig, setDailyConfig] = useState<DailyMenuConfig>(() => store.getDailyMenuConfig());
+  const [isInitialLoadingDailyMenu, setIsInitialLoadingDailyMenu] = useState<boolean>(() => !store.getDailyMenuConfig().enabled);
+
+  // Cross-device Daily Menu initial fetch
+  useEffect(() => {
+    let isMounted = true;
+    store.syncDailyMenuWithServer(true).finally(() => {
+      if (isMounted) {
+        setDailyConfig(store.getDailyMenuConfig());
+        setIsInitialLoadingDailyMenu(false);
+      }
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Placed order success state
   const [createdOrder, setCreatedOrder] = useState<Order | null>(null);
@@ -411,6 +426,9 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         totalAmount: cartTotal,
         paymentMethod,
         paymentChangeFor: paymentMethod === 'DINHEIRO' && paymentChangeFor ? parseFloat(paymentChangeFor) : undefined,
+        cashReceived: paymentMethod === 'DINHEIRO' ? (parseFloat(paymentChangeFor) || cartTotal) : undefined,
+        changeAmount: paymentMethod === 'DINHEIRO' ? Math.max(0, (parseFloat(paymentChangeFor) || cartTotal) - cartTotal) : undefined,
+        createdBy: customerName.trim() || 'Cliente Cardápio Web',
         paymentStatus: 'PENDENTE',
         status: 'NOVO',
       });
@@ -681,7 +699,19 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         </div>
       )}
 
-      {!isDailyMenuPublished ? (
+      {isInitialLoadingDailyMenu ? (
+        <div className="w-full max-w-lg mx-auto px-4 py-16 text-center animate-pulse">
+          <div className="bg-[#FFFDF9] rounded-3xl p-8 sm:p-10 border border-[#E8DFD5] shadow-sm space-y-4">
+            <div className="flex justify-center">
+              <AmanditaLogo variant="full" size="md" theme="light" />
+            </div>
+            <div className="flex items-center justify-center gap-2 text-xs font-bold text-[#8C5E47]">
+              <Sparkles className="w-4 h-4 text-[#C86D3B] animate-spin" />
+              <span>Sincronizando cardápio do dia...</span>
+            </div>
+          </div>
+        </div>
+      ) : !isDailyMenuPublished ? (
         <div className="w-full max-w-lg mx-auto px-4 py-12 text-center">
           <div className="bg-[#FFFDF9] rounded-3xl p-8 sm:p-10 border border-[#E8DFD5] shadow-xl space-y-5 animate-in fade-in">
             <div className="flex justify-center">
