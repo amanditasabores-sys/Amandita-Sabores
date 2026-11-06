@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
-import { User, UserRole, UserStatus, AppModule, UserAccessLog } from '../../types';
+import { User, UserRole, UserStatus, AppModule, UserAccessLog, DeliveryPermissions } from '../../types';
 import { formatDateTime } from '../../utils/formatters';
 import { 
   Users, 
@@ -29,6 +29,16 @@ import {
   X
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
+
+const DEFAULT_DELIVERY_PERMISSIONS: DeliveryPermissions = {
+  canViewDeliveryDashboard: false,
+  canManageDrivers: false,
+  canAssignDeliveries: false,
+  canOpenDailyShift: false,
+  canCloseDailyShift: false,
+  canViewShiftHistory: false,
+  canReopenDailyShift: false
+};
 
 const AVAILABLE_MODULES: { id: AppModule; label: string; desc: string }[] = [
   { id: 'pdv', label: 'PDV / Frente de Caixa', desc: 'Registro de vendas, comandas no balcão e cupons' },
@@ -68,6 +78,7 @@ export const StaffManager: React.FC = () => {
   const [formRole, setFormRole] = useState<UserRole>('CAIXA');
   const [formStatus, setFormStatus] = useState<UserStatus>('ATIVO');
   const [formAllowedModules, setFormAllowedModules] = useState<AppModule[]>(['pdv', 'kanban', 'caixa']);
+  const [formDeliveryPermissions, setFormDeliveryPermissions] = useState<DeliveryPermissions>(DEFAULT_DELIVERY_PERMISSIONS);
   const [formError, setFormError] = useState<string | null>(null);
 
   // Password reset modal
@@ -95,16 +106,38 @@ export const StaffManager: React.FC = () => {
     // Apply smart preset modules based on chosen role
     if (role === 'ADMINISTRADOR') {
       setFormAllowedModules(AVAILABLE_MODULES.map((m) => m.id));
+      setFormDeliveryPermissions({
+        canViewDeliveryDashboard: true,
+        canManageDrivers: true,
+        canAssignDeliveries: true,
+        canOpenDailyShift: true,
+        canCloseDailyShift: true,
+        canViewShiftHistory: true,
+        canReopenDailyShift: true
+      });
     } else if (role === 'GERENTE') {
-      setFormAllowedModules(['pdv', 'kanban', 'kds', 'caixa', 'relatorios', 'menu', 'qrcodes', 'auditoria']);
+      setFormAllowedModules(['pdv', 'kanban', 'kds', 'caixa', 'relatorios', 'menu', 'qrcodes', 'auditoria', 'entregas']);
+      setFormDeliveryPermissions({
+        canViewDeliveryDashboard: true,
+        canManageDrivers: true,
+        canAssignDeliveries: true,
+        canOpenDailyShift: true,
+        canCloseDailyShift: true,
+        canViewShiftHistory: true,
+        canReopenDailyShift: false
+      });
     } else if (role === 'CAIXA') {
       setFormAllowedModules(['pdv', 'kanban', 'caixa']);
+      setFormDeliveryPermissions(DEFAULT_DELIVERY_PERMISSIONS);
     } else if (role === 'COZINHA') {
       setFormAllowedModules(['kds']);
+      setFormDeliveryPermissions(DEFAULT_DELIVERY_PERMISSIONS);
     } else if (role === 'ENTREGADOR') {
       setFormAllowedModules(['entregas']);
+      setFormDeliveryPermissions(DEFAULT_DELIVERY_PERMISSIONS);
     } else if (role === 'ATENDENTE' || role === 'atendente') {
       setFormAllowedModules(['pdv', 'kanban']);
+      setFormDeliveryPermissions(DEFAULT_DELIVERY_PERMISSIONS);
     }
   };
 
@@ -127,6 +160,7 @@ export const StaffManager: React.FC = () => {
     setFormRole('CAIXA');
     setFormStatus('ATIVO');
     setFormAllowedModules(['pdv', 'kanban', 'caixa']);
+    setFormDeliveryPermissions(DEFAULT_DELIVERY_PERMISSIONS);
     setFormError(null);
     setIsUserModalOpen(true);
   };
@@ -142,6 +176,7 @@ export const StaffManager: React.FC = () => {
     setFormRole(user.role);
     setFormStatus(user.status || 'ATIVO');
     setFormAllowedModules(user.allowedModules || ['pdv', 'kanban']);
+    setFormDeliveryPermissions(store.getDeliveryPermissions(user));
     setFormError(null);
     setIsUserModalOpen(true);
   };
@@ -175,6 +210,7 @@ export const StaffManager: React.FC = () => {
         role: formRole,
         status: formStatus,
         allowedModules: formAllowedModules,
+        deliveryPermissions: formDeliveryPermissions,
       });
 
       if (formPassword && formPassword.trim().length >= 4) {
@@ -198,6 +234,7 @@ export const StaffManager: React.FC = () => {
           role: formRole,
           status: formStatus,
           allowedModules: formAllowedModules,
+          deliveryPermissions: formDeliveryPermissions,
           isEmailVerified: true,
         },
         formPassword || '123456'
@@ -704,6 +741,64 @@ export const StaffManager: React.FC = () => {
                         <div>
                           <p className="font-bold">{mod.label}</p>
                           <p className="text-[10px] text-slate-500 leading-tight mt-0.5">{mod.desc}</p>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Delivery Management Granular Permissions */}
+              <div className="space-y-2 pt-3 border-t border-[#E8DFD5]">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-1.5">
+                    <Bike className="w-4 h-4 text-[#C86D3B]" />
+                    <label className="block text-xs font-bold text-[#3D2314] uppercase">
+                      Permissões de Gestão de Entregas (Movimento Diário):
+                    </label>
+                  </div>
+                  <span className="text-[10px] text-[#8C5E47] bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md font-semibold">
+                    Supervisão & Controle
+                  </span>
+                </div>
+                <p className="text-[11px] text-[#8C5E47]">
+                  Permite que o colaborador gerencie turnos, distribua pedidos e monitore entregadores sem conceder acesso administrativo irrestrito.
+                </p>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                  {[
+                    { key: 'canViewDeliveryDashboard' as const, label: 'Painel & Métricas', desc: 'Visualizar painel de controle e métricas de entregas' },
+                    { key: 'canManageDrivers' as const, label: 'Gerenciar Entregadores', desc: 'Visualizar status e presença da equipe de entrega' },
+                    { key: 'canAssignDeliveries' as const, label: 'Atribuir Pedidos', desc: 'Despachar e reatribuir entregas aos entregadores' },
+                    { key: 'canOpenDailyShift' as const, label: 'Abrir Movimento Diário', desc: 'Iniciar novo turno diário de entregas' },
+                    { key: 'canCloseDailyShift' as const, label: 'Fechar Movimento Diário', desc: 'Encerrar o dia com conferência e checklist' },
+                    { key: 'canViewShiftHistory' as const, label: 'Histórico de Movimentos', desc: 'Consultar turnos anteriores e auditoria' },
+                    { key: 'canReopenDailyShift' as const, label: 'Reabrir Movimento Diário', desc: 'Reabrir movimento fechado (restrito e auditado)' },
+                  ].map((perm) => {
+                    const isChecked = Boolean(formDeliveryPermissions[perm.key]);
+                    return (
+                      <label
+                        key={perm.key}
+                        className={`p-2.5 rounded-xl border text-xs cursor-pointer flex items-start gap-2.5 transition ${
+                          isChecked
+                            ? 'bg-[#C86D3B]/10 border-[#C86D3B] text-[#2C1810]'
+                            : 'bg-white border-[#E8DFD5] text-slate-600 hover:bg-[#FAF7F2]'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            setFormDeliveryPermissions((prev) => ({
+                              ...prev,
+                              [perm.key]: e.target.checked
+                            }));
+                          }}
+                          className="mt-0.5 w-4 h-4 rounded text-[#C86D3B] focus:ring-[#C86D3B]"
+                        />
+                        <div>
+                          <p className="font-bold">{perm.label}</p>
+                          <p className="text-[10px] text-slate-500 leading-tight mt-0.5">{perm.desc}</p>
                         </div>
                       </label>
                     );

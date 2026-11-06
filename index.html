@@ -32,6 +32,30 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+
+    <!-- Suppress benign dev-server WebSocket HMR disconnections in sandbox proxy -->
+    <script>
+      (function() {
+        var isWsErr = function(msg) {
+          if (!msg) return false;
+          var s = String(msg).toLowerCase();
+          return s.indexOf('websocket') !== -1 || s.indexOf('@vite/client') !== -1;
+        };
+        window.addEventListener('error', function(e) {
+          if (isWsErr(e.message) || (e.error && isWsErr(e.error.message))) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+        window.addEventListener('unhandledrejection', function(e) {
+          if (e.reason && (isWsErr(e.reason.message) || isWsErr(e.reason))) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+          }
+        }, true);
+      })();
+    </script>
   </head>
   <body class="bg-[#FAF7F2] text-[#2C1810] antialiased selection:bg-[#C86D3B] selection:text-white">
     <div id="root"></div>
