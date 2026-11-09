@@ -25,6 +25,7 @@ import confetti from 'canvas-confetti';
 import { User } from '../../types';
 import { AmanditaLogo } from '../common/AmanditaLogo';
 import { DeliverySupervisorDashboard } from './DeliverySupervisorDashboard';
+import { DriverReadyOrderAlert } from './DriverReadyOrderAlert';
 
 interface DeliveryPortalProps {
   initialOrderId?: string;
@@ -912,6 +913,15 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
           </div>
         )}
       </main>
+
+      {/* NOTIFICAÇÃO DE PEDIDO PRONTO PARA ENTREGA COM CONTROLE DE SOM E CIÊNCIA */}
+      <DriverReadyOrderAlert
+        currentUser={currentUser}
+        onSelectOrder={(order) => {
+          setActiveOrder(order);
+          setDeliveryTab('pendentes');
+        }}
+      />
     </div>
   );
 };

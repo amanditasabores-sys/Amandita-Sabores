@@ -201,10 +201,106 @@ class SoundService {
   }
 
   /**
-   * Check if persistent alert is actively ringing
+   * Returns whether the persistent alert loop is currently active.
    */
   public isPersistentAlertActive(): boolean {
     return this.isAlertLooping;
+  }
+
+  /**
+   * Distinct, upbeat 4-note ascending chime for orders ready for delivery:
+   * D5 (587.33Hz) -> F#5 (739.99Hz) -> A5 (880.00Hz) -> D6 (1174.66Hz)
+   */
+  public playReadyOrderAlert() {
+    if (!this.isSoundEnabled || this._isNewOrderMuted || this._newOrderVolume <= 0) return;
+    try {
+      this.initContext();
+      if (!this.audioCtx) return;
+
+      const now = this.audioCtx.currentTime;
+      const notes = [
+        { freq: 587.33, time: 0.0, duration: 0.16 }, // D5
+        { freq: 739.99, time: 0.15, duration: 0.16 }, // F#5
+        { freq: 880.00, time: 0.30, duration: 0.18 }, // A5
+        { freq: 1174.66, time: 0.46, duration: 0.42 }, // D6
+      ];
+
+      const peakGain = Math.max(0.005, 0.35 * this._newOrderVolume);
+
+      notes.forEach(({ freq, time, duration }) => {
+        if (!this.audioCtx) return;
+        const osc = this.audioCtx.createOscillator();
+        const gain = this.audioCtx.createGain();
+
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, now + time);
+
+        gain.gain.setValueAtTime(0.001, now + time);
+        gain.gain.exponentialRampToValueAtTime(peakGain, now + time + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + time + duration);
+
+        osc.connect(gain);
+        gain.connect(this.audioCtx.destination);
+
+        osc.start(now + time);
+        osc.stop(now + time + duration);
+      });
+    } catch {
+      // Audio might be blocked until user interacts with document
+    }
+  }
+
+  private driverAlertInterval: ReturnType<typeof setInterval> | null = null;
+  private isDriverAlertLooping: boolean = false;
+  private driverAlertRepeatsRemaining: number = 0;
+
+  /**
+   * Starts a controlled driver alert chime that repeats up to maxRepeats times
+   * (does not ring indefinitely) and can be stopped immediately via stopDriverReadyAlert().
+   */
+  public startDriverReadyAlert(intervalMs = 3500, maxRepeats = 4) {
+    if (!this.isSoundEnabled || this._isNewOrderMuted) return;
+
+    this.isDriverAlertLooping = true;
+    this.driverAlertRepeatsRemaining = maxRepeats;
+
+    // Play first chime immediately
+    this.playReadyOrderAlert();
+    this.driverAlertRepeatsRemaining--;
+
+    // Clear any active timer
+    if (this.driverAlertInterval) {
+      clearInterval(this.driverAlertInterval);
+    }
+
+    // Set recurring timer with repeat limit
+    this.driverAlertInterval = setInterval(() => {
+      if (!this.isDriverAlertLooping || this.driverAlertRepeatsRemaining <= 0) {
+        this.stopDriverReadyAlert();
+        return;
+      }
+      this.playReadyOrderAlert();
+      this.driverAlertRepeatsRemaining--;
+    }, intervalMs);
+  }
+
+  /**
+   * Immediately stops the driver ready order alert sound.
+   */
+  public stopDriverReadyAlert() {
+    this.isDriverAlertLooping = false;
+    this.driverAlertRepeatsRemaining = 0;
+    if (this.driverAlertInterval) {
+      clearInterval(this.driverAlertInterval);
+      this.driverAlertInterval = null;
+    }
+  }
+
+  /**
+   * Checks if driver alert is actively ringing
+   */
+  public isDriverReadyAlertActive(): boolean {
+    return this.isDriverAlertLooping;
   }
 }
 

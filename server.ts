@@ -505,14 +505,14 @@ async function markPushDispatched(key: string, orderId: string, event: string): 
   }
 }
 
-async function sendOrderPushNotification(order: any, event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' = 'NEW_ORDER') {
+async function sendOrderPushNotification(order: any, event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY' = 'NEW_ORDER') {
   if (!order || !order.id) {
-    return;
+    return { sent: 0, failed: 0, total: 0 };
   }
 
-  // 1. Strictly restrict notifications to ONLY the two authorized business events
-  if (event !== 'NEW_ORDER' && event !== 'DELIVERY_CONFIRMED') {
-    return; // Operational steps (cozinha, preparo, pronto, balcão, etc.) NEVER trigger push
+  // 1. Strictly restrict notifications to ONLY the authorized business events
+  if (event !== 'NEW_ORDER' && event !== 'DELIVERY_CONFIRMED' && event !== 'READY_FOR_DELIVERY') {
+    return { sent: 0, failed: 0, total: 0 };
   }
 
   // 2. Persistent Cross-Instance Idempotency Lock
@@ -520,7 +520,7 @@ async function sendOrderPushNotification(order: any, event: 'NEW_ORDER' | 'DELIV
   const alreadySent = await isPushAlreadyDispatched(idempotencyKey);
   if (alreadySent) {
     console.info(`[Web Push Idempotency] Notificação '${event}' para pedido #${order.orderNumber} já enviada. Ignorando duplicata.`);
-    return;
+    return { sent: 0, failed: 0, total: 0 };
   }
 
   // Mark immediately as dispatched to avoid race conditions between parallel workers
@@ -530,19 +530,30 @@ async function sendOrderPushNotification(order: any, event: 'NEW_ORDER' | 'DELIV
   const allSubscriptions = await getAllPushSubscriptions();
   if (allSubscriptions.length === 0) {
     console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição push registrada para alerta.`);
-    return;
+    return { sent: 0, failed: 0, total: 0 };
   }
 
-  // STRICT PRIVACY SHIELD: Filter subscriptions exclusively to authorized staff roles
-  // Anonymous customer devices that might have subscribed must NEVER receive internal order notifications
+  // STRICT PRIVACY SHIELD & EVENT-SPECIFIC ROLE TARGETING:
+  // - NEW_ORDER: Kitchen & attendants responsible for receiving and prepping (exclui entregadores)
+  // - READY_FOR_DELIVERY: Delivery drivers responsible for delivery & supervisors
+  // - DELIVERY_CONFIRMED: Admin, gerente, cashier & attendants
   const staffSubscriptions = allSubscriptions.filter((s) => {
     const r = (s.role || '').toUpperCase();
-    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE', 'ENTREGADOR', 'STAFF'].includes(r);
+    if (event === 'NEW_ORDER') {
+      return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE'].includes(r);
+    }
+    if (event === 'READY_FOR_DELIVERY') {
+      return ['ENTREGADOR', 'ADMINISTRADOR', 'GERENTE'].includes(r);
+    }
+    if (event === 'DELIVERY_CONFIRMED') {
+      return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'ATENDENTE', 'STAFF'].includes(r);
+    }
+    return false;
   });
 
   if (staffSubscriptions.length === 0) {
-    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição de funcionário autorizada ativa.`);
-    return;
+    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição autorizada ativa para o evento '${event}'.`);
+    return { sent: 0, failed: 0, total: 0 };
   }
 
   // Chronological integrity: respect order's real creation or delivery time
@@ -558,6 +569,14 @@ async function sendOrderPushNotification(order: any, event: 'NEW_ORDER' | 'DELIV
     body = `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`;
     tag = `order-${order.id}`;
     targetUrl = '/?view=producao';
+  } else if (event === 'READY_FOR_DELIVERY') {
+    const addressText = order.customer?.address?.street
+      ? `${order.customer.address.street}, ${order.customer.address.number || 'S/N'}${order.customer.address.neighborhood ? ` · ${order.customer.address.neighborhood}` : ''}`
+      : 'Endereço no pedido';
+    title = `Pedido #${order.orderNumber} pronto para entrega!`;
+    body = `${order.customer?.name || 'Cliente'} · ${addressText} · Pronto para retirada.`;
+    tag = `ready-${order.id}`;
+    targetUrl = `/?view=entregador&pedido=${order.id}`;
   } else {
     // DELIVERY_CONFIRMED
     const driverName = order.deliveryPersonName || order.deliveryPerson?.name || 'Entregador';
@@ -864,7 +883,12 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
         res.status(400).json({ success: false, message: 'Pedido ausente ou sem identificador.' });
         return;
       }
-      const eventType = (event === 'DELIVERY_CONFIRMED' ? 'DELIVERY_CONFIRMED' : 'NEW_ORDER');
+      let eventType: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY' = 'NEW_ORDER';
+      if (event === 'DELIVERY_CONFIRMED') {
+        eventType = 'DELIVERY_CONFIRMED';
+      } else if (event === 'READY_FOR_DELIVERY') {
+        eventType = 'READY_FOR_DELIVERY';
+      }
       const stats = await sendOrderPushNotification(order, eventType);
       res.json({
         success: true,
@@ -887,7 +911,7 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       statusMessage: cfg.statusMessage,
       publicKeyPreview: cfg.publicKey ? `${cfg.publicKey.substring(0, 12)}...` : null,
       registeredDevicesCount: subs.length,
-      allowedEvents: ['NEW_ORDER', 'DELIVERY_CONFIRMED'],
+      allowedEvents: ['NEW_ORDER', 'DELIVERY_CONFIRMED', 'READY_FOR_DELIVERY'],
       timestamp: new Date().toISOString(),
     });
   });

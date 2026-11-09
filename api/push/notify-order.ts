@@ -37,13 +37,19 @@ export default async function handler(req: any, res: any) {
       return sendJson(res, 400, { success: false, message: 'Pedido ausente ou sem identificador.' });
     }
 
-    const eventType = event === 'DELIVERY_CONFIRMED' ? 'DELIVERY_CONFIRMED' : 'NEW_ORDER';
+    let eventType: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY' = 'NEW_ORDER';
+    if (event === 'DELIVERY_CONFIRMED') eventType = 'DELIVERY_CONFIRMED';
+    else if (event === 'READY_FOR_DELIVERY') eventType = 'READY_FOR_DELIVERY';
 
     // CRITICAL for Vercel Serverless: Await push dispatch before sending HTTP response
     // Otherwise Vercel terminates the Lambda container immediately, killing pending HTTP push requests.
     const result = await sendOrderPushNotification(order, eventType);
 
-    const eventLabel = eventType === 'DELIVERY_CONFIRMED' ? 'entrega concluída' : 'novo pedido';
+    const eventLabel = eventType === 'DELIVERY_CONFIRMED' 
+      ? 'entrega concluída' 
+      : eventType === 'READY_FOR_DELIVERY' 
+      ? 'pedido pronto para entrega' 
+      : 'novo pedido';
     return sendJson(res, 200, {
       success: true,
       message: `Notificação push de ${eventLabel} processada com sucesso. Entregas confirmadas: ${result.sent}/${result.total}.`,

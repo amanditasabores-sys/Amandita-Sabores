@@ -22,19 +22,49 @@ self.addEventListener('push', function (event) {
 
       const eventType = payload.eventType || payload.event || 'NEW_ORDER';
       const isDelivery = eventType === 'DELIVERY_CONFIRMED';
-      const title = payload.title || (isDelivery ? 'Entrega Concluída!' : 'Amandita Sabores - Novo Pedido!');
+      const isReady = eventType === 'READY_FOR_DELIVERY';
+
+      let title = payload.title;
+      if (!title) {
+        if (isDelivery) {
+          title = 'Entrega Concluída!';
+        } else if (isReady) {
+          title = 'Pedido pronto para entrega!';
+        } else {
+          title = 'Amandita Sabores - Novo Pedido!';
+        }
+      }
+
+      let body = payload.body;
+      if (!body) {
+        if (isDelivery) {
+          body = 'O pedido foi entregue com sucesso.';
+        } else if (isReady) {
+          body = 'O pedido está pronto na cozinha para retirada e entrega.';
+        } else {
+          body = 'Um novo pedido acabou de entrar no sistema.';
+        }
+      }
+
+      let defaultUrl = '/?view=producao';
+      if (isDelivery) {
+        defaultUrl = '/?view=admin';
+      } else if (isReady) {
+        defaultUrl = payload.orderId ? `/?view=entregador&pedido=${payload.orderId}` : '/?view=entregador';
+      }
+
       const options = {
-        body: payload.body || (isDelivery ? 'O pedido foi entregue com sucesso.' : 'Um novo pedido acabou de entrar no sistema.'),
+        body,
         icon: payload.icon || '/pwa-192x192.png',
         badge: payload.badge || '/favicon-32x32.png',
-        vibrate: isDelivery ? [200, 100, 200] : [300, 100, 300, 100, 300],
-        tag: payload.tag || ((isDelivery ? 'deliv-' : 'order-') + (payload.orderId || Date.now())),
+        vibrate: isReady ? [250, 100, 250, 100, 250] : isDelivery ? [200, 100, 200] : [300, 100, 300, 100, 300],
+        tag: payload.tag || ((isReady ? 'ready-' : isDelivery ? 'deliv-' : 'order-') + (payload.orderId || Date.now())),
         renotify: true,
         requireInteraction: true, // Mantém notificação visível na tela de bloqueio até interação
         silent: false,
         timestamp: payload.timestamp || Date.now(),
         data: {
-          url: payload.url || (isDelivery ? '/?view=admin' : '/?view=producao'),
+          url: payload.url || defaultUrl,
           orderId: payload.orderId || '',
           event: eventType,
           timestamp: payload.timestamp || Date.now(),
@@ -42,6 +72,11 @@ self.addEventListener('push', function (event) {
         actions: isDelivery
           ? [
               { action: 'open_orders', title: 'Ver Pedidos' },
+              { action: 'close', title: 'Dispensar' }
+            ]
+          : isReady
+          ? [
+              { action: 'open_driver', title: 'Ver Entrega' },
               { action: 'close', title: 'Dispensar' }
             ]
           : [

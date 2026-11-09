@@ -311,9 +311,10 @@ export interface RestaurantConfig {
   customPublicUrl?: string; // Optional override for shared URL
   receiptFooterText?: string; // Texto configurável do rodapé do cupom térmico (ex: @nomedoperfil)
   dailyMenu?: DailyMenuConfig; // Configuração do cardápio do dia publicado
-  // Configurações independentes de Notificações Push (restritas exclusivamente a 2 eventos)
+  // Configurações independentes de Notificações Push
   notifyNewOrders?: boolean; // [ ] Notificar chegada de novos pedidos (padrão true)
   notifyDeliveryConfirmed?: boolean; // [ ] Notificar confirmação de entrega (padrão true)
+  notifyReadyForDelivery?: boolean; // [ ] Notificar pedido pronto para entrega aos entregadores (padrão true)
   // Entregador fixo responsável pelas novas entregas (sem rodízio)
   defaultDeliveryPersonId?: string; // ID do entregador ativo selecionado pela administração
 }

@@ -395,14 +395,14 @@ export async function sendTestPushNotification(): Promise<{ sent: number; failed
 
 export async function sendOrderPushNotification(
   order: any,
-  event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' = 'NEW_ORDER'
+  event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY' = 'NEW_ORDER'
 ): Promise<{ sent: number; failed: number; total: number; skipped?: string }> {
   if (!order || !order.id) {
     return { sent: 0, failed: 0, total: 0, skipped: 'invalid_order' };
   }
 
-  // 1. Strictly restrict notifications to ONLY the two authorized business events
-  if (event !== 'NEW_ORDER' && event !== 'DELIVERY_CONFIRMED') {
+  // 1. Strictly restrict notifications to ONLY the authorized business events
+  if (event !== 'NEW_ORDER' && event !== 'DELIVERY_CONFIRMED' && event !== 'READY_FOR_DELIVERY') {
     return { sent: 0, failed: 0, total: 0, skipped: 'unauthorized_event' };
   }
 
@@ -427,19 +427,30 @@ export async function sendOrderPushNotification(
     return { sent: 0, failed: 0, total: 0, skipped: 'no_subscriptions' };
   }
 
-  // STRICT PRIVACY SHIELD: Filter subscriptions exclusively to authorized staff roles
-  // Anonymous customer devices that might have subscribed must NEVER receive internal order notifications
-  const staffSubscriptions = allSubscriptions.filter((s) => {
+  // STRICT PRIVACY SHIELD & EVENT-SPECIFIC ROLE TARGETING:
+  // - NEW_ORDER: Kitchen & attendants responsible for receiving and prepping (exclui entregadores)
+  // - READY_FOR_DELIVERY: Delivery drivers responsible for delivery & supervisors
+  // - DELIVERY_CONFIRMED: Admin, gerente, cashier & attendants
+  const targetSubscriptions = allSubscriptions.filter((s) => {
     const r = (s.role || '').toUpperCase();
-    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE', 'ENTREGADOR', 'STAFF'].includes(r);
+    if (event === 'NEW_ORDER') {
+      return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE'].includes(r);
+    }
+    if (event === 'READY_FOR_DELIVERY') {
+      return ['ENTREGADOR', 'ADMINISTRADOR', 'GERENTE'].includes(r);
+    }
+    if (event === 'DELIVERY_CONFIRMED') {
+      return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'ATENDENTE', 'STAFF'].includes(r);
+    }
+    return false;
   });
 
-  if (staffSubscriptions.length === 0) {
-    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição de funcionário autorizada ativa.`);
-    return { sent: 0, failed: 0, total: 0, skipped: 'no_staff_subscriptions' };
+  if (targetSubscriptions.length === 0) {
+    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição autorizada ativa para o evento '${event}'.`);
+    return { sent: 0, failed: 0, total: 0, skipped: 'no_target_subscriptions' };
   }
 
-  // Chronological integrity: respect order's real creation or delivery time
+  // Chronological integrity: respect order's real creation, ready or delivery time
   const orderTimestamp = order.createdAt ? new Date(order.createdAt).getTime() : Date.now();
 
   let title = '';
@@ -452,6 +463,14 @@ export async function sendOrderPushNotification(
     body = `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`;
     tag = `order-${order.id}`;
     targetUrl = '/?view=producao';
+  } else if (event === 'READY_FOR_DELIVERY') {
+    const addressText = order.customer?.address?.street
+      ? `${order.customer.address.street}, ${order.customer.address.number || 'S/N'}${order.customer.address.neighborhood ? ` · ${order.customer.address.neighborhood}` : ''}`
+      : 'Endereço no pedido';
+    title = `Pedido #${order.orderNumber} pronto para entrega!`;
+    body = `${order.customer?.name || 'Cliente'} · ${addressText} · Pronto para retirada.`;
+    tag = `ready-${order.id}`;
+    targetUrl = `/?view=entregador&pedido=${order.id}`;
   } else {
     // DELIVERY_CONFIRMED
     const driverName = order.deliveryPersonName || order.deliveryPerson?.name || 'Entregador';
@@ -461,7 +480,7 @@ export async function sendOrderPushNotification(
     targetUrl = '/?view=admin';
   }
 
-  console.info(`[Web Push] Disparando alerta (${event}) pedido #${order.orderNumber} para ${staffSubscriptions.length} dispositivo(s) da equipe...`);
+  console.info(`[Web Push] Disparando alerta (${event}) pedido #${order.orderNumber} para ${targetSubscriptions.length} dispositivo(s) autorizados...`);
 
   const payload = JSON.stringify({
     title,
@@ -486,7 +505,7 @@ export async function sendOrderPushNotification(
   let failed = 0;
 
   // Await each push notification dispatch concurrently
-  const sendPromises = staffSubscriptions.map(async (subData) => {
+  const sendPromises = targetSubscriptions.map(async (subData) => {
     try {
       await webpush.sendNotification(subData.subscription, payload, pushOptions);
       sent++;
@@ -506,11 +525,11 @@ export async function sendOrderPushNotification(
     await deletePushSubscription(endpoint);
   }
 
-  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber} (${event}): ${sent}/${staffSubscriptions.length} entregas confirmadas.`);
+  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber} (${event}): ${sent}/${targetSubscriptions.length} entregas confirmadas.`);
 
   return {
     sent,
     failed,
-    total: staffSubscriptions.length,
+    total: targetSubscriptions.length,
   };
 }

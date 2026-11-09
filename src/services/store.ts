@@ -67,6 +67,12 @@ export interface MigrationSummary {
   skippedCount: number;
 }
 
+export function isOrderPrepStaffRole(role?: string | null): boolean {
+  if (!role) return false;
+  const normalized = role.toUpperCase();
+  return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE'].includes(normalized);
+}
+
 class StoreService {
   private broadcastChannel: BroadcastChannel | null = null;
   private publicUnsubscribers: Unsubscribe[] = [];
@@ -620,10 +626,10 @@ class StoreService {
         this.broadcastChannel = new BroadcastChannel('gestaofood_sync_channel');
         this.broadcastChannel.onmessage = (event) => {
           if (event.data?.type === 'ORDER_CREATED') {
-            // Strictly isolate public customer views: customers NEVER hear internal kitchen/cashier bells
+            // Strictly isolate public customer views & drivers: customers & drivers NEVER hear internal kitchen/cashier bells
             if (!this.isPublicCustomerContext()) {
               const current = this.getCurrentUser();
-              if (current && this.isAuthorizedStaffRole(current.role)) {
+              if (current && this.isOrderPrepStaffRole(current.role)) {
                 soundService.playNewOrderAlert();
               }
             }
@@ -867,6 +873,14 @@ class StoreService {
     if (!role) return false;
     const normalized = role.toUpperCase();
     return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ENTREGADOR', 'ATENDENTE'].includes(normalized);
+  }
+
+  /**
+   * Helper that checks if a role belongs to staff responsible for order reception & preparation.
+   * Strictly excludes ENTREGADOR so drivers NEVER receive kitchen/cashier new order alarms.
+   */
+  public isOrderPrepStaffRole(role?: string | null): boolean {
+    return isOrderPrepStaffRole(role);
   }
 
   /**
@@ -1125,7 +1139,8 @@ class StoreService {
           if (newIncoming.length > 0) {
             newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
             const activeUser = this.getCurrentUser();
-            if (activeUser && this.isAuthorizedStaffRole(activeUser.role)) {
+            // Strictly alert kitchen/cashier/attendant only (never delivery drivers for new orders)
+            if (activeUser && this.isOrderPrepStaffRole(activeUser.role)) {
               soundService.startPersistentOrderAlert(3500);
             }
 
@@ -1144,6 +1159,23 @@ class StoreService {
             } catch {
               // Non-blocking
             }
+          }
+
+          // Check for orders transitioning to PRONTO for delivery (dedicated driver notification)
+          const newlyReadyDeliveries = remoteOrders.filter((ro) => {
+            if (ro.status !== 'PRONTO' || ro.fulfillmentType !== 'DELIVERY') return false;
+            const prev = localOrders.find((lo) => lo.id === ro.id);
+            return !prev || prev.status !== 'PRONTO';
+          });
+
+          if (newlyReadyDeliveries.length > 0) {
+            newlyReadyDeliveries.forEach((o) => this.recordDriverReadyOrder(o.id));
+            const activeUser = this.getCurrentUser();
+            const isRelevantToDriver = activeUser && newlyReadyDeliveries.some((o) => this.isDriverAssignedToOrder(o, activeUser));
+            if (isRelevantToDriver) {
+              soundService.startDriverReadyAlert();
+            }
+            this.notify('DRIVER_ORDER_READY', newlyReadyDeliveries);
           }
 
           if (remoteOrders.length > 0) {
@@ -1900,10 +1932,11 @@ class StoreService {
     localStorage.setItem('gf_orders', JSON.stringify(updated));
 
     const activeStaffUser = this.getCurrentUser();
-    const isStaffSession = activeStaffUser && this.isAuthorizedStaffRole(activeStaffUser.role);
+    const isStaffSession = Boolean(activeStaffUser && this.isAuthorizedStaffRole(activeStaffUser.role));
+    const isPrepStaffSession = Boolean(activeStaffUser && this.isOrderPrepStaffRole(activeStaffUser.role));
 
-    // CRITICAL: Public customer sessions must NEVER play staff kitchen/cashier alarms!
-    if (!this.isPublicCustomerContext() && isStaffSession) {
+    // CRITICAL: Public customer sessions & delivery drivers must NEVER play kitchen/cashier new order alarms!
+    if (!this.isPublicCustomerContext() && isPrepStaffSession) {
       soundService.playNewOrderAlert();
     }
 
@@ -1944,12 +1977,16 @@ class StoreService {
   }
 
   /**
-   * Dispatches background Web Push notifications restricted to ONLY the 2 authorized events:
-   * Event A: 'NEW_ORDER' (Arrival of a new order)
-   * Event B: 'DELIVERY_CONFIRMED' (Delivery completion confirmed by driver)
+   * Dispatches background Web Push notifications restricted to ONLY the authorized events:
+   * Event A: 'NEW_ORDER' (Arrival of a new order to kitchen & attendants)
+   * Event B: 'READY_FOR_DELIVERY' (Order ready for pickup and delivery to assigned driver)
+   * Event C: 'DELIVERY_CONFIRMED' (Delivery completion confirmed by driver)
    * Respects independent configuration toggles and prevents intermediate operational spam.
    */
-  public dispatchOrderPushNotification(order: Order, event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED'): void {
+  public dispatchOrderPushNotification(
+    order: Order, 
+    event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY'
+  ): void {
     if (typeof window === 'undefined' || !order || !order.id) return;
     const cfg = this.getRestaurantConfig();
 
@@ -1957,6 +1994,9 @@ class StoreService {
       return;
     }
     if (event === 'DELIVERY_CONFIRMED' && cfg.notifyDeliveryConfirmed === false) {
+      return;
+    }
+    if (event === 'READY_FOR_DELIVERY' && cfg.notifyReadyForDelivery === false) {
       return;
     }
 
@@ -2215,6 +2255,145 @@ class StoreService {
     this.notify('ALERTS_SILENCED', {});
   }
 
+  // ---- Driver Ready Delivery Orders & Controlled Sound Alert Management ----
+
+  /**
+   * Checks if an order is destined for and assigned to the specified driver.
+   * If driver is specified and order has an assigned driver, strictly matches IDs/names.
+   * If order is ready but unassigned, returns true for any active delivery driver.
+   */
+  public isDriverAssignedToOrder(order: Order, driverUser?: User | null): boolean {
+    if (!driverUser) return false;
+    if (order.fulfillmentType !== 'DELIVERY') return false;
+
+    const driverId = driverUser.id;
+    const cleanCurrentDriver = (driverUser.name || driverUser.username || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+
+    // 1. If order has an assigned delivery person:
+    const assignedId = order.deliveryPersonId || order.deliveryPerson?.id;
+    const assignedName = (order.deliveryPerson?.name || order.deliveryPersonName || '').toLowerCase().replace(/entregador\s*/g, '').trim();
+
+    if (assignedId || assignedName) {
+      if (assignedId && (assignedId === driverId || assignedId === `driver-${driverId}` || `driver-${assignedId}` === driverId)) {
+        return true;
+      }
+      if (assignedName && cleanCurrentDriver && (
+        assignedName === cleanCurrentDriver ||
+        assignedName.includes(cleanCurrentDriver) ||
+        cleanCurrentDriver.includes(assignedName)
+      )) {
+        return true;
+      }
+      // Order belongs specifically to another driver
+      return false;
+    }
+
+    // 2. If order has NO assigned driver yet:
+    // Active delivery drivers can receive notification that an unassigned order is ready
+    if (driverUser.role?.toUpperCase() === 'ENTREGADOR') {
+      return true;
+    }
+
+    // 3. Admin / Gerente / Supervisor
+    const role = driverUser.role?.toUpperCase();
+    if (role === 'ADMINISTRADOR' || role === 'GERENTE') {
+      return true;
+    }
+
+    return false;
+  }
+
+  public getAcknowledgedDriverReadyOrderIds(): string[] {
+    try {
+      const data = localStorage.getItem('gf_driver_acknowledged_ready_orders');
+      return data ? JSON.parse(data) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  public hasDriverAcknowledgedReadyOrder(orderId: string): boolean {
+    return this.getAcknowledgedDriverReadyOrderIds().includes(orderId);
+  }
+
+  public getUnseenDriverReadyOrderIds(driverUser?: User | null): string[] {
+    try {
+      const data = localStorage.getItem('gf_driver_unseen_ready_orders');
+      const allUnseen: string[] = data ? JSON.parse(data) : [];
+      const acknowledged = new Set(this.getAcknowledgedDriverReadyOrderIds());
+      const allOrders = this.getOrders();
+
+      return allUnseen.filter((id) => {
+        if (acknowledged.has(id)) return false;
+        const order = allOrders.find((o) => o.id === id);
+        if (!order || order.status !== 'PRONTO' || order.fulfillmentType !== 'DELIVERY') return false;
+        if (driverUser) {
+          return this.isDriverAssignedToOrder(order, driverUser);
+        }
+        return true;
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  public recordDriverReadyOrder(orderId: string) {
+    try {
+      if (this.hasDriverAcknowledgedReadyOrder(orderId)) return;
+      const data = localStorage.getItem('gf_driver_unseen_ready_orders');
+      const ids: string[] = data ? JSON.parse(data) : [];
+      if (!ids.includes(orderId)) {
+        ids.push(orderId);
+        localStorage.setItem('gf_driver_unseen_ready_orders', JSON.stringify(ids));
+      }
+    } catch {}
+  }
+
+  public markDriverReadyOrderSeen(orderId: string) {
+    try {
+      // 1. Remove from unseen
+      const data = localStorage.getItem('gf_driver_unseen_ready_orders');
+      const ids: string[] = data ? JSON.parse(data) : [];
+      const remaining = ids.filter((id) => id !== orderId);
+      localStorage.setItem('gf_driver_unseen_ready_orders', JSON.stringify(remaining));
+
+      // 2. Add to acknowledged
+      const ackIds = this.getAcknowledgedDriverReadyOrderIds();
+      if (!ackIds.includes(orderId)) {
+        ackIds.push(orderId);
+        localStorage.setItem('gf_driver_acknowledged_ready_orders', JSON.stringify(ackIds));
+      }
+
+      // 3. Stop sound if no remaining unseen orders
+      if (remaining.length === 0) {
+        soundService.stopDriverReadyAlert();
+      }
+
+      this.notify('DRIVER_READY_ORDER_SEEN', { orderId, remainingCount: remaining.length });
+    } catch {
+      soundService.stopDriverReadyAlert();
+    }
+  }
+
+  public silenceDriverReadyAlerts() {
+    soundService.stopDriverReadyAlert();
+    this.notify('DRIVER_READY_ALERTS_SILENCED', {});
+  }
+
+  public acknowledgeAllDriverReadyOrders(driverUser?: User | null) {
+    try {
+      const unseen = this.getUnseenDriverReadyOrderIds(driverUser);
+      const ackIds = this.getAcknowledgedDriverReadyOrderIds();
+      for (const id of unseen) {
+        if (!ackIds.includes(id)) ackIds.push(id);
+      }
+      localStorage.setItem('gf_driver_acknowledged_ready_orders', JSON.stringify(ackIds));
+      localStorage.setItem('gf_driver_unseen_ready_orders', JSON.stringify([]));
+    } catch {}
+    soundService.stopDriverReadyAlert();
+    this.notify('DRIVER_READY_ALERTS_SILENCED', {});
+  }
+
   public updateOrderStatus(orderId: string, newStatus: OrderStatus, author: string, notes?: string): Order | null {
     const currentUser = this.getCurrentUser();
     if (currentUser && !this.canUserUpdateOrderStatus(currentUser, newStatus)) {
@@ -2308,9 +2487,17 @@ class StoreService {
     this.queueOrderForSync(order);
     this.persistOrderToFirestore(order).catch(() => {});
 
-    // Strictly restrict delivery notification: ONLY when order is confirmed as ENTREGUE (Event B)
+    // Dispatch appropriate push & in-app alerts based on business events
     if (newStatus === 'ENTREGUE') {
       this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
+    } else if (newStatus === 'PRONTO' && order.fulfillmentType === 'DELIVERY') {
+      this.recordDriverReadyOrder(order.id);
+      this.dispatchOrderPushNotification(order, 'READY_FOR_DELIVERY');
+      this.notify('DRIVER_ORDER_READY', order);
+      const activeUser = this.getCurrentUser();
+      if (activeUser && this.isDriverAssignedToOrder(order, activeUser)) {
+        soundService.startDriverReadyAlert();
+      }
     }
 
     return order;
@@ -2327,6 +2514,8 @@ class StoreService {
     const res = await this.persistOrderToFirestore(order);
     if (newStatus === 'ENTREGUE') {
       this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
+    } else if (newStatus === 'PRONTO' && order.fulfillmentType === 'DELIVERY') {
+      this.dispatchOrderPushNotification(order, 'READY_FOR_DELIVERY');
     }
     return { order, synced: res.success, error: res.error };
   }
