@@ -39,6 +39,16 @@ export type AppModule =
   | 'qrcodes'       // QR Codes & Links
   | 'auditoria';    // Logs de Auditoria
 
+export interface DeliveryPermissions {
+  canViewDeliveryDashboard: boolean;
+  canManageDrivers: boolean;
+  canAssignDeliveries: boolean;
+  canOpenDailyShift: boolean;
+  canCloseDailyShift: boolean;
+  canViewShiftHistory: boolean;
+  canReopenDailyShift: boolean;
+}
+
 export interface User {
   id: string;
   name?: string;
@@ -48,6 +58,7 @@ export interface User {
   role: UserRole;
   status?: UserStatus;
   allowedModules?: AppModule[];
+  deliveryPermissions?: DeliveryPermissions;
   phone?: string;
   createdAt: string;
   updatedAt?: string;
@@ -221,6 +232,37 @@ export interface DeliveryAssignmentRecord {
   newDriverId?: string;
   newDriverName?: string;
   assignedBy: string; // Usuário administrativo responsável pela alteração
+  reason?: string; // Motivo da atribuição ou reatribuição
+}
+
+export interface DeliveryShiftSummary {
+  totalDeliveries: number;
+  completedDeliveries: number;
+  inTransitDeliveries: number;
+  pendingDeliveries: number;
+  unassignedDeliveries: number;
+  totalAmount: number;
+  activeDriversCount: number;
+}
+
+export interface DeliveryShift {
+  id: string; // ex: 'del-shift-2026-11-07'
+  date: string; // 'YYYY-MM-DD'
+  status: 'ABERTO' | 'FECHADO';
+  openedAt: string;
+  openedBy: {
+    userId: string;
+    userName: string;
+    userRole: string;
+  };
+  closedAt?: string;
+  closedBy?: {
+    userId: string;
+    userName: string;
+    userRole: string;
+  };
+  summary?: DeliveryShiftSummary;
+  notes?: string;
 }
 
 export interface PublicOrderTracking {

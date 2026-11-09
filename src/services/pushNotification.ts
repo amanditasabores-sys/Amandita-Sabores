@@ -3,6 +3,8 @@
  * Manages Service Worker push registration, browser permissions, and backend subscription syncing.
  */
 
+import { getCurrentFirebaseUser } from './firebase.ts';
+
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const cleanBase64 = base64String.trim().replace(/\s+/g, '');
   const padding = '='.repeat((4 - (cleanBase64.length % 4)) % 4);
@@ -151,10 +153,25 @@ class PushNotificationService {
 
       if (subscription) {
         this.currentSubscription = subscription;
+
+        // Retrieve auth token if user is signed in to attach Bearer header
+        let idToken: string | null = null;
+        try {
+          const user = getCurrentFirebaseUser();
+          if (user) {
+            idToken = await user.getIdToken();
+          }
+        } catch {}
+
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (idToken) {
+          headers['Authorization'] = `Bearer ${idToken}`;
+        }
+
         // Register subscription with server and verify database confirmation
         const regRes = await fetch('/api/push/subscribe', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
             subscription,
             role,

@@ -109,9 +109,9 @@ test('DeliveryLoginScreen.tsx existe e está implementado', () => {
   assert(deliveryLoginExists, 'Arquivo DeliveryLoginScreen.tsx deve existir');
 });
 
-test('App.tsx mantém sessão independente para entregador (deliveryUser / gf_delivery_user)', () => {
-  assert(appContent.includes('gf_delivery_user'), 'App.tsx deve armazenar sessão do entregador em gf_delivery_user');
-  assert(appContent.includes('deliveryUser'), 'App.tsx deve ter estado isolado deliveryUser');
+test('App.tsx utiliza autenticação unificada e sessão centralizada (currentUser / gf_current_user)', () => {
+  assert(appContent.includes('UnifiedLoginScreen'), 'App.tsx deve usar UnifiedLoginScreen');
+  assert(appContent.includes('currentUser'), 'App.tsx deve usar currentUser como sessão oficial');
 });
 
 test('App.tsx oculta barra global de navegação do administrador em view=entregador', () => {
@@ -140,8 +140,7 @@ test('DeliveryPortal filtra rigorosamente para NUNCA exibir pedidos de Retirada 
 
 test('App.tsx e store.ts invalidam sessões de colaboradores desativados imediatamente', () => {
   assert(appContent.includes("fresh.status === 'DESATIVADO' || fresh.status === 'BLOQUEADO'"), 'App.tsx invalida sessão de usuário desativado');
-  assert(appContent.includes("freshDev.status === 'DESATIVADO' || freshDev.status === 'BLOQUEADO'"), 'App.tsx invalida sessão de entregador desativado');
-  assert(appContent.includes('Acesso de entregador revogado ou desativado pela administração'), 'Exibe aviso de revogação');
+  assert(appContent.includes('Sua conta de colaborador foi desativada ou bloqueada pela administração'), 'Exibe aviso de desativação');
 });
 
 test('Regras RBAC impedem entregador de acessar módulos administrativos (PDV, Caixa, Cozinha, etc.)', () => {

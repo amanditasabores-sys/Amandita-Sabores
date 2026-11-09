@@ -30,6 +30,9 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
+    const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
+    const staffToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : undefined;
+
     const data = await readJsonBody(req);
     const { subscription, role, userAgent } = data;
 
@@ -42,7 +45,7 @@ export default async function handler(req: any, res: any) {
       role: role || 'staff',
       userAgent,
       subscribedAt: new Date().toISOString(),
-    });
+    }, staffToken);
 
     return sendJson(res, 200, {
       success: true,

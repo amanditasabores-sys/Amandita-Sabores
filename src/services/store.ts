@@ -14,7 +14,10 @@ import {
   UserRole,
   Combo,
   ComboComponent,
-  DailyMenuConfig
+  DailyMenuConfig,
+  DeliveryPermissions,
+  DeliveryShift,
+  DeliveryShiftSummary
 } from '../types';
 import { soundService } from './audio';
 import { thermalPrinterService } from './thermalPrinter';
@@ -2398,7 +2401,8 @@ class StoreService {
   public assignDeliveryPerson(
     orderId: string, 
     deliveryPerson: { id: string; name: string; phone: string } | null,
-    assignedBy = 'Administração'
+    assignedBy = 'Administração',
+    reason?: string
   ): Order | null {
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
@@ -2423,6 +2427,15 @@ class StoreService {
         newDriverId: undefined,
         newDriverName: undefined,
         assignedBy,
+        reason: reason || 'Atribuição removida pela supervisão',
+      });
+
+      order.movements.push({
+        id: `mov-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        toStatus: order.status,
+        author: assignedBy,
+        notes: `Entregador desvinculado por ${assignedBy}${reason ? ` (Motivo: ${reason})` : ''}`,
       });
 
       localStorage.setItem('gf_orders', JSON.stringify(orders));
@@ -2450,6 +2463,7 @@ class StoreService {
       newDriverId: deliveryPerson.id,
       newDriverName: deliveryPerson.name,
       assignedBy,
+      reason,
     });
 
     order.movements.push({
@@ -2458,8 +2472,32 @@ class StoreService {
       toStatus: order.status,
       author: assignedBy,
       notes: previousDriverName
-        ? `Reatribuído de ${previousDriverName} para ${deliveryPerson.name} por ${assignedBy}`
-        : `Atribuído ao entregador ${deliveryPerson.name} por ${assignedBy}`,
+        ? `Reatribuído de ${previousDriverName} para ${deliveryPerson.name} por ${assignedBy}${reason ? ` (Motivo: ${reason})` : ''}`
+        : `Atribuído ao entregador ${deliveryPerson.name} por ${assignedBy}${reason ? ` (Obs: ${reason})` : ''}`,
+    });
+    order._cloudSyncStatus = 'PENDING';
+
+    localStorage.setItem('gf_orders', JSON.stringify(orders));
+    this.notify('ORDER_UPDATED', order);
+
+    this.queueOrderForSync(order);
+    this.persistOrderToFirestore(order).catch(() => {});
+
+    return order;
+  }
+
+  public addOrderOccurrence(orderId: string, note: string, author = 'Supervisão'): Order | null {
+    const orders = this.getOrders();
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) return null;
+
+    order.updatedAt = new Date().toISOString();
+    order.movements.push({
+      id: `mov-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      toStatus: order.status,
+      author,
+      notes: `[OCORRÊNCIA]: ${note}`,
     });
     order._cloudSyncStatus = 'PENDING';
 
@@ -2763,6 +2801,150 @@ class StoreService {
   }
 
   // ==========================================
+  // DAILY DELIVERY SHIFTS API (SUPERVISÃO DE ENTREGAS)
+  // ==========================================
+  public getCurrentDeliveryShift(): DeliveryShift | null {
+    try {
+      const data = localStorage.getItem('gf_current_delivery_shift');
+      if (data) return JSON.parse(data);
+
+      // Default active open delivery shift for today
+      const today = new Date().toISOString().slice(0, 10);
+      const defaultShift: DeliveryShift = {
+        id: `del-shift-${today}`,
+        date: today,
+        status: 'ABERTO',
+        openedAt: new Date(Date.now() - 4 * 3600 * 1000).toISOString(),
+        openedBy: {
+          userId: 'usr-admin-1',
+          userName: 'Administrador Geral',
+          userRole: 'ADMINISTRADOR',
+        },
+        notes: 'Movimento diário de entregas iniciado automaticamente pelo sistema',
+      };
+      localStorage.setItem('gf_current_delivery_shift', JSON.stringify(defaultShift));
+      return defaultShift;
+    } catch {
+      return null;
+    }
+  }
+
+  public saveCurrentDeliveryShift(shift: DeliveryShift | null): void {
+    if (shift) {
+      const cleanShift = this.cleanForFirestore(shift);
+      try {
+        localStorage.setItem('gf_current_delivery_shift', JSON.stringify(cleanShift));
+      } catch {}
+      if (db) {
+        setDoc(doc(db, 'delivery_shifts', shift.id), cleanShift).catch((err) => {
+          handleFirestoreError(err, OperationType.WRITE, `delivery_shifts/${shift.id}`);
+        });
+      }
+    } else {
+      localStorage.removeItem('gf_current_delivery_shift');
+    }
+    this.notify('DELIVERY_SHIFT_UPDATED', shift);
+  }
+
+  public getDeliveryShiftHistory(): DeliveryShift[] {
+    try {
+      const data = localStorage.getItem('gf_delivery_shifts_history');
+      if (!data) return [];
+      return JSON.parse(data);
+    } catch {
+      return [];
+    }
+  }
+
+  public openDeliveryShift(
+    openedBy: { userId: string; userName: string; userRole: string },
+    notes?: string
+  ): { success: boolean; shift?: DeliveryShift; message: string } {
+    const current = this.getCurrentDeliveryShift();
+    if (current && current.status === 'ABERTO') {
+      return { success: false, shift: current, message: 'Já existe um movimento diário de entregas aberto.' };
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const newShift: DeliveryShift = {
+      id: `del-shift-${today}-${Date.now()}`,
+      date: today,
+      status: 'ABERTO',
+      openedAt: new Date().toISOString(),
+      openedBy,
+      notes: notes || 'Abertura de movimento diário de entregas',
+    };
+
+    this.saveCurrentDeliveryShift(newShift);
+    return { success: true, shift: newShift, message: 'Movimento diário de entregas aberto com sucesso!' };
+  }
+
+  public closeDeliveryShift(
+    closedBy: { userId: string; userName: string; userRole: string },
+    summary: DeliveryShiftSummary,
+    notes?: string
+  ): { success: boolean; shift?: DeliveryShift; message: string } {
+    const shift = this.getCurrentDeliveryShift();
+    if (!shift || shift.status !== 'ABERTO') {
+      return { success: false, message: 'Não há movimento diário de entregas aberto para encerramento.' };
+    }
+
+    const closedShift: DeliveryShift = {
+      ...shift,
+      status: 'FECHADO',
+      closedAt: new Date().toISOString(),
+      closedBy,
+      summary,
+      notes: notes || shift.notes,
+    };
+
+    const history = this.getDeliveryShiftHistory();
+    history.unshift(closedShift);
+    try {
+      localStorage.setItem('gf_delivery_shifts_history', JSON.stringify(history));
+    } catch {}
+
+    this.saveCurrentDeliveryShift(closedShift);
+
+    return { 
+      success: true, 
+      shift: closedShift, 
+      message: 'Movimento diário de entregas fechado com sucesso! Os pedidos pendentes continuam preservados para o próximo movimento.' 
+    };
+  }
+
+  public reopenDeliveryShift(
+    reopenedBy: { userId: string; userName: string; userRole: string }
+  ): { success: boolean; shift?: DeliveryShift; message: string } {
+    const shift = this.getCurrentDeliveryShift();
+    if (shift && shift.status === 'ABERTO') {
+      return { success: false, message: 'O movimento diário de entregas já está aberto.' };
+    }
+
+    const targetShift: DeliveryShift = shift ? {
+      ...shift,
+      status: 'ABERTO',
+      closedAt: undefined,
+      closedBy: undefined,
+      notes: `${shift.notes || ''} (Reaberto por ${reopenedBy.userName})`.trim(),
+    } : {
+      id: `del-shift-${new Date().toISOString().slice(0, 10)}-${Date.now()}`,
+      date: new Date().toISOString().slice(0, 10),
+      status: 'ABERTO',
+      openedAt: new Date().toISOString(),
+      openedBy: reopenedBy,
+      notes: `Reabertura por ${reopenedBy.userName}`,
+    };
+
+    this.saveCurrentDeliveryShift(targetShift);
+    return { success: true, shift: targetShift, message: 'Movimento diário de entregas reaberto com sucesso!' };
+  }
+
+  public getDeliveryDrivers(): User[] {
+    return this.getUsers().filter((u) => u.role === 'ENTREGADOR');
+  }
+
+  // ==========================================
   // RESTAURANT CONFIG API
   // ==========================================
   public getRestaurantConfig(): RestaurantConfig {
@@ -2829,6 +3011,66 @@ class StoreService {
     return this.getUsers().find((u) => u.id === id);
   }
 
+  public getDeliveryPermissions(user?: User | null): DeliveryPermissions {
+    if (!user) {
+      return {
+        canViewDeliveryDashboard: false,
+        canManageDrivers: false,
+        canAssignDeliveries: false,
+        canOpenDailyShift: false,
+        canCloseDailyShift: false,
+        canViewShiftHistory: false,
+        canReopenDailyShift: false,
+      };
+    }
+    const role = (user.role || '').toUpperCase();
+    if (role === 'ADMINISTRADOR' || user.username === 'admin') {
+      return {
+        canViewDeliveryDashboard: true,
+        canManageDrivers: true,
+        canAssignDeliveries: true,
+        canOpenDailyShift: true,
+        canCloseDailyShift: true,
+        canViewShiftHistory: true,
+        canReopenDailyShift: true,
+      };
+    }
+    if (role === 'GERENTE') {
+      return {
+        canViewDeliveryDashboard: true,
+        canManageDrivers: true,
+        canAssignDeliveries: true,
+        canOpenDailyShift: true,
+        canCloseDailyShift: true,
+        canViewShiftHistory: true,
+        canReopenDailyShift: false,
+        ...(user.deliveryPermissions || {}),
+      };
+    }
+    if (role === 'ENTREGADOR') {
+      return {
+        canViewDeliveryDashboard: true,
+        canManageDrivers: false,
+        canAssignDeliveries: false,
+        canOpenDailyShift: false,
+        canCloseDailyShift: false,
+        canViewShiftHistory: false,
+        canReopenDailyShift: false,
+        ...(user.deliveryPermissions || {}),
+      };
+    }
+    return {
+      canViewDeliveryDashboard: false,
+      canManageDrivers: false,
+      canAssignDeliveries: false,
+      canOpenDailyShift: false,
+      canCloseDailyShift: false,
+      canViewShiftHistory: false,
+      canReopenDailyShift: false,
+      ...(user.deliveryPermissions || {}),
+    };
+  }
+
   public getCurrentUser(): User | null {
     try {
       const data = localStorage.getItem('gf_current_user');
@@ -2840,6 +3082,7 @@ class StoreService {
 
   public setCurrentUser(user: User | null): void {
     try {
+      localStorage.removeItem('gf_delivery_user');
       if (user) {
         localStorage.setItem('gf_current_user', JSON.stringify(user));
       } else {

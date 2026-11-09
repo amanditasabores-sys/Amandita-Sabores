@@ -24,6 +24,7 @@ import {
 import confetti from 'canvas-confetti';
 import { User } from '../../types';
 import { AmanditaLogo } from '../common/AmanditaLogo';
+import { DeliverySupervisorDashboard } from './DeliverySupervisorDashboard';
 
 interface DeliveryPortalProps {
   initialOrderId?: string;
@@ -40,8 +41,30 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
   onLogout,
   onBackToAdmin
 }) => {
-  const isSupervisor = Boolean(adminUser || currentUser?.role === 'ADMINISTRADOR' || currentUser?.role === 'GERENTE');
+  const permissions = store.getDeliveryPermissions(currentUser);
+  const isSupervisor = Boolean(
+    adminUser || 
+    currentUser?.role === 'ADMINISTRADOR' || 
+    currentUser?.role === 'GERENTE' || 
+    currentUser?.username === 'admin' ||
+    permissions.canViewDeliveryDashboard
+  );
   const isDriverRole = currentUser?.role === 'ENTREGADOR';
+
+  // 1. COMPORTAMENTO DO ADMINISTRADOR / SUPERVISOR:
+  // Se for Administrador, Gerente ou usuário autorizado na supervisão (e não um entregador individual),
+  // entra AUTOMATICAMENTE no Painel de Supervisão Geral, e NUNCA no painel individual de motorista!
+  if (isSupervisor && !isDriverRole) {
+    return (
+      <DeliverySupervisorDashboard
+        currentUser={currentUser}
+        adminUser={adminUser}
+        onBackToAdmin={onBackToAdmin}
+        onLogout={onLogout}
+        initialOrderId={initialOrderId}
+      />
+    );
+  }
 
   const [driverName, setDriverName] = useState(() => {
     return currentUser?.name || currentUser?.username || 'Entregador Autorizado';

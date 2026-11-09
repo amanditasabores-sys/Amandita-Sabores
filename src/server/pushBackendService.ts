@@ -73,7 +73,6 @@ export interface PushSubscriptionData {
 }
 
 const activePushSubscriptions: Map<string, PushSubscriptionData> = new Map();
-const sentNotificationOrderIds = new Set<string>();
 
 function toFirestoreValue(val: unknown): Record<string, unknown> {
   if (val === null || val === undefined) return { nullValue: null };
@@ -108,7 +107,67 @@ function jsonToFirestoreDocument(obj: Record<string, unknown>): Record<string, u
   return { fields };
 }
 
-export async function savePushSubscription(subData: PushSubscriptionData): Promise<boolean> {
+// In-memory cache for idempotency deduplication across calls in the same container
+const pushDispatchesCache = new Set<string>();
+
+export async function isPushAlreadyDispatched(key: string): Promise<boolean> {
+  if (pushDispatchesCache.has(key)) return true;
+
+  if (adminDb) {
+    try {
+      const snap = await adminDb.collection('push_dispatches').doc(key).get();
+      if (snap.exists) {
+        pushDispatchesCache.add(key);
+        return true;
+      }
+    } catch {}
+  }
+
+  if (API_KEY && PROJECT_ID) {
+    try {
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+      const res = await fetch(`${baseUrl}/push_dispatches/${key}?key=${API_KEY}`);
+      if (res.ok) {
+        pushDispatchesCache.add(key);
+        return true;
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
+export async function markPushDispatched(key: string, orderId: string, event: string): Promise<void> {
+  pushDispatchesCache.add(key);
+
+  const record = {
+    id: key,
+    orderId,
+    event,
+    dispatchedAt: new Date().toISOString(),
+  };
+
+  if (adminDb) {
+    try {
+      await adminDb.collection('push_dispatches').doc(key).set(record);
+      return;
+    } catch {}
+  }
+
+  if (API_KEY && PROJECT_ID) {
+    try {
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+      const docPayload = jsonToFirestoreDocument(record);
+      await fetch(`${baseUrl}/push_dispatches/${key}?key=${API_KEY}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(docPayload),
+      });
+    } catch {}
+  }
+}
+
+export async function savePushSubscription(subData: PushSubscriptionData, staffToken?: string): Promise<boolean> {
   const endpoint = subData.subscription.endpoint;
   const endpointHash = crypto.createHash('sha256').update(endpoint).digest('hex');
   const record = {
@@ -125,7 +184,7 @@ export async function savePushSubscription(subData: PushSubscriptionData): Promi
 
   activePushSubscriptions.set(endpoint, subData);
 
-  // Strategy 1: Firebase Admin SDK
+  // Strategy 1: Firebase Admin SDK (Privileged backend bypass)
   if (adminDb) {
     try {
       await adminDb.collection('push_subscriptions').doc(endpointHash).set(record);
@@ -133,7 +192,24 @@ export async function savePushSubscription(subData: PushSubscriptionData): Promi
     } catch {}
   }
 
-  // Strategy 2: Client SDK
+  // Strategy 2: Authenticated Staff Bearer Token via Firestore REST
+  if (staffToken && PROJECT_ID) {
+    try {
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+      const docPayload = jsonToFirestoreDocument(record);
+      const res = await fetch(`${baseUrl}/push_subscriptions/${endpointHash}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${staffToken}`,
+        },
+        body: JSON.stringify(docPayload),
+      });
+      if (res.ok) return true;
+    } catch {}
+  }
+
+  // Strategy 3: Client SDK
   if (clientDb) {
     try {
       await clientSetDoc(clientDoc(clientDb, 'push_subscriptions', endpointHash), record);
@@ -141,7 +217,7 @@ export async function savePushSubscription(subData: PushSubscriptionData): Promi
     } catch {}
   }
 
-  // Strategy 3: Firestore REST API
+  // Strategy 4: Firestore REST API with API Key
   if (API_KEY) {
     try {
       const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
@@ -292,7 +368,6 @@ export async function sendTestPushNotification(): Promise<{ sent: number; failed
   const pushOptions = {
     TTL: 86400,
     urgency: 'high' as const,
-    topic: 'system-tests',
   };
 
   let sent = 0;
@@ -318,48 +393,124 @@ export async function sendTestPushNotification(): Promise<{ sent: number; failed
   return { sent, failed };
 }
 
-export async function sendOrderPushNotification(order: any): Promise<void> {
-  if (!order || !order.id || sentNotificationOrderIds.has(order.id)) {
-    return;
+export async function sendOrderPushNotification(
+  order: any,
+  event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' = 'NEW_ORDER'
+): Promise<{ sent: number; failed: number; total: number; skipped?: string }> {
+  if (!order || !order.id) {
+    return { sent: 0, failed: 0, total: 0, skipped: 'invalid_order' };
   }
-  sentNotificationOrderIds.add(order.id);
 
-  getVapidConfig(); // Ensure webpush is configured
-  const subscriptions = await getAllPushSubscriptions();
-  if (subscriptions.length === 0) {
-    return;
+  // 1. Strictly restrict notifications to ONLY the two authorized business events
+  if (event !== 'NEW_ORDER' && event !== 'DELIVERY_CONFIRMED') {
+    return { sent: 0, failed: 0, total: 0, skipped: 'unauthorized_event' };
   }
+
+  // 2. Persistent Cross-Instance Idempotency Lock
+  const idempotencyKey = `notif_${order.id}_${event}`;
+  const alreadySent = await isPushAlreadyDispatched(idempotencyKey);
+  if (alreadySent) {
+    console.info(`[Web Push Idempotency] Notificação '${event}' para pedido #${order.orderNumber} já enviada. Ignorando duplicata.`);
+    return { sent: 0, failed: 0, total: 0, skipped: 'already_sent' };
+  }
+
+  // Mark immediately as dispatched to avoid race conditions between parallel workers
+  await markPushDispatched(idempotencyKey, order.id, event);
+
+  // 3. Ensure VAPID configuration is initialized
+  getVapidConfig();
+
+  // 4. Retrieve subscriptions
+  const allSubscriptions = await getAllPushSubscriptions();
+  if (allSubscriptions.length === 0) {
+    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição push registrada para alerta.`);
+    return { sent: 0, failed: 0, total: 0, skipped: 'no_subscriptions' };
+  }
+
+  // STRICT PRIVACY SHIELD: Filter subscriptions exclusively to authorized staff roles
+  // Anonymous customer devices that might have subscribed must NEVER receive internal order notifications
+  const staffSubscriptions = allSubscriptions.filter((s) => {
+    const r = (s.role || '').toUpperCase();
+    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE', 'ENTREGADOR', 'STAFF'].includes(r);
+  });
+
+  if (staffSubscriptions.length === 0) {
+    console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição de funcionário autorizada ativa.`);
+    return { sent: 0, failed: 0, total: 0, skipped: 'no_staff_subscriptions' };
+  }
+
+  // Chronological integrity: respect order's real creation or delivery time
+  const orderTimestamp = order.createdAt ? new Date(order.createdAt).getTime() : Date.now();
+
+  let title = '';
+  let body = '';
+  let tag = '';
+  let targetUrl = '/?view=producao';
+
+  if (event === 'NEW_ORDER') {
+    title = `Novo Pedido #${order.orderNumber}!`;
+    body = `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`;
+    tag = `order-${order.id}`;
+    targetUrl = '/?view=producao';
+  } else {
+    // DELIVERY_CONFIRMED
+    const driverName = order.deliveryPersonName || order.deliveryPerson?.name || 'Entregador';
+    title = `Entrega Concluída! Pedido #${order.orderNumber}`;
+    body = `Entregador ${driverName} confirmou a entrega para ${order.customer?.name || 'Cliente'}.`;
+    tag = `delivery-${order.id}`;
+    targetUrl = '/?view=admin';
+  }
+
+  console.info(`[Web Push] Disparando alerta (${event}) pedido #${order.orderNumber} para ${staffSubscriptions.length} dispositivo(s) da equipe...`);
 
   const payload = JSON.stringify({
-    title: `Novo Pedido #${order.orderNumber}!`,
-    body: `${order.customer?.name || 'Cliente'} · R$ ${(order.totalAmount || 0).toFixed(2)} · ${order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : 'Entrega'}`,
+    title,
+    body,
     icon: '/pwa-192x192.png',
     badge: '/favicon-32x32.png',
-    tag: `order-${order.id}`,
+    tag,
     orderId: order.id,
-    url: '/?view=producao',
-    timestamp: Date.now(),
+    orderNumber: order.orderNumber,
+    eventType: event,
+    url: targetUrl,
+    timestamp: orderTimestamp,
   });
 
   const pushOptions = {
-    TTL: 86400,
-    urgency: 'high' as const,
-    topic: 'new-orders',
+    TTL: 86400, // 24 horas de retenção nos gateways FCM/Apple
+    urgency: 'high' as const, // Força acordar o dispositivo mesmo em modo Doze/economia de bateria no Android
   };
 
   const deadEndpoints: string[] = [];
+  let sent = 0;
+  let failed = 0;
 
-  for (const subData of subscriptions) {
+  // Await each push notification dispatch concurrently
+  const sendPromises = staffSubscriptions.map(async (subData) => {
     try {
       await webpush.sendNotification(subData.subscription, payload, pushOptions);
+      sent++;
     } catch (err: any) {
-      if (err.statusCode === 404 || err.statusCode === 410) {
+      failed++;
+      console.warn(`[Web Push] Falha ao enviar para endpoint (${err?.statusCode || 'erro'}):`, err?.message);
+      if (err?.statusCode === 404 || err?.statusCode === 410) {
         deadEndpoints.push(subData.subscription.endpoint);
       }
     }
-  }
+  });
 
+  await Promise.allSettled(sendPromises);
+
+  // Clean up dead subscriptions
   for (const endpoint of deadEndpoints) {
     await deletePushSubscription(endpoint);
   }
+
+  console.info(`[Web Push] Resumo de envio pedido #${order.orderNumber} (${event}): ${sent}/${staffSubscriptions.length} entregas confirmadas.`);
+
+  return {
+    sent,
+    failed,
+    total: staffSubscriptions.length,
+  };
 }

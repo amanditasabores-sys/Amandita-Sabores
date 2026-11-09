@@ -4,31 +4,21 @@ import { User } from './types';
 import { AdminDashboard } from './components/admin/AdminDashboard';
 import { CustomerMenu } from './components/menu/CustomerMenu';
 import { DeliveryPortal } from './components/delivery/DeliveryPortal';
-import { DeliveryLoginScreen } from './components/delivery/DeliveryLoginScreen';
 import { OrderTrackingView } from './components/tracking/OrderTrackingView';
 import { KitchenScreen } from './components/staff/KitchenScreen';
 import { CashierScreen } from './components/staff/CashierScreen';
 import { AttendantScreen } from './components/staff/AttendantScreen';
 import { AuthModal } from './components/auth/AuthModal';
+import { UnifiedLoginScreen } from './components/auth/UnifiedLoginScreen';
 import { pushNotificationService } from './services/pushNotification';
-import { AmanditaLogo } from './components/common/AmanditaLogo';
 import { 
-  ShieldCheck, 
   UtensilsCrossed, 
   Bike, 
-  MapPin, 
-  LogIn, 
   ChefHat, 
   Vault, 
   Store, 
   ShieldAlert, 
-  X, 
-  Lock, 
-  Sparkles,
-  User as UserIcon,
-  AlertCircle,
-  Eye,
-  EyeOff
+  X 
 } from 'lucide-react';
 
 export type AppView = 'admin' | 'cardapio' | 'entregador' | 'producao' | 'caixa' | 'atendente' | 'rastreio';
@@ -65,54 +55,8 @@ export default function App() {
     return 'admin';
   });
 
-  // Employee inline login state
-  const [loginIdentifier, setLoginIdentifier] = useState('');
-  const [loginPassword, setLoginPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
-  const [loginError, setLoginError] = useState<string | null>(null);
-  const [loginLoading, setLoginLoading] = useState(false);
-
-  const handleInlineLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoginError(null);
-    setLoginLoading(true);
-
-    if (!loginIdentifier.trim() || !loginPassword.trim()) {
-      setLoginError('Por favor, informe seu usuário ou e-mail e senha.');
-      setLoginLoading(false);
-      return;
-    }
-
-    const res = await store.login(loginIdentifier, loginPassword);
-    setLoginLoading(false);
-
-    if (res.success && res.user) {
-      setCurrentUser(res.user);
-      navigateTo(getDefaultViewForRole(res.user.role));
-    } else {
-      setLoginError(res.message);
-    }
-  };
-
   const [selectedOrderId, setSelectedOrderId] = useState<string>('');
   const [selectedTrackingCode, setSelectedTrackingCode] = useState<string>('');
-
-  // Independent delivery driver session (strictly isolated from administrative currentUser)
-  const [deliveryUser, setDeliveryUser] = useState<User | null>(() => {
-    try {
-      const raw = localStorage.getItem('gf_delivery_user');
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as User;
-      const current = store.getUserById(parsed.id);
-      if (!current || current.status === 'DESATIVADO' || current.status === 'BLOQUEADO') {
-        localStorage.removeItem('gf_delivery_user');
-        return null;
-      }
-      return current;
-    } catch {
-      return null;
-    }
-  });
 
   const getDefaultViewForRole = (role?: string): AppView => {
     const norm = role?.toUpperCase();
@@ -127,9 +71,6 @@ export default function App() {
     // Public customer views
     if (view === 'cardapio' || view === 'rastreio') return true;
 
-    // Dedicated delivery screen manages its independent delivery authentication
-    if (view === 'entregador') return true;
-
     // Unauthenticated visitors have NO permission for internal modules
     if (!user) return false;
 
@@ -141,6 +82,12 @@ export default function App() {
     const role = user.role?.toUpperCase();
     if (role === 'ADMINISTRADOR' || role === 'GERENTE' || user.username === 'admin') {
       return true; // Full access across all modules
+    }
+
+    if (view === 'entregador') {
+      if (role === 'ENTREGADOR') return true;
+      const perms = store.getDeliveryPermissions(user);
+      return Boolean(perms.canViewDeliveryDashboard);
     }
 
     // Delivery drivers cannot access internal administrative modules (PDV, Caixa, Cozinha, etc.)
@@ -252,22 +199,6 @@ export default function App() {
         }
       } else {
         setCurrentUser(null);
-      }
-
-      // Check dedicated delivery session status
-      const rawDev = localStorage.getItem('gf_delivery_user');
-      if (rawDev) {
-        try {
-          const parsed = JSON.parse(rawDev) as User;
-          const freshDev = store.getUserById(parsed.id);
-          if (freshDev && (freshDev.status === 'DESATIVADO' || freshDev.status === 'BLOQUEADO')) {
-            localStorage.removeItem('gf_delivery_user');
-            setDeliveryUser(null);
-            setSecurityNotice('Acesso de entregador revogado ou desativado pela administração.');
-          }
-        } catch {
-          // ignore
-        }
       }
     };
 
@@ -505,126 +436,42 @@ export default function App() {
         />
       )}
 
-      {/* VIEW 6: PORTAL DO ENTREGADOR (SESSÃO EXCLUSIVA DO ENTREGADOR OU MODO SUPERVISÃO ADMIN) */}
-      {currentView === 'entregador' && (
-        (deliveryUser || (currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE'))) ? (
-          <DeliveryPortal
-            initialOrderId={selectedOrderId || undefined}
-            currentUser={deliveryUser || null}
-            adminUser={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? currentUser : null}
-            onBackToAdmin={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? () => navigateTo('admin') : undefined}
-            onLogout={() => {
-              localStorage.removeItem('gf_delivery_user');
-              setDeliveryUser(null);
-            }}
-          />
-        ) : (
-          <DeliveryLoginScreen
-            adminUser={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? currentUser : null}
-            onBackToAdmin={currentUser && (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? () => navigateTo('admin') : undefined}
-            onLoginSuccess={(loggedUser) => {
-              localStorage.setItem('gf_delivery_user', JSON.stringify(loggedUser));
-              setDeliveryUser(loggedUser);
-            }}
-          />
-        )
+      {/* UNIFIED AUTHENTICATION FOR ALL UNLOGGED ACCESS (EXCEPT PUBLIC CARDÁPIO & RASTREIO) */}
+      {!currentUser && currentView !== 'cardapio' && currentView !== 'rastreio' && (
+        <UnifiedLoginScreen
+          initialNotice={securityNotice}
+          onLoginSuccess={(loggedUser) => {
+            setCurrentUser(loggedUser);
+            setSecurityNotice(null);
+            const targetView = getDefaultViewForRole(loggedUser.role);
+            navigateTo(targetView);
+          }}
+          onNavigateToCustomerMenu={() => navigateTo('cardapio')}
+        />
       )}
 
-      {/* VIEW 7: PAINEL ADMINISTRATIVO (ADMIN OU LOGIN DE FUNCIONÁRIO) */}
-      {currentView === 'admin' && (
-        <>
-          {currentUser ? (
-            <AdminDashboard
-              currentUser={currentUser}
-              onLogout={handleLogout}
-              onNavigateToView={(v) => navigateTo(v)}
-            />
-          ) : (
-            <div className="min-h-[85vh] flex flex-col items-center justify-center p-4">
-              <div className="bg-[#FFFDF9] rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-xl border border-[#E8DFD5]">
-                <div className="text-center mb-5">
-                  <div className="flex justify-center mb-3">
-                    <AmanditaLogo variant="icon" size="lg" theme="light" />
-                  </div>
-                  <h2 className="text-xl sm:text-2xl font-black text-[#2C1810]">Acesso do Colaborador</h2>
-                  <p className="text-xs text-[#8C5E47] mt-1.5 leading-relaxed">
-                    Amandita Sabores · Faça login com seu usuário e senha autorizados para acessar seu módulo de trabalho.
-                  </p>
-                </div>
+      {/* VIEW 6: PORTAL DO ENTREGADOR (SESSÃO UNIFICADA: ENTREGADOR OU MODO SUPERVISÃO ADMIN) */}
+      {currentUser && currentView === 'entregador' && (
+        <DeliveryPortal
+          initialOrderId={selectedOrderId || undefined}
+          currentUser={currentUser}
+          adminUser={(currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') ? currentUser : null}
+          onBackToAdmin={
+            (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || store.getDeliveryPermissions(currentUser).canViewDeliveryDashboard)
+              ? () => navigateTo('admin')
+              : undefined
+          }
+          onLogout={handleLogout}
+        />
+      )}
 
-                {loginError && (
-                  <div className="mb-4 p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2 animate-in fade-in">
-                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
-                    <span>{loginError}</span>
-                  </div>
-                )}
-
-                <form onSubmit={handleInlineLogin} className="space-y-3.5">
-                  <div>
-                    <label className="block text-xs font-bold text-[#3D2314] uppercase tracking-wider mb-1">
-                      Usuário ou E-mail
-                    </label>
-                    <div className="relative">
-                      <UserIcon className="w-4 h-4 text-[#8C5E47] absolute left-3.5 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        value={loginIdentifier}
-                        onChange={(e) => setLoginIdentifier(e.target.value)}
-                        placeholder="Ex: admin, caixa, cozinha..."
-                        className="w-full pl-10 pr-4 py-2.5 bg-white border border-[#E8DFD5] rounded-xl text-sm text-[#2C1810] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#C86D3B]/40 focus:border-[#C86D3B] transition"
-                        autoFocus
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-[#3D2314] uppercase tracking-wider mb-1">
-                      Senha
-                    </label>
-                    <div className="relative">
-                      <Lock className="w-4 h-4 text-[#8C5E47] absolute left-3.5 top-1/2 -translate-y-1/2" />
-                      <input
-                        type={showPassword ? 'text' : 'password'}
-                        value={loginPassword}
-                        onChange={(e) => setLoginPassword(e.target.value)}
-                        placeholder="Sua senha secreta"
-                        className="w-full pl-10 pr-10 py-2.5 bg-white border border-[#E8DFD5] rounded-xl text-sm text-[#2C1810] placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#C86D3B]/40 focus:border-[#C86D3B] transition"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowPassword(!showPassword)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-[#3D2314] p-1 transition cursor-pointer"
-                        title={showPassword ? 'Ocultar senha' : 'Ver senha'}
-                      >
-                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={loginLoading}
-                    className="w-full py-3 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] hover:opacity-95 text-white font-bold rounded-xl text-sm transition flex items-center justify-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
-                  >
-                    <LogIn className="w-4 h-4 text-white" />
-                    <span>{loginLoading ? 'Validando Acesso...' : 'Entrar no Sistema'}</span>
-                  </button>
-                </form>
-
-                <div className="mt-5 pt-4 border-t border-[#E8DFD5] text-center">
-                  <button
-                    type="button"
-                    onClick={() => navigateTo('cardapio')}
-                    className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#8C5E47] hover:text-[#C86D3B] transition cursor-pointer"
-                  >
-                    <UtensilsCrossed className="w-3.5 h-3.5" />
-                    <span>Acessar Cardápio Digital Público do Cliente →</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-        </>
+      {/* VIEW 7: PAINEL ADMINISTRATIVO (ADMIN OU GERENTE) */}
+      {currentUser && currentView === 'admin' && (
+        <AdminDashboard
+          currentUser={currentUser}
+          onLogout={handleLogout}
+          onNavigateToView={(v) => navigateTo(v)}
+        />
       )}
 
       {/* SECURITY ACCESS NOTICE TOAST */}

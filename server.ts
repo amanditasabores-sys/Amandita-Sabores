@@ -865,10 +865,12 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
         return;
       }
       const eventType = (event === 'DELIVERY_CONFIRMED' ? 'DELIVERY_CONFIRMED' : 'NEW_ORDER');
-      sendOrderPushNotification(order, eventType).catch((pushErr) => {
-        console.warn('[Web Push Notify-Order] Aviso ao despachar push:', pushErr?.message || pushErr);
+      const stats = await sendOrderPushNotification(order, eventType);
+      res.json({
+        success: true,
+        message: `Notificação push do evento ${eventType} despachada com sucesso aos dispositivos autorizados.`,
+        stats,
       });
-      res.json({ success: true, message: `Notificação push do evento ${eventType} despachada com sucesso aos dispositivos autorizados.` });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, message: msg });

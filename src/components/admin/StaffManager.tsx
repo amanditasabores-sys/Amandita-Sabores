@@ -789,7 +789,7 @@ export const StaffManager: React.FC = () => {
                           type="checkbox"
                           checked={isChecked}
                           onChange={(e) => {
-                            setFormDeliveryPermissions((prev) => ({
+                            setFormDeliveryPermissions((prev: DeliveryPermissions) => ({
                               ...prev,
                               [perm.key]: e.target.checked
                             }));

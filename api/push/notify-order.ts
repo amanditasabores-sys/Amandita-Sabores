@@ -31,17 +31,23 @@ export default async function handler(req: any, res: any) {
 
   try {
     const data = await readJsonBody(req);
-    const { order } = data;
+    const { order, event = 'NEW_ORDER' } = data;
 
     if (!order || !order.id) {
       return sendJson(res, 400, { success: false, message: 'Pedido ausente ou sem identificador.' });
     }
 
-    sendOrderPushNotification(order).catch(() => {});
+    const eventType = event === 'DELIVERY_CONFIRMED' ? 'DELIVERY_CONFIRMED' : 'NEW_ORDER';
 
+    // CRITICAL for Vercel Serverless: Await push dispatch before sending HTTP response
+    // Otherwise Vercel terminates the Lambda container immediately, killing pending HTTP push requests.
+    const result = await sendOrderPushNotification(order, eventType);
+
+    const eventLabel = eventType === 'DELIVERY_CONFIRMED' ? 'entrega concluída' : 'novo pedido';
     return sendJson(res, 200, {
       success: true,
-      message: 'Notificação push de novo pedido despachada com sucesso aos dispositivos da equipe.',
+      message: `Notificação push de ${eventLabel} processada com sucesso. Entregas confirmadas: ${result.sent}/${result.total}.`,
+      stats: result,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
