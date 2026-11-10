@@ -116,6 +116,23 @@
         "role": { "type": "string" }
       },
       "required": ["id", "username", "timestamp", "action"]
+    },
+    "DeliveryShift": {
+      "title": "DeliveryShift",
+      "description": "Turno e movimento diário de supervisão de entregas e estatísticas de entregadores",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "date": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["ABERTO", "FECHADO"] },
+        "openedAt": { "type": "string", "format": "date-time" },
+        "openedBy": { "type": "object" },
+        "closedAt": { "type": "string" },
+        "closedBy": { "type": "object" },
+        "summary": { "type": "object" },
+        "notes": { "type": "string", "maxLength": 1000 }
+      },
+      "required": ["id", "date", "status", "openedAt", "openedBy"]
     }
   },
   "firestore": {
@@ -134,6 +151,10 @@
     "/cash_shifts/{shiftId}": {
       "schema": "CashShift",
       "description": "Turnos de caixa abertos e históricos de fechamento"
+    },
+    "/delivery_shifts/{shiftId}": {
+      "schema": "DeliveryShift",
+      "description": "Movimento diário de supervisão de entregas, fechamentos e estatísticas"
     },
     "/users/{userId}": {
       "schema": "UserProfile",

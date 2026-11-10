@@ -479,8 +479,8 @@ class StoreService {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       
-      // If direct write was rejected (e.g. cart size limit in client rules), attempt backend fallback
-      if (typeof window !== 'undefined' && (order.items?.length || 0) > 5) {
+      // If direct write was rejected (e.g. security rules or auth token pending), attempt backend fallback
+      if (typeof window !== 'undefined') {
         try {
           let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
           if (auth?.currentUser) {
@@ -1171,9 +1171,9 @@ class StoreService {
           if (newlyReadyDeliveries.length > 0) {
             newlyReadyDeliveries.forEach((o) => this.recordDriverReadyOrder(o.id));
             const activeUser = this.getCurrentUser();
-            const isRelevantToDriver = activeUser && newlyReadyDeliveries.some((o) => this.isDriverAssignedToOrder(o, activeUser));
-            if (isRelevantToDriver) {
-              soundService.startDriverReadyAlert();
+            const relevantReady = newlyReadyDeliveries.find((o) => this.isDriverAssignedToOrder(o, activeUser));
+            if (activeUser && relevantReady) {
+              soundService.startDriverReadyAlert(3500, 4, relevantReady.id);
             }
             this.notify('DRIVER_ORDER_READY', newlyReadyDeliveries);
           }
@@ -1183,27 +1183,64 @@ class StoreService {
             const pendingIds = new Set(pendingOrders.map((o) => o.id));
             const remoteMap = new Map(remoteOrders.map((o) => [o.id, o]));
 
+            // Strict status precedence hierarchy: newer pipeline progression always wins
+            const STATUS_PRECEDENCE: Record<string, number> = {
+              NOVO: 1,
+              EM_PREPARO: 2,
+              PRONTO: 3,
+              EM_ROTA: 4,
+              ENTREGUE: 5,
+              CANCELADO: 6,
+            };
+
             const merged: Order[] = [];
-            // Preserve pending local orders so user actions aren't overwritten before upload
+
+            // Reconcile local orders against incoming remote Firestore data
             for (const lo of localOrders) {
-              if (pendingIds.has(lo.id)) {
+              const ro = remoteMap.get(lo.id);
+              if (!ro) {
+                // Exists only locally
                 merged.push(lo);
+              } else {
                 remoteMap.delete(lo.id);
+
+                const roRank = STATUS_PRECEDENCE[ro.status] || 0;
+                const loRank = STATUS_PRECEDENCE[lo.status] || 0;
+                const roTime = ro.updatedAt ? new Date(ro.updatedAt).getTime() : 0;
+                const loTime = lo.updatedAt ? new Date(lo.updatedAt).getTime() : 0;
+                const roMovesCount = ro.movements?.length || 0;
+                const loMovesCount = lo.movements?.length || 0;
+
+                // Remote WINS if:
+                // 1. Remote status is further along the pipeline (e.g. EM_ROTA or ENTREGUE vs PRONTO)
+                // 2. OR remote timestamp is newer than or equal to local
+                // 3. OR remote has more movement audit records
+                if (
+                  roRank > loRank ||
+                  (roRank === loRank && roTime >= loTime) ||
+                  roMovesCount > loMovesCount
+                ) {
+                  this.removeOrderFromSyncQueue(lo.id);
+                  merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+                } else if (pendingIds.has(lo.id)) {
+                  // Keep true pending local changes that have not yet reached remote
+                  merged.push(lo);
+                } else {
+                  merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+                }
               }
             }
-            // Add remote orders
+
+            // Add any remaining remote orders not yet present in local storage
             for (const ro of remoteMap.values()) {
               merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
-            }
-            // Preserve any local order not yet on remote
-            for (const lo of localOrders) {
-              if (!merged.some((m) => m.id === lo.id)) {
-                merged.push(lo);
-              }
             }
 
             merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
             localStorage.setItem('gf_orders', JSON.stringify(merged));
+
+            // Apply automated assignment rule: if exactly 1 active driver exists, auto-assign
+            this.applyAutomaticDriverAssignment();
           } else if (localOrders.length > 0 && db) {
             // Firestore orders was empty: seed existing local orders to Firestore
             for (const lo of localOrders) {
@@ -1849,32 +1886,52 @@ class StoreService {
       ? crypto.randomUUID().replace(/-/g, '')
       : `tk_${Date.now()}_${Math.random().toString(36).substring(2, 12)}`;
 
-    // Resolve fixed default delivery person from administrative settings
-    // Strictly requires active profile with role ENTREGADOR. Never assigns admin or cashier.
+    // Automated driver assignment rule:
+    // 1. Exactly 1 active driver: automatically assigns the order to this driver without requiring admin action.
+    // 2. Two or more active drivers: remains unassigned for the administrator to choose.
+    // 3. Zero active drivers: remains unassigned with clear alert for the administration.
     const cfg = this.getRestaurantConfig();
     let assignedDriver: { id: string; name: string; phone: string } | undefined = undefined;
     let initialAssignmentHistory: any[] | undefined = undefined;
 
-    if (!isRetirada && cfg.defaultDeliveryPersonId) {
-      const allUsers = this.getUsers();
-      const driver = allUsers.find(
-        (u) => u.id === cfg.defaultDeliveryPersonId && u.role === 'ENTREGADOR' && u.status === 'ATIVO'
-      );
-      if (driver) {
-        const dName = driver.name || driver.username;
+    if (!isRetirada) {
+      const activeDrivers = this.getActiveDeliveryDrivers();
+      if (activeDrivers.length === 1) {
+        const soleDriver = activeDrivers[0];
+        const dName = soleDriver.name || soleDriver.username;
         assignedDriver = {
-          id: driver.id,
+          id: soleDriver.id,
           name: dName,
-          phone: driver.phone || '',
+          phone: soleDriver.phone || '',
         };
         initialAssignmentHistory = [
           {
             assignedAt: now,
-            newDriverId: driver.id,
+            newDriverId: soleDriver.id,
             newDriverName: dName,
-            assignedBy: 'Atribuição Automática (Configurações)',
+            assignedBy: 'Sistema (Atribuição Automática - Único Entregador Ativo)',
+            reason: 'Atribuição automática: 1 entregador ativo no estabelecimento',
           }
         ];
+      } else if (cfg.defaultDeliveryPersonId && activeDrivers.length > 1) {
+        // Fallback to configured default only if that driver is confirmed active among the multiple drivers
+        const driver = activeDrivers.find((u) => u.id === cfg.defaultDeliveryPersonId);
+        if (driver) {
+          const dName = driver.name || driver.username;
+          assignedDriver = {
+            id: driver.id,
+            name: dName,
+            phone: driver.phone || '',
+          };
+          initialAssignmentHistory = [
+            {
+              assignedAt: now,
+              newDriverId: driver.id,
+              newDriverName: dName,
+              assignedBy: 'Atribuição Padrão (Configurações)',
+            }
+          ];
+        }
       }
     }
 
@@ -2318,20 +2375,19 @@ class StoreService {
 
   public getUnseenDriverReadyOrderIds(driverUser?: User | null): string[] {
     try {
-      const data = localStorage.getItem('gf_driver_unseen_ready_orders');
-      const allUnseen: string[] = data ? JSON.parse(data) : [];
       const acknowledged = new Set(this.getAcknowledgedDriverReadyOrderIds());
       const allOrders = this.getOrders();
 
-      return allUnseen.filter((id) => {
-        if (acknowledged.has(id)) return false;
-        const order = allOrders.find((o) => o.id === id);
-        if (!order || order.status !== 'PRONTO' || order.fulfillmentType !== 'DELIVERY') return false;
+      const readyDeliveries = allOrders.filter((o) => {
+        if (o.status !== 'PRONTO' || o.fulfillmentType !== 'DELIVERY') return false;
+        if (acknowledged.has(o.id)) return false;
         if (driverUser) {
-          return this.isDriverAssignedToOrder(order, driverUser);
+          return this.isDriverAssignedToOrder(o, driverUser);
         }
         return true;
       });
+
+      return readyDeliveries.map((o) => o.id);
     } catch {
       return [];
     }
@@ -2394,7 +2450,13 @@ class StoreService {
     this.notify('DRIVER_READY_ALERTS_SILENCED', {});
   }
 
-  public updateOrderStatus(orderId: string, newStatus: OrderStatus, author: string, notes?: string): Order | null {
+  public updateOrderStatus(
+    orderId: string, 
+    newStatus: OrderStatus, 
+    author: string, 
+    notes?: string, 
+    autoPersist = true
+  ): Order | null {
     const currentUser = this.getCurrentUser();
     if (currentUser && !this.canUserUpdateOrderStatus(currentUser, newStatus)) {
       console.warn(`[Security Guard] Usuário @${currentUser.username} (${currentUser.role}) não possui permissão para avançar pedido para ${newStatus}.`);
@@ -2414,17 +2476,21 @@ class StoreService {
 
     // Additional status actions
     if (newStatus === 'ENTREGUE') {
-      // NOTE: Concluding physical delivery does NOT automatically force payment to PAGO if it was PENDENTE.
-      // Payment status is preserved and must be confirmed by cashier/operator when funds are verified.
+      // Concluding delivery automatically marks ready order as seen and silences audio
+      this.markDriverReadyOrderSeen(order.id);
+      soundService.stopDriverReadyAlert();
+
       const cleanDriverName = author.replace(/^Entregador\s*/i, '').trim() || 'Entregador de Plantão';
       if (!order.deliveryPerson) {
         order.deliveryPerson = {
-          id: `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          id: currentUser?.id || `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
           name: cleanDriverName,
-          phone: '',
+          phone: currentUser?.phone || '',
           assignedAt: now,
           deliveredAt: now,
         };
+        order.deliveryPersonId = order.deliveryPerson.id;
+        order.deliveryPersonName = order.deliveryPerson.name;
       } else {
         order.deliveryPerson.deliveredAt = now;
         if (!order.deliveryPerson.name || order.deliveryPerson.name === 'Entregador de Plantão') {
@@ -2453,14 +2519,20 @@ class StoreService {
         }
       }
     } else if (newStatus === 'EM_ROTA') {
+      // Driver took the order: immediately silence and dismiss ready alert
+      this.markDriverReadyOrderSeen(order.id);
+      soundService.stopDriverReadyAlert();
+
       const cleanDriverName = author.replace(/^Entregador\s*/i, '').trim() || 'Entregador de Plantão';
       if (!order.deliveryPerson) {
         order.deliveryPerson = {
-          id: `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          id: currentUser?.id || `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
           name: cleanDriverName,
-          phone: '',
+          phone: currentUser?.phone || '',
           assignedAt: now,
         };
+        order.deliveryPersonId = order.deliveryPerson.id;
+        order.deliveryPersonName = order.deliveryPerson.name;
       } else if (!order.deliveryPerson.assignedAt) {
         order.deliveryPerson.assignedAt = now;
       }
@@ -2483,9 +2555,11 @@ class StoreService {
     soundService.playSuccessTone();
     this.notify('ORDER_UPDATED', order);
 
-    // Queue for cloud sync and attempt immediate transmission to Cloud Firestore
+    // Queue for cloud sync and attempt immediate transmission to Cloud Firestore if autoPersist is true
     this.queueOrderForSync(order);
-    this.persistOrderToFirestore(order).catch(() => {});
+    if (autoPersist) {
+      this.persistOrderToFirestore(order).catch(() => {});
+    }
 
     // Dispatch appropriate push & in-app alerts based on business events
     if (newStatus === 'ENTREGUE') {
@@ -2496,7 +2570,7 @@ class StoreService {
       this.notify('DRIVER_ORDER_READY', order);
       const activeUser = this.getCurrentUser();
       if (activeUser && this.isDriverAssignedToOrder(order, activeUser)) {
-        soundService.startDriverReadyAlert();
+        soundService.startDriverReadyAlert(3500, 4, order.id);
       }
     }
 
@@ -2509,7 +2583,7 @@ class StoreService {
     author = 'Operador', 
     notes?: string
   ): Promise<{ order: Order | null; synced: boolean; error?: string }> {
-    const order = this.updateOrderStatus(orderId, newStatus, author, notes);
+    const order = this.updateOrderStatus(orderId, newStatus, author, notes, false);
     if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
     const res = await this.persistOrderToFirestore(order);
     if (newStatus === 'ENTREGUE') {
@@ -3025,7 +3099,27 @@ class StoreService {
         localStorage.setItem('gf_current_delivery_shift', JSON.stringify(cleanShift));
       } catch {}
       if (db) {
-        setDoc(doc(db, 'delivery_shifts', shift.id), cleanShift).catch((err) => {
+        setDoc(doc(db, 'delivery_shifts', shift.id), cleanShift).catch(async (err) => {
+          console.warn('[Firestore Delivery Shift] Direct write notice:', err);
+          if (typeof window !== 'undefined' && typeof fetch === 'function') {
+            try {
+              let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+              if (auth?.currentUser) {
+                try {
+                  const idToken = await auth.currentUser.getIdToken();
+                  if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+                } catch {}
+              }
+              const res = await fetch('/api/delivery-shifts', {
+                method: 'POST',
+                headers: authHeaders,
+                body: JSON.stringify({ shift: cleanShift }),
+              });
+              if (res.ok) return;
+            } catch {
+              // Fallback error
+            }
+          }
           handleFirestoreError(err, OperationType.WRITE, `delivery_shifts/${shift.id}`);
         });
       }
@@ -3130,7 +3224,90 @@ class StoreService {
   }
 
   public getDeliveryDrivers(): User[] {
-    return this.getUsers().filter((u) => u.role === 'ENTREGADOR');
+    return this.getUsers().filter((u) => u.role?.toUpperCase() === 'ENTREGADOR');
+  }
+
+  /**
+   * Returns ONLY users with role ENTREGADOR and status ATIVO.
+   * Strictly excludes disabled, blocked, or other roles.
+   */
+  public getActiveDeliveryDrivers(): User[] {
+    return this.getUsers().filter(
+      (u) => (u.role?.toUpperCase() === 'ENTREGADOR') && u.status === 'ATIVO'
+    );
+  }
+
+  /**
+   * Automatically assigns unassigned delivery orders if there is EXACTLY 1 active delivery driver.
+   * - 1 active driver: automatically assigns without requiring admin manual choice.
+   * - >= 2 active drivers: remains unassigned for admin manual selection.
+   * - 0 active drivers: remains unassigned with clear alert for administration.
+   * Operates idempotently: assigns an order once without duplicate log spam.
+   */
+  public applyAutomaticDriverAssignment(): boolean {
+    const activeDrivers = this.getActiveDeliveryDrivers();
+    if (activeDrivers.length !== 1) {
+      return false;
+    }
+
+    const soleDriver = activeDrivers[0];
+    const soleDriverName = soleDriver.name || soleDriver.username;
+    const orders = this.getOrders();
+    let hasModified = false;
+    const now = new Date().toISOString();
+
+    for (const order of orders) {
+      if (
+        order.fulfillmentType === 'DELIVERY' &&
+        order.status !== 'ENTREGUE' &&
+        order.status !== 'CANCELADO' &&
+        !order.deliveryPersonId &&
+        !order.deliveryPerson
+      ) {
+        order.deliveryPersonId = soleDriver.id;
+        order.deliveryPersonName = soleDriverName;
+        order.deliveryPerson = {
+          id: soleDriver.id,
+          name: soleDriverName,
+          phone: soleDriver.phone || '',
+          assignedAt: now,
+        };
+        if (!order.deliveryAssignmentHistory) {
+          order.deliveryAssignmentHistory = [];
+        }
+        order.deliveryAssignmentHistory.push({
+          assignedAt: now,
+          newDriverId: soleDriver.id,
+          newDriverName: soleDriverName,
+          assignedBy: 'Sistema (Atribuição Automática - Único Entregador Ativo)',
+          reason: 'Atribuição automática: 1 entregador ativo no estabelecimento',
+        });
+        if (!order.movements) {
+          order.movements = [];
+        }
+        order.movements.push({
+          id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          timestamp: now,
+          toStatus: order.status,
+          author: 'Sistema',
+          notes: `Pedido delivery atribuído automaticamente a ${soleDriverName} (único entregador ativo)`,
+        });
+        order.updatedAt = now;
+        order._cloudSyncStatus = 'PENDING';
+        hasModified = true;
+        this.persistOrderToFirestore(order).catch(() => {});
+      }
+    }
+
+    if (hasModified) {
+      localStorage.setItem('gf_orders', JSON.stringify(orders));
+      this.notify('ORDERS_UPDATED', { reason: 'AUTOMATIC_DRIVER_ASSIGNMENT' });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDERS_UPDATED' } }));
+      }
+    }
+
+    return hasModified;
   }
 
   // ==========================================

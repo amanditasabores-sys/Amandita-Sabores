@@ -27,6 +27,7 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
   const [readyAlerts, setReadyAlerts] = useState<Order[]>([]);
   const [isSoundMutedManually, setIsSoundMutedManually] = useState(false);
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const playedAudioOrdersRef = React.useRef<Set<string>>(new Set());
 
   const checkReadyOrders = () => {
     const unseenIds = store.getUnseenDriverReadyOrderIds(currentUser);
@@ -48,12 +49,16 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
     setReadyAlerts(matching);
 
     // If there are ready orders not yet acknowledged and sound was not manually silenced
-    if (matching.length > 0 && !isSoundMutedManually) {
-      if (!soundService.isDriverReadyAlertActive()) {
-        soundService.startDriverReadyAlert(3500, 4);
+    if (matching.length > 0) {
+      const unplayedOrder = matching.find((o) => !playedAudioOrdersRef.current.has(o.id));
+      if (unplayedOrder && !isSoundMutedManually) {
+        playedAudioOrdersRef.current.add(unplayedOrder.id);
+        soundService.startDriverReadyAlert(3500, 4, unplayedOrder.id);
+        setIsPlayingAudio(true);
+      } else {
+        setIsPlayingAudio(soundService.isDriverReadyAlertActive());
       }
-      setIsPlayingAudio(true);
-    } else if (matching.length === 0) {
+    } else {
       soundService.stopDriverReadyAlert();
       setIsPlayingAudio(false);
     }
@@ -105,6 +110,8 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
 
   // Acknowledge receipt of the notification (removes alert card without changing order status)
   const handleAcknowledge = (orderId: string) => {
+    soundService.stopDriverReadyAlert();
+    setIsPlayingAudio(false);
     store.markDriverReadyOrderSeen(orderId);
     soundService.playSuccessTone();
     setReadyAlerts((prev) => prev.filter((o) => o.id !== orderId));
@@ -234,7 +241,7 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
 
           {/* Clear message */}
           <p className="text-xs font-medium text-amber-200/90 bg-amber-950/40 border border-amber-900/50 p-2 rounded-xl">
-            📦 <strong>Mensagem:</strong> O pedido está pronto para retirada e entrega.
+            📦 <strong>Mensagem:</strong> O pedido está pronto para ser retirado e entregue.
           </p>
 
           {additionalCount > 0 && (

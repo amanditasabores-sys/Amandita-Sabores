@@ -45,7 +45,7 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     return () => window.removeEventListener('gestaofood_state_changed', handleState);
   }, []);
 
-  const activeDrivers = users.filter((u) => u.role === 'ENTREGADOR' && u.status === 'ATIVO');
+  const activeDrivers = users.filter((u) => u.role?.toUpperCase() === 'ENTREGADOR' && u.status === 'ATIVO');
 
   const handleReassignDriver = (orderId: string, driverId: string) => {
     const adminName = currentUser?.name || currentUser?.username || 'Administrador';
@@ -95,25 +95,25 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     },
     {
       status: 'EM_PREPARO',
-      title: 'Em Produção (Cozinha)',
+      title: 'Em Preparo (Cozinha)',
       count: orders.filter((o) => o.status === 'EM_PREPARO').length,
       colorClass: 'border-blue-400 bg-blue-500/10 text-blue-800',
     },
     {
       status: 'PRONTO',
-      title: 'Prontos para Retirada',
+      title: 'Pronto (Aguardando Retirada)',
       count: orders.filter((o) => o.status === 'PRONTO').length,
       colorClass: 'border-purple-400 bg-purple-500/10 text-purple-800',
     },
     {
       status: 'EM_ROTA',
-      title: 'Em Rota (Motoboy)',
+      title: 'Em Rota / Saiu para Entrega',
       count: orders.filter((o) => o.status === 'EM_ROTA').length,
       colorClass: 'border-indigo-400 bg-indigo-500/10 text-indigo-800',
     },
     {
       status: 'ENTREGUE',
-      title: 'Entregues Concluídos',
+      title: 'Entregue (Concluído)',
       count: orders.filter((o) => o.status === 'ENTREGUE').length,
       colorClass: 'border-emerald-400 bg-emerald-500/10 text-emerald-800',
     },

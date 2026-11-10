@@ -31,7 +31,8 @@ import {
   FileText,
   AlertCircle,
   X,
-  Plus
+  Plus,
+  Check
 } from 'lucide-react';
 
 interface DeliverySupervisorDashboardProps {
@@ -116,10 +117,11 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
     return orderDate < todayStr && o.status !== 'ENTREGUE' && o.status !== 'CANCELADO';
   });
 
-  // KPIs
-  const totalDriversCount = drivers.length;
-  const activeDrivers = drivers.filter((d) => d.status === 'ATIVO' || !d.status);
-  const inactiveDrivers = drivers.filter((d) => d.status === 'DESATIVADO' || d.status === 'BLOQUEADO');
+  // KPIs - Strictly consider only users with role ENTREGADOR
+  const driverUsers = drivers.filter((d) => d.role?.toUpperCase() === 'ENTREGADOR');
+  const totalDriversCount = driverUsers.length;
+  const activeDrivers = driverUsers.filter((d) => d.status === 'ATIVO');
+  const inactiveDrivers = driverUsers.filter((d) => d.status === 'DESATIVADO' || d.status === 'BLOQUEADO');
 
   // In-transit orders for active driver mapping
   const inTransitOrders = deliveryOrders.filter((o) => o.status === 'EM_ROTA');
@@ -445,6 +447,56 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
             </div>
           )}
         </div>
+      </div>
+
+      {/* DRIVER ASSIGNMENT SYSTEM STATUS BANNER */}
+      <div className="max-w-7xl mx-auto px-4 pt-2.5">
+        {activeDrivers.length === 0 ? (
+          <div className="p-3 bg-rose-950/60 border border-rose-800/50 rounded-2xl flex items-center justify-between gap-3 text-xs shadow-sm">
+            <div className="flex items-center gap-2.5 text-rose-200">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+              <div>
+                <strong className="text-rose-300">Nenhum entregador ativo disponível no momento.</strong>
+                <span className="text-rose-100/90 ml-1.5">
+                  Os pedidos permanecerão aguardando atribuição até que um entregador seja ativado ou atribuído manualmente.
+                </span>
+              </div>
+            </div>
+            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 whitespace-nowrap">
+              0 Ativos
+            </span>
+          </div>
+        ) : activeDrivers.length === 1 ? (
+          <div className="p-3 bg-emerald-950/50 border border-emerald-800/40 rounded-2xl flex items-center justify-between gap-3 text-xs shadow-sm">
+            <div className="flex items-center gap-2.5 text-emerald-200">
+              <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div>
+                <strong className="text-emerald-300">Atribuição Automática Ativa:</strong>
+                <span className="text-emerald-100/90 ml-1.5">
+                  Existe apenas 1 entregador ativo ({activeDrivers[0].name || activeDrivers[0].username}). Os novos pedidos delivery são atribuídos automaticamente a ele.
+                </span>
+              </div>
+            </div>
+            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 whitespace-nowrap">
+              Auto-Atribuição Ativa
+            </span>
+          </div>
+        ) : (
+          <div className="p-3 bg-indigo-950/50 border border-indigo-800/40 rounded-2xl flex items-center justify-between gap-3 text-xs shadow-sm">
+            <div className="flex items-center gap-2.5 text-indigo-200">
+              <Users className="w-4 h-4 text-indigo-400 shrink-0" />
+              <div>
+                <strong className="text-indigo-300">Atribuição Manual Disponível:</strong>
+                <span className="text-indigo-100/90 ml-1.5">
+                  Existem {activeDrivers.length} entregadores ativos cadastrados. A supervisão pode escolher qual entregador ficará responsável por cada entrega.
+                </span>
+              </div>
+            </div>
+            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 whitespace-nowrap">
+              {activeDrivers.length} Entregadores Ativos
+            </span>
+          </div>
+        )}
       </div>
 
       {/* KPI METRICS OVERVIEW */}

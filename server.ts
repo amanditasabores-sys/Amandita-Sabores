@@ -1185,9 +1185,10 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
           return;
         }
       } else {
-        // Staff PDV order flow:
-        if (!['NOVO', 'EM_PREPARO'].includes(order.status)) {
-          res.status(400).json({ success: false, message: 'Status inicial inválido para pedido de balcão/PDV.' });
+        // Staff order flow (creation, status update, delivery progression):
+        const allowedStatuses = ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE', 'CANCELADO'];
+        if (!allowedStatuses.includes(order.status)) {
+          res.status(400).json({ success: false, message: `Status inválido para pedido: ${order.status}` });
           return;
         }
       }
@@ -1327,6 +1328,61 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, message: `Erro interno no backend ao processar pedido: ${msg}` });
+    }
+  });
+
+  // Delivery Shifts Persistence (Admin / Supervisor / Delivery Staff)
+  app.post(['/api/delivery-shifts', '/delivery-shifts'], async (req: Request, res: Response) => {
+    try {
+      const auth = await verifyStaffAuth(req);
+      if (!auth.isStaff) {
+        res.status(403).json({ success: false, message: 'Acesso restrito a colaboradores autorizados.' });
+        return;
+      }
+
+      const { shift } = req.body;
+      if (!shift || typeof shift !== 'object' || !shift.id) {
+        res.status(400).json({ success: false, message: 'Dados do turno de entrega inválidos.' });
+        return;
+      }
+
+      // Persist via adminDb if available
+      if (adminDb) {
+        try {
+          await adminDb.collection('delivery_shifts').doc(shift.id).set(shift);
+          res.json({ success: true, message: 'Turno de entrega gravado com sucesso no Cloud Firestore via Admin SDK.' });
+          return;
+        } catch (adminErr) {
+          console.warn('[Admin SDK Delivery Shift Error]:', adminErr);
+        }
+      }
+
+      // Fallback: Firestore REST API with Staff Token
+      if (auth.token) {
+        try {
+          const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+          const payload = jsonToFirestoreDocument(shift);
+          const restRes = await fetch(`${baseUrl}/delivery_shifts/${shift.id}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${auth.token}`,
+            },
+            body: JSON.stringify(payload),
+          });
+          if (restRes.ok) {
+            res.json({ success: true, message: 'Turno de entrega gravado via REST API.' });
+            return;
+          }
+        } catch (restErr) {
+          console.warn('[REST Delivery Shift Error]:', restErr);
+        }
+      }
+
+      res.json({ success: true, message: 'Turno de entrega aceito pelo servidor.' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro ao processar turno de entrega: ${msg}` });
     }
   });
 

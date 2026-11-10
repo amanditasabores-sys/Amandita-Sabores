@@ -253,25 +253,35 @@ class SoundService {
   private driverAlertInterval: ReturnType<typeof setInterval> | null = null;
   private isDriverAlertLooping: boolean = false;
   private driverAlertRepeatsRemaining: number = 0;
+  private currentDriverAlertOrderId: string | null = null;
 
   /**
    * Starts a controlled driver alert chime that repeats up to maxRepeats times
    * (does not ring indefinitely) and can be stopped immediately via stopDriverReadyAlert().
+   * Prevents restarting or overlapping audio if already actively playing for the same order.
    */
-  public startDriverReadyAlert(intervalMs = 3500, maxRepeats = 4) {
+  public startDriverReadyAlert(intervalMs = 3500, maxRepeats = 4, orderId?: string) {
     if (!this.isSoundEnabled || this._isNewOrderMuted) return;
 
+    if (this.isDriverAlertLooping) {
+      if (orderId && this.currentDriverAlertOrderId === orderId) {
+        return;
+      }
+    }
+
+    this.currentDriverAlertOrderId = orderId || null;
     this.isDriverAlertLooping = true;
     this.driverAlertRepeatsRemaining = maxRepeats;
+
+    // Clear any previous interval before starting fresh
+    if (this.driverAlertInterval) {
+      clearInterval(this.driverAlertInterval);
+      this.driverAlertInterval = null;
+    }
 
     // Play first chime immediately
     this.playReadyOrderAlert();
     this.driverAlertRepeatsRemaining--;
-
-    // Clear any active timer
-    if (this.driverAlertInterval) {
-      clearInterval(this.driverAlertInterval);
-    }
 
     // Set recurring timer with repeat limit
     this.driverAlertInterval = setInterval(() => {
@@ -285,11 +295,12 @@ class SoundService {
   }
 
   /**
-   * Immediately stops the driver ready order alert sound.
+   * Immediately stops the driver ready order alert sound and resets looping state.
    */
   public stopDriverReadyAlert() {
     this.isDriverAlertLooping = false;
     this.driverAlertRepeatsRemaining = 0;
+    this.currentDriverAlertOrderId = null;
     if (this.driverAlertInterval) {
       clearInterval(this.driverAlertInterval);
       this.driverAlertInterval = null;
@@ -301,6 +312,14 @@ class SoundService {
    */
   public isDriverReadyAlertActive(): boolean {
     return this.isDriverAlertLooping;
+  }
+
+  /**
+   * Immediately stops all running persistent alerts and driver notifications.
+   */
+  public stopAllAlerts() {
+    this.stopPersistentOrderAlert();
+    this.stopDriverReadyAlert();
   }
 }
 

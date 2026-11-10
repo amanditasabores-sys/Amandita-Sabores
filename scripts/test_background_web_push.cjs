@@ -109,7 +109,11 @@ runTest('6. src/components/delivery/DriverReadyOrderAlert.tsx: Banner visual, pa
   assert(content.includes('Parar som'), 'Deve conter o botão Parar som');
   assert(content.includes('Entendido'), 'Deve conter o botão Entendido');
   assert(content.includes('stopDriverReadyAlert') || content.includes('silenceDriverReadyAlerts'), 'Deve silenciar o som no clique');
-  assert(content.includes('O pedido está pronto para retirada e entrega'), 'Deve exibir a mensagem informativa');
+  assert(content.includes('Pedido pronto para entrega!'), 'Deve conter o título da notificação');
+  assert(content.includes('Parar som'), 'Deve conter o botão Parar som');
+  assert(content.includes('Entendido'), 'Deve conter o botão Entendido');
+  assert(content.includes('stopDriverReadyAlert') || content.includes('silenceDriverReadyAlerts'), 'Deve silenciar o som no clique');
+  assert(content.includes('O pedido está pronto para ser retirado e entregue') || content.includes('O pedido está pronto para retirada e entrega'), 'Deve exibir a mensagem informativa');
 });
 
 // 7. Verify DeliveryPortal mounts DriverReadyOrderAlert
@@ -120,13 +124,47 @@ runTest('7. src/components/delivery/DeliveryPortal.tsx: Integração do DriverRe
   assert(content.includes('DriverReadyOrderAlert'), 'DeliveryPortal deve importar e renderizar DriverReadyOrderAlert');
 });
 
-// 8. Verify server.ts endpoints
-runTest('8. server.ts: Endpoints com suporte a READY_FOR_DELIVERY', () => {
+// 8. Verify server.ts endpoints and status transitions
+runTest('8. server.ts: Endpoints com suporte a READY_FOR_DELIVERY e status de entrega', () => {
   const serverPath = path.resolve('server.ts');
   const content = fs.readFileSync(serverPath, 'utf8');
 
   assert(content.includes("eventType: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY'"), 'server.ts deve tipar READY_FOR_DELIVERY');
   assert(content.includes("'READY_FOR_DELIVERY'"), 'server.ts deve aceitar READY_FOR_DELIVERY');
+  assert(content.includes("'EM_ROTA'") && content.includes("'ENTREGUE'"), 'server.ts deve permitir status EM_ROTA e ENTREGUE');
+});
+
+// 9. Verify Audio Ceiling and Deduplication
+runTest('9. src/services/audio.ts: Teto de repetições (4 repetições / ~14s) e bloqueio de sobreposição', () => {
+  const audioPath = path.resolve('src/services/audio.ts');
+  const content = fs.readFileSync(audioPath, 'utf8');
+
+  assert(content.includes('maxRepeats = 4') || content.includes('maxRepeats: number = 4'), 'Deve limitar repetições a no máximo 4');
+  assert(content.includes('currentDriverAlertOrderId'), 'Deve rastrear id do pedido em alerta para evitar repetições');
+  assert(content.includes('stopAllAlerts'), 'Deve possuir método stopAllAlerts');
+});
+
+// 10. Verify Driver Assignment Logic & Status Precedence in store.ts
+runTest('10. src/services/store.ts: Regras de atribuição de entregadores e precedência de status', () => {
+  const storePath = path.resolve('src/services/store.ts');
+  const content = fs.readFileSync(storePath, 'utf8');
+
+  assert(content.includes('getActiveDeliveryDrivers'), 'store.ts deve ter getActiveDeliveryDrivers()');
+  assert(content.includes("role === 'ENTREGADOR'") && content.includes("status === 'ATIVO'"), 'Deve filtrar estritamente ENTREGADOR e ATIVO');
+  assert(content.includes('applyAutomaticDriverAssignment'), 'store.ts deve ter applyAutomaticDriverAssignment()');
+  assert(content.includes('activeDrivers.length === 1'), 'Auto-atribuição quando exatamente 1 entregador ativo');
+  assert(content.includes('STATUS_PRECEDENCE'), 'store.ts deve ter STATUS_PRECEDENCE para sincronização');
+  assert(content.includes('roRank > loRank'), 'Status remoto mais avançado deve vencer');
+});
+
+// 11. Verify Supervisor Dashboard Driver Status Banner
+runTest('11. DeliverySupervisorDashboard: Indicador visual e aviso de entregadores ativos', () => {
+  const dashPath = path.resolve('src/components/delivery/DeliverySupervisorDashboard.tsx');
+  const content = fs.readFileSync(dashPath, 'utf8');
+
+  assert(content.includes('Nenhum entregador ativo disponível no momento.'), 'Deve exibir aviso claro quando 0 entregadores ativos');
+  assert(content.includes('Atribuição Automática Ativa'), 'Deve indicar auto-atribuição para 1 entregador');
+  assert(content.includes('Atribuição Manual Disponível'), 'Deve indicar atribuição manual para múltiplos entregadores');
 });
 
 console.log(`\n========================================`);
@@ -136,3 +174,4 @@ console.log(`========================================\n`);
 if (testsFailed > 0) {
   process.exit(1);
 }
+

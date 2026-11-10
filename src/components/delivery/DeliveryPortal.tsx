@@ -238,35 +238,30 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
   // Status transitions
   const handleStartDelivery = async () => {
     if (!activeOrder) return;
-    const updated = await store.updateOrderStatusAsync(
+    const authorStr = `Entregador ${driverName}`;
+    const notesStr = `Entregador ${driverName} retirou o pedido e iniciou o trajeto de entrega.`;
+    const res = await store.updateOrderStatusAsync(
       activeOrder.id,
       'EM_ROTA',
-      `Entregador ${driverName}`,
-      `Entregador ${driverName} retirou o pedido e iniciou o trajeto de entrega.`
+      authorStr,
+      notesStr
     );
-    if (updated) {
-      store.assignDeliveryPerson(activeOrder.id, {
-        id: `driver-${driverName}`,
-        name: driverName,
-        phone: driverPhone,
-      });
-      setActiveOrder(store.getOrderById(activeOrder.id) || null);
+    const refreshed = store.getOrderById(activeOrder.id) || res.order;
+    if (refreshed) {
+      setActiveOrder(refreshed);
       loadData();
     }
   };
 
   const handleCompleteDelivery = async () => {
     if (!activeOrder) return;
-    store.assignDeliveryPerson(activeOrder.id, {
-      id: `driver-${driverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-      name: driverName,
-      phone: driverPhone,
-    });
+    const authorStr = `Entregador ${driverName}`;
+    const notesStr = `Entrega confirmada pelo entregador ${driverName} no endereço do cliente.`;
     const res = await store.updateOrderStatusAsync(
       activeOrder.id,
       'ENTREGUE',
-      `Entregador ${driverName}`,
-      `Entrega confirmada pelo entregador ${driverName} no endereço do cliente.`
+      authorStr,
+      notesStr
     );
     const refreshed = store.getOrderById(activeOrder.id) || res.order;
     if (refreshed) {

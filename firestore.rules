@@ -47,7 +47,9 @@ service cloud.firestore {
     function isBootstrappedAdmin() {
       return isSignedIn() && 'email' in request.auth.token && (
         request.auth.token.email.lower() == 'dvrmercadinho@gmail.com' ||
-        request.auth.token.email.lower() == 'admin@amanditasabores.com.br'
+        request.auth.token.email.lower() == 'admin@amanditasabores.com.br' ||
+        request.auth.token.email.lower() == 'amanditasabore@gmail.com' ||
+        request.auth.token.email.lower() == 'amanditasabores@gmail.com'
       );
     }
 
@@ -133,6 +135,13 @@ service cloud.firestore {
     // =========================================================================
     match /configs/internal {
       allow get, list, create, update, delete: if isAdmin();
+    }
+
+    match /configs/daily_menu {
+      allow get: if true;
+      allow list: if isStaff();
+      allow create, update: if isGerente();
+      allow delete: if isAdmin();
     }
 
     match /configs/{otherConfig} {
@@ -454,6 +463,17 @@ service cloud.firestore {
     match /cash_shifts/{shiftId} {
       allow get, list: if isStaff() && (isCashierStaff() || isGerente());
       allow create, update: if isValidId(shiftId) && isStaff() && (isCashierStaff() || isGerente());
+      allow delete: if isValidId(shiftId) && isAdmin();
+    }
+
+    // =========================================================================
+    // 4b. DELIVERY SHIFTS (Movimento Diário de Entregas e Supervisão)
+    // Strictly restricted to authorized staff (Gerente, Admin, Delivery Staff)
+    // ZERO public access.
+    // =========================================================================
+    match /delivery_shifts/{shiftId} {
+      allow get, list: if isStaff();
+      allow create, update: if isValidId(shiftId) && isStaff() && (isGerente() || isDeliveryStaff());
       allow delete: if isValidId(shiftId) && isAdmin();
     }
 
