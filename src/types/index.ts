@@ -213,9 +213,28 @@ export interface Order {
   operatorName?: string;
   cancellationReason?: string;
   cancelledBy?: string;
+  cancelledAt?: string;
+  refundInfo?: OrderRefundInfo;
   movements: OrderMovementLog[];
   trackingCode?: string; // Código de alta entropia para rastreamento seguro público
   _cloudSyncStatus?: 'SYNCED' | 'PENDING' | 'ERROR';
+}
+
+export interface OrderRefundInfo {
+  id: string; // ex: 'ref-1731400000-xyz'
+  orderId: string;
+  orderNumber: string;
+  originalAmount: number;
+  refundAmount: number;
+  originalPaymentMethod: PaymentMethod;
+  refundPaymentMethod: PaymentMethod;
+  timestamp: string;
+  reason: string;
+  author: string;
+  cashMovementId?: string;
+  targetShiftId?: string;
+  originalShiftId?: string;
+  status: 'CONCLUIDO' | 'PENDENTE_CAIXA';
 }
 
 export interface OrderPaymentSplit {
@@ -319,7 +338,7 @@ export interface RestaurantConfig {
   defaultDeliveryPersonId?: string; // ID do entregador ativo selecionado pela administração
 }
 
-export type CashMovementType = 'SANGRIA' | 'VALE' | 'SUPRIMENTO' | 'VENDA' | 'AJUSTE';
+export type CashMovementType = 'SANGRIA' | 'VALE' | 'SUPRIMENTO' | 'VENDA' | 'AJUSTE' | 'ESTORNO';
 
 export interface CashMovement {
   id: string;
@@ -332,6 +351,9 @@ export interface CashMovement {
   orderId?: string;
   orderNumber?: string;
   author: string;
+  refundReason?: string;
+  originalShiftId?: string;
+  originalMovementId?: string;
 }
 
 export interface CashRegisterShift {

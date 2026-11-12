@@ -38,6 +38,47 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
   const [printableOrder, setPrintableOrder] = useState<Order | null>(null);
   const [receiptQrCode, setReceiptQrCode] = useState<string>('');
   const [users, setUsers] = useState<User[]>(() => store.getUsers());
+  const [isDeletingOrder, setIsDeletingOrder] = useState(false);
+  const [deleteErrorMessage, setDeleteErrorMessage] = useState<string | null>(null);
+
+  // Cancellation & Refund Modal state
+  const [orderToCancelModal, setOrderToCancelModal] = useState<Order | null>(null);
+  const [cancelReasonInput, setCancelReasonInput] = useState('');
+  const [cancelErrorMsg, setCancelErrorMsg] = useState<string | null>(null);
+  const [cancelSuccessResult, setCancelSuccessResult] = useState<{ order: Order; message: string } | null>(null);
+
+  const handleOpenCancelModal = (order: Order) => {
+    setOrderToCancelModal(order);
+    setCancelReasonInput('');
+    setCancelErrorMsg(null);
+  };
+
+  const handleConfirmCancelOrder = () => {
+    if (!orderToCancelModal) return;
+    if (!cancelReasonInput.trim()) {
+      setCancelErrorMsg('Por favor informe o motivo obrigatório do cancelamento.');
+      return;
+    }
+    const operator = currentUser?.name || currentUser?.username || 'Administrador';
+    const res = store.cancelOrder(orderToCancelModal.id, cancelReasonInput.trim(), operator);
+    if (!res.success) {
+      setCancelErrorMsg(res.message);
+      return;
+    }
+    const updated = store.getOrderById(orderToCancelModal.id);
+    setOrderToCancelModal(null);
+    onOrderUpdated();
+    if (selectedOrderForModal && selectedOrderForModal.id === orderToCancelModal.id && updated) {
+      setSelectedOrderForModal(updated);
+    }
+    if (updated) {
+      setCancelSuccessResult({
+        order: updated,
+        message: res.message,
+      });
+      setTimeout(() => setCancelSuccessResult(null), 10000);
+    }
+  };
 
   React.useEffect(() => {
     const handleState = () => setUsers(store.getUsers());
@@ -74,15 +115,29 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
   const config = store.getRestaurantConfig();
 
   const handleDeleteOrder = (order: Order) => {
+    setDeleteErrorMessage(null);
     setOrderToDelete(order);
   };
 
-  const executeDeleteOrder = () => {
-    if (!orderToDelete) return;
-    store.deleteOrder(orderToDelete.id);
-    setSelectedOrderForModal(null);
-    setOrderToDelete(null);
-    onOrderUpdated();
+  const executeDeleteOrder = async () => {
+    if (!orderToDelete || isDeletingOrder) return;
+    setIsDeletingOrder(true);
+    setDeleteErrorMessage(null);
+    try {
+      const res = await store.deleteOrderAsync(orderToDelete.id);
+      if (res.success) {
+        setSelectedOrderForModal(null);
+        setOrderToDelete(null);
+        onOrderUpdated();
+      } else {
+        setDeleteErrorMessage(res.error || 'Não foi possível excluir o pedido no servidor. Tente novamente.');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setDeleteErrorMessage(msg || 'Erro inesperado ao excluir o pedido.');
+    } finally {
+      setIsDeletingOrder(false);
+    }
   };
 
   // Columns definition
@@ -521,6 +576,59 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
               </div>
             </div>
 
+            {/* Refund & Cancellation Audit Card (se o pedido foi cancelado e estornado) */}
+            {selectedOrderForModal.refundInfo && (
+              <div className="p-3.5 bg-rose-50 rounded-xl border border-rose-200 text-xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-extrabold text-rose-900 flex items-center gap-1.5">
+                    <AlertCircle className="w-4 h-4 text-rose-600" />
+                    <span>Pedido Cancelado e Devolvido</span>
+                  </span>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                    selectedOrderForModal.refundInfo.status === 'CONCLUIDO'
+                      ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                      : 'bg-amber-100 text-amber-900 border border-amber-300'
+                  }`}>
+                    {selectedOrderForModal.refundInfo.status === 'CONCLUIDO' ? 'Estornado no Caixa' : 'Pendente de Compensação'}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-700">
+                  <div>
+                    <span className="text-slate-500 block">Valor Estornado:</span>
+                    <strong className="text-rose-700 font-mono text-sm">{formatCurrency(selectedOrderForModal.refundInfo.refundAmount)}</strong>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block">Forma de Estorno:</span>
+                    <strong className="text-slate-800">{getPaymentMethodLabel(selectedOrderForModal.refundInfo.refundPaymentMethod)}</strong>
+                  </div>
+                </div>
+
+                <div className="text-[11px] text-slate-700">
+                  <span className="text-slate-500 block">Motivo:</span>
+                  <p className="italic bg-white p-2 rounded-lg border border-rose-200 text-slate-800 mt-0.5">
+                    {selectedOrderForModal.refundInfo.reason}
+                  </p>
+                </div>
+
+                <div className="flex justify-between items-center text-[10px] text-slate-500 pt-1 border-t border-rose-100">
+                  <span>Autorizado por: <strong className="text-slate-700">{selectedOrderForModal.refundInfo.author}</strong></span>
+                  <span>{formatDateTime(selectedOrderForModal.refundInfo.timestamp)}</span>
+                </div>
+
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={() => thermalPrinterService.printRefundReceipt(selectedOrderForModal)}
+                    className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs flex items-center justify-center gap-1.5 transition shadow-xs cursor-pointer"
+                  >
+                    <Printer className="w-3.5 h-3.5" />
+                    <span>Imprimir Comprovante de Estorno (58mm)</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Delivery Assignment & Reassignment (Exclusively for Delivery fulfillment) */}
             {selectedOrderForModal.fulfillmentType === 'DELIVERY' && (
               <div className="p-3 bg-indigo-50/70 rounded-xl border border-indigo-100 text-xs space-y-2.5">
@@ -633,12 +741,21 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                 >
                   Finalizar (Entregue)
                 </button>
-                <button
-                  onClick={() => handleAdvanceStatus(selectedOrderForModal, 'CANCELADO')}
-                  className="py-2 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 rounded-xl text-xs font-bold transition"
-                >
-                  Cancelar
-                </button>
+                {selectedOrderForModal.status === 'CANCELADO' ? (
+                  <button
+                    disabled
+                    className="py-2 bg-slate-100 text-slate-400 border border-slate-200 rounded-xl text-xs font-bold cursor-not-allowed"
+                  >
+                    Pedido Cancelado
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleOpenCancelModal(selectedOrderForModal)}
+                    className="py-2 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 rounded-xl text-xs font-bold transition cursor-pointer"
+                  >
+                    Cancelar / Devolver
+                  </button>
+                )}
               </div>
 
               <div className="pt-2 border-t border-slate-100 flex justify-end">
@@ -751,9 +868,160 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
           confirmLabel="Excluir Pedido"
           cancelLabel="Cancelar"
           isDanger={true}
+          isLoading={isDeletingOrder}
+          errorMessage={deleteErrorMessage}
           onConfirm={executeDeleteOrder}
-          onCancel={() => setOrderToDelete(null)}
+          onCancel={() => {
+            if (!isDeletingOrder) {
+              setOrderToDelete(null);
+              setDeleteErrorMessage(null);
+            }
+          }}
         />
+      )}
+
+      {/* MODAL: CANCELAMENTO E ESTORNO FINANCEIRO */}
+      {orderToCancelModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-xs animate-in fade-in">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-rose-200 shadow-2xl p-6 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-100 text-rose-700 flex items-center justify-center">
+                  <AlertCircle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-black text-base text-slate-900">Cancelar Pedido</h3>
+                  <p className="text-xs text-slate-500">
+                    {orderToCancelModal.orderNumber} · {orderToCancelModal.customer.name}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOrderToCancelModal(null)}
+                className="text-slate-400 hover:text-slate-700 p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Financial Status Summary */}
+            <div className={`p-3.5 rounded-xl text-xs space-y-2 border ${
+              orderToCancelModal.paymentStatus === 'PAGO'
+                ? 'bg-amber-50 border-amber-200 text-amber-950'
+                : 'bg-slate-50 border-slate-200 text-slate-700'
+            }`}>
+              <div className="flex justify-between items-center font-bold">
+                <span>Valor Total:</span>
+                <span className="text-sm font-mono text-rose-700">{formatCurrency(orderToCancelModal.totalAmount)}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span>Status de Pagamento:</span>
+                <span className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
+                  orderToCancelModal.paymentStatus === 'PAGO'
+                    ? 'bg-emerald-100 text-emerald-800'
+                    : 'bg-amber-100 text-amber-900'
+                }`}>
+                  {orderToCancelModal.paymentStatus === 'PAGO' ? 'PAGO' : 'NÃO PAGO (PENDENTE)'}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span>Forma Registrada:</span>
+                <span className="font-semibold">{getPaymentMethodLabel(orderToCancelModal.paymentMethod)}</span>
+              </div>
+
+              {orderToCancelModal.paymentStatus === 'PAGO' ? (
+                <div className="pt-2 border-t border-amber-200/80 text-[11px] leading-relaxed">
+                  {orderToCancelModal.paymentMethod === 'DINHEIRO' ? (
+                    <p className="text-rose-900 font-semibold">
+                      💵 <strong>Impacto no Caixa:</strong> Este pedido foi pago em dinheiro. O cancelamento registrará um <strong>estorno de {formatCurrency(orderToCancelModal.totalAmount)}</strong> e deduzirá esse valor da <strong>gaveta física</strong> do caixa atual.
+                    </p>
+                  ) : orderToCancelModal.paymentMethod === 'PIX' ? (
+                    <p className="text-blue-950 font-semibold">
+                      📱 <strong>Impacto no Caixa:</strong> Este pedido foi pago via PIX. O estorno será registrado como devolução bancária PIX e <strong>NÃO alterará a gaveta física</strong> de dinheiro.
+                    </p>
+                  ) : (
+                    <p className="text-indigo-950 font-semibold">
+                      💳 <strong>Impacto no Caixa:</strong> O estorno será registrado para conciliação das vendas via cartão no fechamento do turno.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="pt-2 border-t border-slate-200 text-[11px] text-slate-500">
+                  ℹ️ Este pedido ainda não teve pagamento recebido. Não haverá movimentação financeira ou devolução de valores no caixa.
+                </p>
+              )}
+            </div>
+
+            {cancelErrorMsg && (
+              <div className="p-2.5 bg-rose-50 border border-rose-300 rounded-xl text-xs text-rose-700 font-semibold">
+                {cancelErrorMsg}
+              </div>
+            )}
+
+            <div>
+              <label className="block text-xs font-bold text-slate-800 mb-1">
+                Motivo Obrigatório do Cancelamento <span className="text-rose-600">*</span>
+              </label>
+              <textarea
+                value={cancelReasonInput}
+                onChange={(e) => setCancelReasonInput(e.target.value)}
+                placeholder="Ex: Desistência do cliente, erro de lançamento, troca de itens..."
+                rows={3}
+                autoFocus
+                className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:ring-2 focus:ring-rose-500"
+              />
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setOrderToCancelModal(null)}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition"
+              >
+                Voltar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmCancelOrder}
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition shadow-xs"
+              >
+                Confirmar Cancelamento
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FEEDBACK TOAST / BANNER FOR CANCEL SUCCESS */}
+      {cancelSuccessResult && (
+        <div className="fixed bottom-4 right-4 z-50 max-w-md bg-white border-2 border-rose-300 rounded-2xl p-4 shadow-xl space-y-2 animate-in slide-in-from-bottom-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-5 h-5 text-rose-600" />
+              <strong className="text-xs text-slate-900">Cancelamento Concluído</strong>
+            </div>
+            <button
+              onClick={() => setCancelSuccessResult(null)}
+              className="text-slate-400 hover:text-slate-700 text-xs p-1"
+            >
+              ✕
+            </button>
+          </div>
+          <p className="text-xs text-slate-600">{cancelSuccessResult.message}</p>
+          {cancelSuccessResult.order.refundInfo && (
+            <div className="pt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => thermalPrinterService.printRefundReceipt(cancelSuccessResult.order)}
+                className="flex-1 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1 transition"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Imprimir Estorno (58mm)</span>
+              </button>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

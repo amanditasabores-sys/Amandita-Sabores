@@ -461,8 +461,9 @@ service cloud.firestore {
     // ZERO public access.
     // =========================================================================
     match /cash_shifts/{shiftId} {
-      allow get, list: if isStaff() && (isCashierStaff() || isGerente());
-      allow create, update: if isValidId(shiftId) && isStaff() && (isCashierStaff() || isGerente());
+      allow get, list: if isAdmin() || (isStaff() && (isCashierStaff() || isGerente()));
+      allow create: if isValidId(shiftId) && (isAdmin() || (isStaff() && (isCashierStaff() || isGerente())));
+      allow update: if isValidId(shiftId) && (isAdmin() || (isStaff() && (isCashierStaff() || isGerente()))) && resource.data.status != 'FECHADO';
       allow delete: if isValidId(shiftId) && isAdmin();
     }
 
@@ -471,9 +472,18 @@ service cloud.firestore {
     // Strictly restricted to authorized staff (Gerente, Admin, Delivery Staff)
     // ZERO public access.
     // =========================================================================
+    function isValidDeliveryShiftData(data) {
+      return data is map &&
+        data.keys().hasAll(['id', 'date', 'status', 'openedAt', 'openedBy']) &&
+        data.status in ['ABERTO', 'FECHADO'] &&
+        data.date is string && data.date.size() >= 8 && data.date.size() <= 32 &&
+        data.openedAt is string &&
+        data.openedBy is map;
+    }
+
     match /delivery_shifts/{shiftId} {
       allow get, list: if isStaff();
-      allow create, update: if isValidId(shiftId) && isStaff() && (isGerente() || isDeliveryStaff());
+      allow create, update: if isValidId(shiftId) && isStaff() && (isGerente() || isDeliveryStaff()) && isValidDeliveryShiftData(incoming());
       allow delete: if isValidId(shiftId) && isAdmin();
     }
 

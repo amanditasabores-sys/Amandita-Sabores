@@ -299,13 +299,18 @@ class FirestoreRuleEngine {
 
   // Collection: cash_shifts
   evalCashShiftGet(auth, shiftId) {
-    return this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth));
+    return this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth)));
   }
   evalCashShiftList(auth) {
-    return this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth));
+    return this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth)));
   }
-  evalCashShiftWrite(auth, shiftId) {
-    return this.isValidId(shiftId) && this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth));
+  evalCashShiftCreate(auth, shiftId) {
+    return this.isValidId(shiftId) && (this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth))));
+  }
+  evalCashShiftUpdate(auth, shiftId, incoming, existing) {
+    return this.isValidId(shiftId) && 
+      (this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth)))) &&
+      existing?.status !== 'FECHADO';
   }
   evalCashShiftDelete(auth, shiftId) {
     return this.isValidId(shiftId) && this.isAdmin(auth);
@@ -886,6 +891,33 @@ runTest('25. Configurações Internas: /configs/internal restrito exclusivamente
   assert.strictEqual(engine.evalConfigGet(gerenteAuth, 'internal'), false, 'Gerente não pode ler /configs/internal');
   assert.strictEqual(engine.evalConfigGet(adminAuth, 'internal'), true, 'Administrador pode ler /configs/internal');
   assert.strictEqual(engine.evalConfigWrite(adminAuth, 'internal', { internalDbPass: 'secret' }), true, 'Administrador pode gravar /configs/internal');
+});
+
+runTest('26. Imutabilidade do Caixa: Proibir alteração de turno FECHADO e permitir criação/fechamento legítimo', () => {
+  const shiftAberto = { id: 'shift-100', status: 'ABERTO', openedAt: '2026-11-11T08:00:00Z', openedBy: 'admin', initialBalance: 100, movements: [] };
+  const shiftFechando = { ...shiftAberto, status: 'FECHADO', closedAt: '2026-11-11T18:00:00Z', closedBy: 'admin', finalCountedCash: 150 };
+  const shiftFechado = { id: 'shift-100', status: 'FECHADO', openedAt: '2026-11-11T08:00:00Z', openedBy: 'admin', initialBalance: 100, movements: [] };
+  const shiftModificadoAposFechado = { ...shiftFechado, initialBalance: 9999, notes: 'Alteração maliciosa pós fechamento' };
+
+  // 1. Criar novo turno: permitido para staff/admin
+  assert.strictEqual(engine.evalCashShiftCreate(caixaAuth, 'shift-100'), true, 'Caixa pode criar turno novo');
+  assert.strictEqual(engine.evalCashShiftCreate(adminAuth, 'shift-101'), true, 'Admin pode criar turno novo');
+  assert.strictEqual(engine.evalCashShiftCreate(cozinhaAuth, 'shift-102'), false, 'Cozinha NÃO pode criar turno');
+  assert.strictEqual(engine.evalCashShiftCreate(anonymousAuth, 'shift-103'), false, 'Anônimo NÃO pode criar turno');
+
+  // 2. Atualizar turno ABERTO (ex: adicionar movimento): permitido
+  assert.strictEqual(engine.evalCashShiftUpdate(caixaAuth, 'shift-100', shiftAberto, shiftAberto), true, 'Caixa pode atualizar turno ABERTO');
+
+  // 3. Fechar turno ABERTO (transição ABERTO -> FECHADO): permitido
+  assert.strictEqual(engine.evalCashShiftUpdate(caixaAuth, 'shift-100', shiftFechando, shiftAberto), true, 'Caixa pode fechar turno ABERTO');
+
+  // 4. Modificar turno já FECHADO: ESTRITAMENTE BLOQUEADO para Caixa, Gerente e Admin
+  assert.strictEqual(engine.evalCashShiftUpdate(caixaAuth, 'shift-100', shiftModificadoAposFechado, shiftFechado), false, 'Caixa NÃO pode alterar turno FECHADO');
+  assert.strictEqual(engine.evalCashShiftUpdate(gerenteAuth, 'shift-100', shiftModificadoAposFechado, shiftFechado), false, 'Gerente NÃO pode alterar turno FECHADO');
+  assert.strictEqual(engine.evalCashShiftUpdate(adminAuth, 'shift-100', shiftModificadoAposFechado, shiftFechado), false, 'Admin NÃO pode alterar turno FECHADO');
+
+  // 5. Criar outro turno novo com ID diferente: permitido
+  assert.strictEqual(engine.evalCashShiftCreate(caixaAuth, 'shift-200'), true, 'Novo turno com outro ID permitido');
 });
 
 console.log(`\n======================================================`);

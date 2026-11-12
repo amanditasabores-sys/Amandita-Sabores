@@ -432,9 +432,19 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       return;
     }
 
-    store.cancelOrder(orderToCancel.id, cancelReason, operatorName);
+    const res = store.cancelOrder(orderToCancel.id, cancelReason.trim(), operatorName);
+    if (!res.success) {
+      setCancelError(res.message);
+      return;
+    }
+
+    const cancelledOrder = store.getOrderById(orderToCancel.id);
     setOrderToCancel(null);
     reloadData();
+
+    if (cancelledOrder?.refundInfo) {
+      thermalPrinterService.printRefundReceipt(cancelledOrder);
+    }
   };
 
   // Reusable Cart Section rendered both in desktop sidebar and slide-over cart drawer
@@ -1318,16 +1328,25 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                           <td className="py-3 px-4 text-right space-x-1">
                             <button
                               onClick={() => handlePrintReceipt(order)}
-                              title="Reimprimir Comprovante Térmico"
-                              className="p-1.5 rounded-lg bg-[#FAF7F2] hover:bg-[#EFE6DC] text-[#3D2314] transition"
+                              title="Reimprimir Comprovante Térmico do Pedido"
+                              className="p-1.5 rounded-lg bg-[#FAF7F2] hover:bg-[#EFE6DC] text-[#3D2314] transition cursor-pointer"
                             >
                               <Printer className="w-3.5 h-3.5" />
                             </button>
+                            {order.refundInfo && (
+                              <button
+                                onClick={() => thermalPrinterService.printRefundReceipt(order)}
+                                title="Reimprimir Comprovante de Estorno (58mm)"
+                                className="p-1.5 rounded-lg bg-rose-100 hover:bg-rose-200 text-rose-800 transition cursor-pointer"
+                              >
+                                <AlertCircle className="w-3.5 h-3.5" />
+                              </button>
+                            )}
                             {!isCancelled && (
                               <button
                                 onClick={() => handleOpenCancelModal(order)}
                                 title="Cancelar Venda (Permissão & Motivo)"
-                                className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 transition"
+                                className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 transition cursor-pointer"
                               >
                                 <XCircle className="w-3.5 h-3.5" />
                               </button>
@@ -1635,6 +1654,52 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               </div>
             </div>
 
+            {/* Financial Details Preview */}
+            <div className={`p-3 rounded-2xl text-xs space-y-1.5 border ${
+              orderToCancel.paymentStatus === 'PAGO'
+                ? 'bg-amber-50/80 border-amber-200 text-amber-950'
+                : 'bg-slate-50 border-slate-200 text-slate-700'
+            }`}>
+              <div className="flex justify-between items-center font-bold">
+                <span>Valor do Pedido:</span>
+                <span className="text-sm font-mono text-rose-700">{formatCurrency(orderToCancel.totalAmount)}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span>Status de Pagamento:</span>
+                <span className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
+                  orderToCancel.paymentStatus === 'PAGO' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-900'
+                }`}>
+                  {orderToCancel.paymentStatus === 'PAGO' ? 'PAGO' : 'NÃO PAGO (PENDENTE)'}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span>Forma:</span>
+                <span className="font-semibold">{getPaymentMethodLabel(orderToCancel.paymentMethod)}</span>
+              </div>
+
+              {orderToCancel.paymentStatus === 'PAGO' ? (
+                <div className="pt-2 border-t border-amber-200/80 text-[11px] leading-relaxed">
+                  {orderToCancel.paymentMethod === 'DINHEIRO' ? (
+                    <p className="text-rose-950 font-semibold">
+                      💵 <strong>Gaveta de Dinheiro:</strong> O cancelamento registrará uma devolução de {formatCurrency(orderToCancel.totalAmount)} e <strong>subtrairá o dinheiro físico da gaveta</strong> do caixa aberto.
+                    </p>
+                  ) : orderToCancel.paymentMethod === 'PIX' ? (
+                    <p className="text-blue-950 font-semibold">
+                      📱 <strong>Devolução PIX:</strong> O cancelamento registrará a devolução bancária PIX e <strong>NÃO alterará o saldo da gaveta física</strong>.
+                    </p>
+                  ) : (
+                    <p className="text-indigo-950 font-semibold">
+                      💳 <strong>Estorno Cartão:</strong> O estorno será registrado para conciliação das vendas via maquininha.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="pt-2 border-t border-slate-200 text-[11px] text-slate-500">
+                  ℹ️ Pedido sem recebimento prévio. Não haverá estorno financeiro no caixa.
+                </p>
+              )}
+            </div>
+
             {cancelError && (
               <p className="text-xs text-rose-600 font-semibold bg-rose-50 p-2 rounded-lg border border-rose-200">
                 {cancelError}
@@ -1656,21 +1721,21 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             </div>
 
             <p className="text-[11px] text-[#8C5E47] bg-[#FAF7F2] p-2.5 rounded-xl border border-[#E8DFD5]">
-              O cancelamento estornará a venda no fluxo do caixa atual e registrará o operador responsável (<strong>{operatorName}</strong>) nos relatórios de auditoria.
+              Operador responsável: <strong>{operatorName}</strong>. Um comprovante de estorno para auditoria será gerado automaticamente.
             </p>
 
             <div className="flex gap-2">
               <button
                 type="button"
                 onClick={() => setOrderToCancel(null)}
-                className="flex-1 py-2.5 bg-[#FAF7F2] text-[#3D2314] font-bold rounded-xl text-xs border border-[#E8DFD5]"
+                className="flex-1 py-2.5 bg-[#FAF7F2] text-[#3D2314] font-bold rounded-xl text-xs border border-[#E8DFD5] cursor-pointer"
               >
                 Voltar
               </button>
               <button
                 type="button"
                 onClick={handleExecuteCancelSale}
-                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition"
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition cursor-pointer shadow-xs"
               >
                 Confirmar Cancelamento
               </button>

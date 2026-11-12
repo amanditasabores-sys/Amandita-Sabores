@@ -82,20 +82,35 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
       return {
         initialBalance: 0,
         cashSales: 0,
+        grossCashSales: 0,
+        cashRefunds: 0,
+        netCashSales: 0,
         pixSales: 0,
+        grossPixSales: 0,
+        pixRefunds: 0,
+        netPixSales: 0,
         cardSales: 0,
+        grossCardSales: 0,
+        cardRefunds: 0,
+        netCardSales: 0,
         totalSangrias: 0,
         totalSuprimentos: 0,
         totalVales: 0,
         totalAjustes: 0,
+        totalGrossRevenue: 0,
+        totalRefunds: 0,
+        totalNetRevenue: 0,
         expectedCashInDrawer: 0,
         totalRevenue: 0,
       };
     }
 
-    let cashSales = 0;
-    let pixSales = 0;
-    let cardSales = 0;
+    let grossCashSales = 0;
+    let cashRefunds = 0;
+    let grossPixSales = 0;
+    let pixRefunds = 0;
+    let grossCardSales = 0;
+    let cardRefunds = 0;
     let totalSangrias = 0;
     let totalSuprimentos = 0;
     let totalVales = 0;
@@ -103,9 +118,13 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
 
     currentShift.movements.forEach((m) => {
       if (m.type === 'VENDA') {
-        if (m.paymentMethod === 'DINHEIRO') cashSales += m.amount;
-        else if (m.paymentMethod === 'PIX') pixSales += m.amount;
-        else cardSales += m.amount;
+        if (m.paymentMethod === 'DINHEIRO') grossCashSales += m.amount;
+        else if (m.paymentMethod === 'PIX') grossPixSales += m.amount;
+        else grossCardSales += m.amount;
+      } else if (m.type === 'ESTORNO') {
+        if (m.paymentMethod === 'DINHEIRO') cashRefunds += m.amount;
+        else if (m.paymentMethod === 'PIX') pixRefunds += m.amount;
+        else cardRefunds += m.amount;
       } else if (m.type === 'SANGRIA') {
         totalSangrias += m.amount;
       } else if (m.type === 'SUPRIMENTO') {
@@ -117,20 +136,38 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
       }
     });
 
-    const expectedCashInDrawer = currentShift.initialBalance + cashSales + totalSuprimentos - totalSangrias - totalVales + totalAjustes;
-    const totalRevenue = cashSales + pixSales + cardSales;
+    const netCashSales = grossCashSales - cashRefunds;
+    const netPixSales = grossPixSales - pixRefunds;
+    const netCardSales = grossCardSales - cardRefunds;
+    const totalGrossRevenue = grossCashSales + grossPixSales + grossCardSales;
+    const totalRefunds = cashRefunds + pixRefunds + cardRefunds;
+    const totalNetRevenue = totalGrossRevenue - totalRefunds;
+
+    const expectedCashInDrawer = currentShift.initialBalance + grossCashSales - cashRefunds + totalSuprimentos - totalSangrias - totalVales + totalAjustes;
 
     return {
       initialBalance: currentShift.initialBalance,
-      cashSales,
-      pixSales,
-      cardSales,
+      cashSales: grossCashSales,
+      grossCashSales,
+      cashRefunds,
+      netCashSales,
+      pixSales: grossPixSales,
+      grossPixSales,
+      pixRefunds,
+      netPixSales,
+      cardSales: grossCardSales,
+      grossCardSales,
+      cardRefunds,
+      netCardSales,
       totalSangrias,
       totalSuprimentos,
       totalVales,
       totalAjustes,
+      totalGrossRevenue,
+      totalRefunds,
+      totalNetRevenue,
       expectedCashInDrawer,
-      totalRevenue,
+      totalRevenue: totalNetRevenue,
     };
   }, [currentShift]);
 
@@ -324,20 +361,26 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
 
           <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Vendas Dinheiro</span>
-            <p className="text-base font-black text-emerald-700 mt-1">{formatCurrency(metrics.cashSales)}</p>
-            <span className="text-[10px] text-emerald-600">+ na gaveta</span>
+            <p className="text-base font-black text-emerald-700 mt-1">{formatCurrency(metrics.netCashSales)}</p>
+            <span className="text-[10px] text-emerald-600 block">
+              {metrics.cashRefunds > 0 ? `Líq (Devol: -${formatCurrency(metrics.cashRefunds)})` : '+ na gaveta'}
+            </span>
           </div>
 
           <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Vendas PIX</span>
-            <p className="text-base font-black text-blue-700 mt-1">{formatCurrency(metrics.pixSales)}</p>
-            <span className="text-[10px] text-blue-600">Em conta</span>
+            <p className="text-base font-black text-blue-700 mt-1">{formatCurrency(metrics.netPixSales)}</p>
+            <span className="text-[10px] text-blue-600 block">
+              {metrics.pixRefunds > 0 ? `Líq (Devol: -${formatCurrency(metrics.pixRefunds)})` : 'Em conta'}
+            </span>
           </div>
 
           <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Vendas Cartão</span>
-            <p className="text-base font-black text-indigo-700 mt-1">{formatCurrency(metrics.cardSales)}</p>
-            <span className="text-[10px] text-indigo-600">POS / Máquina</span>
+            <p className="text-base font-black text-indigo-700 mt-1">{formatCurrency(metrics.netCardSales)}</p>
+            <span className="text-[10px] text-indigo-600 block">
+              {metrics.cardRefunds > 0 ? `Líq (Devol: -${formatCurrency(metrics.cardRefunds)})` : 'POS / Máquina'}
+            </span>
           </div>
 
           <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
@@ -423,6 +466,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <tbody className="divide-y divide-slate-100">
                   {currentShift.movements.slice().reverse().map((mov) => {
                     const isPositive = mov.type === 'VENDA' || mov.type === 'SUPRIMENTO' || (mov.type === 'AJUSTE' && mov.amount >= 0);
+                    const isEstorno = mov.type === 'ESTORNO';
                     const isSangria = mov.type === 'SANGRIA';
                     const isVale = mov.type === 'VALE';
                     const isAjuste = mov.type === 'AJUSTE';
@@ -436,6 +480,8 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                           <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                             mov.type === 'VENDA'
                               ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                              : mov.type === 'ESTORNO'
+                              ? 'bg-rose-100 text-rose-800 border border-rose-300'
                               : mov.type === 'SUPRIMENTO'
                               ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                               : mov.type === 'VALE'
@@ -444,7 +490,17 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                               ? 'bg-amber-50 text-amber-800 border border-amber-300'
                               : 'bg-rose-50 text-rose-700 border border-rose-200'
                           }`}>
-                            {mov.type === 'VENDA' ? 'Venda' : mov.type === 'SUPRIMENTO' ? 'Suprimento (Entrada)' : mov.type === 'VALE' ? 'Vale Funcionário' : mov.type === 'AJUSTE' ? 'Ajuste de Gaveta' : 'Sangria (Retirada)'}
+                            {mov.type === 'VENDA' 
+                              ? 'Venda' 
+                              : mov.type === 'ESTORNO' 
+                              ? 'Estorno / Devolução' 
+                              : mov.type === 'SUPRIMENTO' 
+                              ? 'Suprimento (Entrada)' 
+                              : mov.type === 'VALE' 
+                              ? 'Vale Funcionário' 
+                              : mov.type === 'AJUSTE' 
+                              ? 'Ajuste de Gaveta' 
+                              : 'Sangria (Retirada)'}
                           </span>
                         </td>
                         <td className="py-3 px-2 text-slate-800 font-medium">
@@ -453,9 +509,14 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                               👤 {mov.employeeName}
                             </span>
                           )}
-                          {mov.description}
+                          <span>{mov.description}</span>
                           {mov.orderNumber && (
                             <span className="ml-1.5 font-mono text-[11px] text-amber-700 font-bold">({mov.orderNumber})</span>
+                          )}
+                          {mov.refundReason && (
+                            <span className="block text-[10px] text-rose-700 italic mt-0.5">
+                              Motivo: {mov.refundReason}
+                            </span>
                           )}
                         </td>
                         <td className="py-3 px-2 text-slate-600 whitespace-nowrap">
@@ -464,10 +525,16 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                         <td className={`py-3 px-2 text-right font-mono font-bold whitespace-nowrap ${
                           isAjuste
                             ? mov.amount >= 0 ? 'text-emerald-700' : 'text-rose-600'
-                            : isPositive ? 'text-emerald-700' : isVale ? 'text-purple-700' : 'text-rose-600'
+                            : isEstorno || isSangria
+                            ? 'text-rose-600'
+                            : isVale
+                            ? 'text-purple-700'
+                            : 'text-emerald-700'
                         }`}>
                           {isAjuste
                             ? mov.amount >= 0 ? `+${formatCurrency(mov.amount)}` : `-${formatCurrency(Math.abs(mov.amount))}`
+                            : isEstorno
+                            ? `-${formatCurrency(mov.amount)}`
                             : `${isPositive ? '+' : '-'}${formatCurrency(Math.abs(mov.amount))}`}
                         </td>
                         <td className="py-3 px-2 text-slate-500 whitespace-nowrap">
@@ -659,8 +726,18 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <span className="font-mono font-semibold">{formatCurrency(metrics.initialBalance)}</span>
               </div>
               <div className="flex justify-between">
-                <span>Vendas em dinheiro apuradas:</span>
-                <span className="font-mono font-semibold text-emerald-700">+{formatCurrency(metrics.cashSales)}</span>
+                <span>Vendas em dinheiro (bruto):</span>
+                <span className="font-mono font-semibold text-emerald-700">+{formatCurrency(metrics.grossCashSales)}</span>
+              </div>
+              {metrics.cashRefunds > 0 && (
+                <div className="flex justify-between text-rose-600 font-semibold">
+                  <span>Estornos/Devoluções em dinheiro:</span>
+                  <span className="font-mono">-{formatCurrency(metrics.cashRefunds)}</span>
+                </div>
+              )}
+              <div className="flex justify-between font-semibold text-slate-700">
+                <span>Vendas líquidas em dinheiro:</span>
+                <span className="font-mono text-emerald-800">+{formatCurrency(metrics.netCashSales)}</span>
               </div>
               <div className="flex justify-between">
                 <span>Suprimentos adicionados:</span>
@@ -683,12 +760,28 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 </div>
               )}
               <div className="flex justify-between pt-2 border-t border-slate-200 font-bold text-slate-900 text-sm">
-                <span>Gaveta:</span>
+                <span>Gaveta (Dinheiro Físico Esperado):</span>
                 <span className="text-amber-800">{formatCurrency(metrics.expectedCashInDrawer)}</span>
               </div>
-              <div className="flex justify-between text-[11px] text-slate-400 pt-1">
-                <span>Outras formas (não entram na gaveta):</span>
-                <span>PIX: {formatCurrency(metrics.pixSales)} · Cartões: {formatCurrency(metrics.cardSales)}</span>
+              <div className="pt-2 border-t border-slate-200 space-y-1 text-[11px] text-slate-500">
+                <div className="flex justify-between">
+                  <span>Vendas PIX:</span>
+                  <span className="font-semibold text-blue-700">
+                    Bruto: {formatCurrency(metrics.grossPixSales)}
+                    {metrics.pixRefunds > 0 ? ` | Devol: -${formatCurrency(metrics.pixRefunds)} | Líq: ${formatCurrency(metrics.netPixSales)}` : ''}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Vendas Cartões:</span>
+                  <span className="font-semibold text-indigo-700">
+                    Bruto: {formatCurrency(metrics.grossCardSales)}
+                    {metrics.cardRefunds > 0 ? ` | Devol: -${formatCurrency(metrics.cardRefunds)} | Líq: ${formatCurrency(metrics.netCardSales)}` : ''}
+                  </span>
+                </div>
+                <div className="flex justify-between font-bold text-slate-900 pt-1 border-t border-slate-100">
+                  <span>Receita Total Líquida do Turno:</span>
+                  <span className="text-emerald-700 font-mono">{formatCurrency(metrics.totalNetRevenue)}</span>
+                </div>
               </div>
             </div>
 
@@ -936,22 +1029,76 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 )}
               </div>
 
+              {(() => {
+                let grossCash = 0, refCash = 0, grossPix = 0, refPix = 0, grossCard = 0, refCard = 0;
+                selectedHistoryShift.movements.forEach(m => {
+                  if (m.type === 'VENDA') {
+                    if (m.paymentMethod === 'DINHEIRO') grossCash += m.amount;
+                    else if (m.paymentMethod === 'PIX') grossPix += m.amount;
+                    else grossCard += m.amount;
+                  } else if (m.type === 'ESTORNO') {
+                    if (m.paymentMethod === 'DINHEIRO') refCash += m.amount;
+                    else if (m.paymentMethod === 'PIX') refPix += m.amount;
+                    else refCard += m.amount;
+                  }
+                });
+                return (
+                  <div className="p-3 bg-slate-50 rounded-xl space-y-1 border border-slate-200">
+                    <div className="flex justify-between">
+                      <span className="text-slate-600">Vendas Dinheiro:</span>
+                      <span className="font-mono">Bruto: {formatCurrency(grossCash)} {refCash > 0 ? `| Estornos: -${formatCurrency(refCash)} | Líq: ${formatCurrency(grossCash - refCash)}` : ''}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-600">Vendas PIX:</span>
+                      <span className="font-mono">Bruto: {formatCurrency(grossPix)} {refPix > 0 ? `| Estornos: -${formatCurrency(refPix)} | Líq: ${formatCurrency(grossPix - refPix)}` : ''}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-600">Vendas Cartão:</span>
+                      <span className="font-mono">Bruto: {formatCurrency(grossCard)} {refCard > 0 ? `| Estornos: -${formatCurrency(refCard)} | Líq: ${formatCurrency(grossCard - refCard)}` : ''}</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
               <div>
                 <h4 className="font-bold text-slate-800 mb-2">Movimentações deste turno ({selectedHistoryShift.movements.length})</h4>
                 <div className="divide-y divide-slate-100 max-h-48 overflow-y-auto border border-slate-200 rounded-xl">
-                  {selectedHistoryShift.movements.map((m) => (
-                    <div key={m.id} className="p-2.5 flex justify-between items-center">
-                      <div>
-                        <span className="font-bold text-slate-900">{m.description}</span>
-                        <span className="text-[10px] text-slate-400 block">{formatTime(m.timestamp)} · {m.type === 'AJUSTE' ? 'Ajuste de Gaveta' : m.type}</span>
+                  {selectedHistoryShift.movements.map((m) => {
+                    const isEstorno = m.type === 'ESTORNO';
+                    const isAjuste = m.type === 'AJUSTE';
+                    const isSangria = m.type === 'SANGRIA';
+                    const isVale = m.type === 'VALE';
+                    return (
+                      <div key={m.id} className="p-2.5 flex justify-between items-center">
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-bold text-slate-900">{m.description}</span>
+                            {m.orderNumber && (
+                              <span className="font-mono text-[10px] text-amber-800 font-bold">({m.orderNumber})</span>
+                            )}
+                          </div>
+                          <span className="text-[10px] text-slate-400 block">
+                            {formatTime(m.timestamp)} · {isAjuste ? 'Ajuste de Gaveta' : isEstorno ? 'Estorno / Devolução' : m.type}
+                            {m.paymentMethod ? ` (${getPaymentMethodLabel(m.paymentMethod)})` : ''}
+                          </span>
+                          {m.refundReason && (
+                            <span className="text-[10px] text-rose-600 italic block">Motivo: {m.refundReason}</span>
+                          )}
+                        </div>
+                        <span className={`font-mono font-bold ${
+                          isAjuste 
+                            ? (m.amount >= 0 ? 'text-emerald-700' : 'text-rose-600')
+                            : (isEstorno || isSangria ? 'text-rose-600' : isVale ? 'text-purple-700' : 'text-emerald-700')
+                        }`}>
+                          {isAjuste 
+                            ? (m.amount >= 0 ? `+${formatCurrency(m.amount)}` : `-${formatCurrency(Math.abs(m.amount))}`)
+                            : isEstorno
+                            ? `-${formatCurrency(m.amount)}`
+                            : `${m.type === 'SANGRIA' || m.type === 'VALE' ? '-' : '+'}${formatCurrency(m.amount)}`}
+                        </span>
                       </div>
-                      <span className={`font-mono font-bold ${m.type === 'SANGRIA' || (m.type === 'AJUSTE' && m.amount < 0) ? 'text-rose-600' : 'text-emerald-700'}`}>
-                        {m.type === 'AJUSTE' 
-                          ? (m.amount >= 0 ? `+${formatCurrency(m.amount)}` : `-${formatCurrency(Math.abs(m.amount))}`)
-                          : `${m.type === 'SANGRIA' ? '-' : '+'}${formatCurrency(m.amount)}`}
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>

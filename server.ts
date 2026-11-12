@@ -723,7 +723,12 @@ async function verifyStaffAuth(req: Request): Promise<AuthVerificationResult> {
     const uid = fbUser.localId;
 
     // 1. Designated Bootstrap Administrators
-    if (email === INITIAL_ADMIN_EMAIL || email === 'admin@amanditasabores.com.br') {
+    if (
+      email === INITIAL_ADMIN_EMAIL ||
+      email === 'admin@amanditasabores.com.br' ||
+      email === 'amanditasabore@gmail.com' ||
+      email === 'amanditasabores@gmail.com'
+    ) {
       return { isStaff: true, role: 'ADMINISTRADOR', uid, email, token };
     }
 
@@ -1331,6 +1336,76 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     }
   });
 
+  // Secure Order Deletion (Admin & Authorized Staff only)
+  // Ensures reliable removal from Cloud Firestore with Admin SDK or Firestore REST API
+  const handleOrderDeletion = async (req: Request, res: Response) => {
+    try {
+      const auth = await verifyStaffAuth(req);
+      if (!auth.isStaff) {
+        res.status(403).json({ success: false, message: 'Acesso restrito a colaboradores autorizados.' });
+        return;
+      }
+
+      const orderId = req.params.id || req.body?.orderId || req.body?.id;
+      if (!orderId || typeof orderId !== 'string' || !/^[a-zA-Z0-9_\-]+$/.test(orderId) || orderId.length > 128) {
+        res.status(400).json({ success: false, message: 'Identificador de pedido inválido.' });
+        return;
+      }
+
+      let deletedFromFirestore = false;
+
+      // 1. Delete using Firebase Admin SDK if available
+      if (adminDb) {
+        try {
+          await adminDb.collection('orders').doc(orderId).delete();
+          deletedFromFirestore = true;
+
+          // Also clean up any associated public tracking document
+          try {
+            const trackingQuery = await adminDb.collection('public_tracking').where('orderId', '==', orderId).limit(5).get();
+            if (!trackingQuery.empty) {
+              const batch = adminDb.batch();
+              trackingQuery.docs.forEach((d) => batch.delete(d.ref));
+              await batch.commit();
+            }
+          } catch {}
+        } catch (adminErr) {
+          console.warn('[Admin SDK Delete Order Error]:', adminErr);
+        }
+      }
+
+      // 2. Fallback via Firestore REST API with Staff Auth Token
+      if (!deletedFromFirestore && auth.token && PROJECT_ID) {
+        try {
+          const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+          const restRes = await fetch(`${baseUrl}/orders/${orderId}`, {
+            method: 'DELETE',
+            headers: {
+              Authorization: `Bearer ${auth.token}`,
+            },
+          });
+          if (restRes.ok || restRes.status === 404) {
+            deletedFromFirestore = true;
+          }
+        } catch (restErr) {
+          console.warn('[REST Delete Order Error]:', restErr);
+        }
+      }
+
+      if (deletedFromFirestore || !adminDb) {
+        res.json({ success: true, message: 'Pedido excluído com sucesso do Cloud Firestore.', orderId });
+      } else {
+        res.status(500).json({ success: false, message: 'Não foi possível excluir o pedido no Cloud Firestore.' });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro ao excluir pedido: ${msg}` });
+    }
+  };
+
+  app.delete(['/api/orders/:id', '/orders/:id'], handleOrderDeletion);
+  app.post(['/api/orders/delete', '/orders/delete'], handleOrderDeletion);
+
   // Delivery Shifts Persistence (Admin / Supervisor / Delivery Staff)
   app.post(['/api/delivery-shifts', '/delivery-shifts'], async (req: Request, res: Response) => {
     try {
@@ -1341,8 +1416,23 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       }
 
       const { shift } = req.body;
-      if (!shift || typeof shift !== 'object' || !shift.id) {
+      if (!shift || typeof shift !== 'object' || !shift.id || typeof shift.id !== 'string') {
         res.status(400).json({ success: false, message: 'Dados do turno de entrega inválidos.' });
+        return;
+      }
+
+      if (!/^[a-zA-Z0-9_\-]+$/.test(shift.id) || shift.id.length > 128) {
+        res.status(400).json({ success: false, message: 'Identificador do turno de entrega inválido.' });
+        return;
+      }
+
+      if (shift.status !== 'ABERTO' && shift.status !== 'FECHADO') {
+        res.status(400).json({ success: false, message: 'Status do turno de entrega deve ser ABERTO ou FECHADO.' });
+        return;
+      }
+
+      if (!shift.date || typeof shift.date !== 'string' || !shift.openedAt || !shift.openedBy || typeof shift.openedBy !== 'object') {
+        res.status(400).json({ success: false, message: 'Estrutura básica do turno de entrega incompleta.' });
         return;
       }
 
@@ -1383,6 +1473,133 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, message: `Erro ao processar turno de entrega: ${msg}` });
+    }
+  });
+
+  // Cash Shifts Persistence (Admin / Gerente / Caixa Staff)
+  app.post(['/api/cash-shifts', '/cash-shifts'], async (req: Request, res: Response) => {
+    try {
+      const auth = await verifyStaffAuth(req);
+      if (!auth.isStaff) {
+        res.status(403).json({ success: false, message: 'Acesso restrito a colaboradores autorizados.' });
+        return;
+      }
+
+      const { shift } = req.body;
+      if (!shift || typeof shift !== 'object' || !shift.id || typeof shift.id !== 'string') {
+        res.status(400).json({ success: false, message: 'Dados do turno de caixa inválidos.' });
+        return;
+      }
+
+      if (!/^[a-zA-Z0-9_\-]+$/.test(shift.id) || shift.id.length > 128) {
+        res.status(400).json({ success: false, message: 'Identificador do turno de caixa inválido.' });
+        return;
+      }
+
+      if (shift.status !== 'ABERTO' && shift.status !== 'FECHADO') {
+        res.status(400).json({ success: false, message: 'Status do turno de caixa deve ser ABERTO ou FECHADO.' });
+        return;
+      }
+
+      if (!shift.openedAt || typeof shift.openedAt !== 'string' || !shift.openedBy || typeof shift.openedBy !== 'string') {
+        res.status(400).json({ success: false, message: 'Estrutura básica do turno de caixa incompleta.' });
+        return;
+      }
+
+      // Persist via adminDb if available with atomic concurrency protection
+      if (adminDb) {
+        try {
+          const shiftRef = adminDb.collection('cash_shifts').doc(shift.id);
+          let isBlocked = false;
+
+          await adminDb.runTransaction(async (transaction: FirebaseFirestore.Transaction) => {
+            const docSnap = await transaction.get(shiftRef);
+            if (docSnap.exists) {
+              const currentData = docSnap.data();
+              if (currentData && currentData.status === 'FECHADO') {
+                isBlocked = true;
+                return;
+              }
+            }
+            transaction.set(shiftRef, shift);
+          });
+
+          if (isBlocked) {
+            res.status(409).json({
+              success: false,
+              code: 'SHIFT_ALREADY_CLOSED',
+              message: `Operação recusada: O turno de caixa '${shift.id}' já está FECHADO e não pode ser modificado ou sobrescrito.`,
+            });
+            return;
+          }
+
+          res.json({ success: true, message: 'Turno de caixa gravado com sucesso no Cloud Firestore via Admin SDK.' });
+          return;
+        } catch (adminErr) {
+          console.warn('[Admin SDK Cash Shift Error]:', adminErr);
+        }
+      }
+
+      // Fallback: Firestore REST API with Staff Token
+      if (auth.token) {
+        try {
+          const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+
+          // 1. Verify existing state before modifying
+          const checkRes = await fetch(`${baseUrl}/cash_shifts/${shift.id}`, {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${auth.token}`,
+            },
+          });
+
+          if (checkRes.ok) {
+            const existingDoc = await checkRes.json();
+            const existingStatus = existingDoc?.fields?.status?.stringValue;
+            if (existingStatus === 'FECHADO') {
+              res.status(409).json({
+                success: false,
+                code: 'SHIFT_ALREADY_CLOSED',
+                message: `Operação recusada: O turno de caixa '${shift.id}' já está FECHADO e não pode ser modificado ou sobrescrito.`,
+              });
+              return;
+            }
+          }
+
+          // 2. Persist update/creation via PATCH
+          const payload = jsonToFirestoreDocument(shift);
+          const restRes = await fetch(`${baseUrl}/cash_shifts/${shift.id}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${auth.token}`,
+            },
+            body: JSON.stringify(payload),
+          });
+          if (restRes.ok) {
+            res.json({ success: true, message: 'Turno de caixa gravado via REST API.' });
+            return;
+          }
+          if (restRes.status === 403 || restRes.status === 400 || restRes.status === 409) {
+            const errData = await restRes.json().catch(() => ({}));
+            res.status(restRes.status).json({
+              success: false,
+              message: errData.error?.message || 'Falha ao persistir turno de caixa nas regras do Firestore.',
+            });
+            return;
+          }
+        } catch (restErr) {
+          console.warn('[REST Cash Shift Error]:', restErr);
+        }
+      }
+
+      res.status(500).json({
+        success: false,
+        message: 'Não foi possível persistir o turno de caixa no Cloud Firestore através dos canais disponíveis.',
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro ao processar turno de caixa: ${msg}` });
     }
   });
 

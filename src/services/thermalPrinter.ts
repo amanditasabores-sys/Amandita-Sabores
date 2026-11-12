@@ -8,7 +8,7 @@
  * 3. Spooler do Sistema / Navegador (58mm): Impressão gráfica com largura e margens de 58mm.
  */
 
-import { Order, CustomerAddress } from '../types';
+import { Order, CustomerAddress, OrderRefundInfo } from '../types';
 import { formatCurrency, formatDateTime, getPaymentMethodLabel } from '../utils/formatters';
 
 export type PrinterPaperWidth = '58mm' | '80mm';
@@ -1224,6 +1224,225 @@ class ThermalPrinterService {
     };
 
     return this.printOrder(testOrder, { forceReprint: true });
+  }
+
+  /**
+   * Gera o texto do comprovante de cancelamento / estorno formatado em 32 colunas (58 mm)
+   */
+  public generateRefundReceiptPlainText(order: Order, refundInfo?: OrderRefundInfo): string {
+    const info = refundInfo || order.refundInfo;
+    const separator = '--------------------------------';
+    const lines: string[] = [];
+    const cancelDate = info?.timestamp ? formatDateTime(info.timestamp) : formatDateTime(order.updatedAt || new Date().toISOString());
+    const originalDate = formatDateTime(order.createdAt);
+
+    // Cabeçalho
+    lines.push(this.centerText('AMANDITA SABORES'));
+    lines.push(this.centerText('Cardapio & Cozinha'));
+    lines.push('');
+    lines.push(separator);
+    lines.push(this.centerText('*** COMPROVANTE DE ESTORNO ***'));
+    lines.push(this.centerText('CANCELAMENTO & DEVOLUCAO'));
+    lines.push(separator);
+    lines.push('');
+
+    // Pedido e Datas
+    lines.push(this.formatLine(`PEDIDO ORIGINAL:`, order.orderNumber));
+    lines.push(`DATA DO PEDIDO: ${originalDate}`);
+    lines.push(`DATA CANCELAMENTO: ${cancelDate}`);
+    lines.push(separator);
+
+    // Cliente
+    lines.push(`CLIENTE: ${this.sanitizeText(order.customer.name || 'Cliente Balcao')}`);
+    if (order.customer.phone) {
+      lines.push(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
+    }
+    lines.push(separator);
+
+    // Valores Financeiros
+    const originalAmt = info?.originalAmount ?? order.totalAmount;
+    const refundAmt = info?.refundAmount ?? order.totalAmount;
+    const originalMethod = info?.originalPaymentMethod || order.paymentMethod;
+    const refundMethod = info?.refundPaymentMethod || originalMethod;
+
+    lines.push(this.formatLine('VALOR ORIGINAL:', formatCurrency(originalAmt)));
+    lines.push(this.formatLine('VALOR ESTORNADO:', formatCurrency(refundAmt)));
+    lines.push(this.formatLine('FORMA ORIGINAL:', getPaymentMethodLabel(originalMethod)));
+    lines.push(this.formatLine('FORMA DEVOLUCAO:', getPaymentMethodLabel(refundMethod)));
+    lines.push(separator);
+
+    // Motivo e Responsabilidade
+    lines.push('MOTIVO DO CANCELAMENTO:');
+    const reasonText = info?.reason || 'Cancelamento solicitado pelo operador';
+    const reasonLines = this.wrapText(reasonText, 32, '  ');
+    lines.push(...reasonLines);
+    lines.push('');
+
+    const authorText = info?.author || order.operatorName || 'Administrador';
+    lines.push(`AUTORIZADO POR: ${this.sanitizeText(authorText)}`);
+
+    // Impacto no Caixa
+    lines.push(separator);
+    if (refundMethod === 'DINHEIRO') {
+      lines.push(this.centerText('IMPACTO NO CAIXA:'));
+      lines.push(this.centerText('VALOR DEDUZIDO DA GAVETA'));
+    } else if (refundMethod === 'PIX') {
+      lines.push(this.centerText('IMPACTO NO CAIXA:'));
+      lines.push(this.centerText('DEVOLUCAO BANCARIA PIX'));
+      lines.push(this.centerText('(SEM ALTERAR GAVETA FISICA)'));
+    } else {
+      lines.push(this.centerText('IMPACTO NO CAIXA:'));
+      lines.push(this.centerText('ESTORNO EM CARTAO / POS'));
+    }
+
+    if (info?.status === 'PENDENTE_CAIXA') {
+      lines.push('');
+      lines.push(this.centerText('** PENDENTE DE COMPENSACAO **'));
+      lines.push(this.centerText('(Nenhum turno de caixa aberto)'));
+    }
+
+    lines.push(separator);
+    lines.push(this.centerText('DOCUMENTO PARA AUDITORIA'));
+    lines.push(this.centerText('Amandita Sabores Artesanais'));
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Imprime comprovante de cancelamento / estorno
+   */
+  public async printRefundReceipt(
+    order: Order,
+    refundInfo?: OrderRefundInfo
+  ): Promise<{ success: boolean; message: string; printMode?: string }> {
+    const info = refundInfo || order.refundInfo;
+    const targetMode = this.config.connectionMode;
+
+    try {
+      this.isPrinting = true;
+      this.lastError = null;
+      this.notifyStatus();
+
+      const receiptText = this.generateRefundReceiptPlainText(order, info);
+
+      // 1. Spooler do Sistema / Navegador
+      if (targetMode === 'system_print') {
+        this.printRefundViaSystemSpooler(order, receiptText);
+        this.isPrinting = false;
+        this.lastPrintedAt = new Date().toISOString();
+        this.notifyStatus();
+        return {
+          success: true,
+          message: `Comprovante de estorno do pedido ${order.orderNumber} aberto para impressão.`,
+          printMode: 'system_print',
+        };
+      }
+
+      // Converte para binário ESC/POS
+      const encoder = new TextEncoder();
+      const textBytes = encoder.encode(receiptText + '\n\n\n\n\x1dV\x00');
+
+      // 2. Android RawBT
+      if (targetMode === 'android_rawbt') {
+        this.sendToAndroidRawBT(textBytes);
+        this.isPrinting = false;
+        this.lastPrintedAt = new Date().toISOString();
+        this.notifyStatus();
+        return {
+          success: true,
+          message: `Comprovante de estorno enviado ao aplicativo Android RawBT.`,
+          printMode: 'android_rawbt',
+        };
+      }
+
+      // 3. Bluetooth BLE
+      const bleResult = await this.sendEscPosOverBluetooth(textBytes);
+      if (bleResult.success) {
+        this.isPrinting = false;
+        this.lastPrintedAt = new Date().toISOString();
+        this.notifyStatus();
+        return {
+          success: true,
+          message: `Comprovante de estorno do pedido ${order.orderNumber} impresso via Bluetooth!`,
+          printMode: 'bluetooth_ble',
+        };
+      } else {
+        // Fallback para spooler
+        this.printRefundViaSystemSpooler(order, receiptText);
+        this.isPrinting = false;
+        this.lastPrintedAt = new Date().toISOString();
+        this.notifyStatus();
+        return {
+          success: true,
+          message: `Bluetooth indisponível. Comprovante de estorno aberto no spooler de impressão.`,
+          printMode: 'system_print',
+        };
+      }
+    } catch (err: any) {
+      this.isPrinting = false;
+      this.lastError = err.message || String(err);
+      this.notifyStatus();
+      return {
+        success: false,
+        message: `Falha ao imprimir comprovante de estorno: ${err.message || err}`,
+        printMode: targetMode,
+      };
+    }
+  }
+
+  private printRefundViaSystemSpooler(order: Order, receiptText: string): void {
+    if (typeof window === 'undefined') return;
+
+    const printWindow = window.open('', '_blank', 'width=380,height=600');
+    if (!printWindow) {
+      window.print();
+      return;
+    }
+
+    printWindow.document.write(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Comprovante de Estorno - Pedido ${order.orderNumber} - 58mm</title>
+          <meta charset="utf-8">
+          <style>
+            @page {
+              size: 58mm auto;
+              margin: 0mm;
+            }
+            body {
+              font-family: 'Courier New', Courier, monospace;
+              font-size: 11px;
+              line-height: 1.25;
+              color: #000;
+              background: #fff;
+              margin: 0;
+              padding: 2mm 3mm;
+              width: 58mm;
+              max-width: 58mm;
+              box-sizing: border-box;
+            }
+            pre {
+              white-space: pre-wrap;
+              word-wrap: break-word;
+              margin: 0;
+              font-family: inherit;
+              font-size: inherit;
+            }
+          </style>
+        </head>
+        <body>
+          <pre>${receiptText.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+          <script>
+            window.onload = function() {
+              window.print();
+              setTimeout(function() { window.close(); }, 500);
+            };
+          </script>
+        </body>
+      </html>
+    `);
+    printWindow.document.close();
   }
 }
 

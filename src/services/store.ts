@@ -17,8 +17,10 @@ import {
   DailyMenuConfig,
   DeliveryPermissions,
   DeliveryShift,
-  DeliveryShiftSummary
+  DeliveryShiftSummary,
+  OrderRefundInfo
 } from '../types';
+import { formatCurrency } from '../utils/formatters';
 import { soundService } from './audio';
 import { thermalPrinterService } from './thermalPrinter';
 import { generatePixCopiaECola } from '../utils/pix';
@@ -388,6 +390,44 @@ class StoreService {
     this.savePendingSyncOrders(list);
   }
 
+  // ==========================================
+  // DELETED ORDERS TOMBSTONE REGISTRY
+  // Prevents deleted orders from resurrecting on snapshot reconciliation or refresh
+  // ==========================================
+  public getDeletedOrderIds(): Set<string> {
+    try {
+      const data = localStorage.getItem('gf_deleted_order_ids');
+      if (data) {
+        const list = JSON.parse(data);
+        if (Array.isArray(list)) return new Set(list);
+      }
+    } catch {}
+    return new Set();
+  }
+
+  public recordDeletedOrderId(orderId: string): void {
+    try {
+      const set = this.getDeletedOrderIds();
+      set.add(orderId);
+      const list = Array.from(set).slice(-500); // Retain last 500 tombstones
+      localStorage.setItem('gf_deleted_order_ids', JSON.stringify(list));
+    } catch {}
+  }
+
+  public isOrderDeleted(orderId: string): boolean {
+    return this.getDeletedOrderIds().has(orderId);
+  }
+
+  public removeDeletedOrderId(orderId: string): void {
+    try {
+      const set = this.getDeletedOrderIds();
+      if (set.has(orderId)) {
+        set.delete(orderId);
+        localStorage.setItem('gf_deleted_order_ids', JSON.stringify(Array.from(set)));
+      }
+    } catch {}
+  }
+
   public updateLocalOrderSyncStatus(orderId: string, status: 'SYNCED' | 'PENDING' | 'ERROR'): void {
     const orders = this.getOrders();
     const idx = orders.findIndex((o) => o.id === orderId);
@@ -529,14 +569,22 @@ class StoreService {
    */
   public async flushPendingSyncQueue(): Promise<{ processed: number; succeeded: number }> {
     if (!db || this.isFlushingPendingQueue) return { processed: 0, succeeded: 0 };
+    const deletedIds = this.getDeletedOrderIds();
     const pending = this.getPendingSyncOrders();
-    if (pending.length === 0) return { processed: 0, succeeded: 0 };
+    const activePending = pending.filter((o) => {
+      if (deletedIds.has(o.id)) {
+        this.removeOrderFromSyncQueue(o.id);
+        return false;
+      }
+      return true;
+    });
+    if (activePending.length === 0) return { processed: 0, succeeded: 0 };
 
     this.isFlushingPendingQueue = true;
     let succeeded = 0;
 
     try {
-      for (const order of pending) {
+      for (const order of activePending) {
         try {
           const cleanOrder = this.cleanForFirestore(order);
           await setDoc(doc(db, 'orders', order.id), cleanOrder);
@@ -550,14 +598,36 @@ class StoreService {
           this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
           succeeded++;
         } catch {
-          // Keep in queue for next transmission cycle
+          // Backend fallback attempt for resilient persistence
+          try {
+            let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (auth?.currentUser) {
+              try {
+                const idToken = await auth.currentUser.getIdToken();
+                if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+              } catch {}
+            }
+            const res = await fetch('/api/orders', {
+              method: 'POST',
+              headers: authHeaders,
+              body: JSON.stringify({ order }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
+              this.removeOrderFromSyncQueue(order.id);
+              this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+              succeeded++;
+            }
+          } catch {
+            // Keep in queue for next transmission cycle
+          }
         }
       }
     } finally {
       this.isFlushingPendingQueue = false;
     }
 
-    return { processed: pending.length, succeeded };
+    return { processed: activePending.length, succeeded };
   }
 
   /**
@@ -938,6 +1008,22 @@ class StoreService {
   }
 
   /**
+   * Helper to identify bootstrapped emergency administrator accounts
+   */
+  public isBootstrappedAdminEmail(email?: string | null): boolean {
+    if (!email) return false;
+    const clean = email.trim().toLowerCase();
+    const configuredAdmin = this.getInitialAdminEmail();
+    return (
+      clean === configuredAdmin ||
+      clean === 'admin@amanditasabores.com.br' ||
+      clean === 'amanditasabore@gmail.com' ||
+      clean === 'amanditasabores@gmail.com' ||
+      clean === 'dvrmercadinho@gmail.com'
+    );
+  }
+
+  /**
    * Verifies if an authenticated Firebase User has a confirmed authorized staff role.
    * Does NOT blindly trust localStorage; checks remote Firestore /users/{uid} and the staff registry.
    */
@@ -971,8 +1057,7 @@ class StoreService {
     }
 
     // 3. Admin email bootstrap check
-    const adminEmail = this.getInitialAdminEmail();
-    if (firebaseUser.email && (firebaseUser.email.trim().toLowerCase() === adminEmail || firebaseUser.email.trim().toLowerCase() === 'admin@amanditasabores.com.br')) {
+    if (firebaseUser.email && this.isBootstrappedAdminEmail(firebaseUser.email)) {
       return 'ADMINISTRADOR';
     }
 
@@ -996,8 +1081,7 @@ class StoreService {
     const currentFbUser = auth?.currentUser;
     if (!currentFbUser) return false;
 
-    const adminEmail = this.getInitialAdminEmail();
-    if (currentFbUser.email && currentFbUser.email.trim().toLowerCase() === adminEmail) return true;
+    if (currentFbUser.email && this.isBootstrappedAdminEmail(currentFbUser.email)) return true;
 
     const localUsers = this.getUsers();
     const matched = localUsers.find(
@@ -1130,11 +1214,28 @@ class StoreService {
             remoteOrders.push(data);
           });
 
-          remoteOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          const deletedIds = this.getDeletedOrderIds();
 
-          const localOrders = this.getOrders();
+          // Discard remote orders that were deleted locally (tombstones) and trigger remote cleanup if needed
+          const activeRemoteOrders: Order[] = [];
+          for (const ro of remoteOrders) {
+            if (deletedIds.has(ro.id)) {
+              if (db) {
+                deleteDoc(doc(db, 'orders', ro.id)).catch(() => {});
+                if (ro.trackingCode) {
+                  deleteDoc(doc(db, 'public_tracking', ro.trackingCode)).catch(() => {});
+                }
+              }
+            } else {
+              activeRemoteOrders.push(ro);
+            }
+          }
+
+          activeRemoteOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+          const localOrders = this.getOrders().filter((lo) => !deletedIds.has(lo.id));
           const localIds = new Set(localOrders.map((o) => o.id));
-          const newIncoming = remoteOrders.filter((ro) => !localIds.has(ro.id) && ro.status === 'NOVO');
+          const newIncoming = activeRemoteOrders.filter((ro) => !localIds.has(ro.id) && ro.status === 'NOVO');
           
           if (newIncoming.length > 0) {
             newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
@@ -1162,7 +1263,7 @@ class StoreService {
           }
 
           // Check for orders transitioning to PRONTO for delivery (dedicated driver notification)
-          const newlyReadyDeliveries = remoteOrders.filter((ro) => {
+          const newlyReadyDeliveries = activeRemoteOrders.filter((ro) => {
             if (ro.status !== 'PRONTO' || ro.fulfillmentType !== 'DELIVERY') return false;
             const prev = localOrders.find((lo) => lo.id === ro.id);
             return !prev || prev.status !== 'PRONTO';
@@ -1178,10 +1279,10 @@ class StoreService {
             this.notify('DRIVER_ORDER_READY', newlyReadyDeliveries);
           }
 
-          if (remoteOrders.length > 0) {
+          if (activeRemoteOrders.length > 0) {
             const pendingOrders = this.getPendingSyncOrders();
             const pendingIds = new Set(pendingOrders.map((o) => o.id));
-            const remoteMap = new Map(remoteOrders.map((o) => [o.id, o]));
+            const remoteMap = new Map(activeRemoteOrders.map((o) => [o.id, o]));
 
             // Strict status precedence hierarchy: newer pipeline progression always wins
             const STATUS_PRECEDENCE: Record<string, number> = {
@@ -1204,6 +1305,23 @@ class StoreService {
               } else {
                 remoteMap.delete(lo.id);
 
+                // Preserve driver assignment if present on local but absent on incoming remote document
+                // This prevents status changes from stripping driver info and triggering auto-assignment loops
+                const mergedDeliveryPersonId = ro.deliveryPersonId || lo.deliveryPersonId;
+                const mergedDeliveryPersonName = ro.deliveryPersonName || lo.deliveryPersonName;
+                const mergedDeliveryPerson = ro.deliveryPerson || lo.deliveryPerson;
+                const mergedAssignmentHistory = (ro.deliveryAssignmentHistory && ro.deliveryAssignmentHistory.length > 0)
+                  ? ro.deliveryAssignmentHistory
+                  : lo.deliveryAssignmentHistory;
+
+                const baseOrder: Order = {
+                  ...ro,
+                  deliveryPersonId: mergedDeliveryPersonId,
+                  deliveryPersonName: mergedDeliveryPersonName,
+                  deliveryPerson: mergedDeliveryPerson,
+                  deliveryAssignmentHistory: mergedAssignmentHistory,
+                };
+
                 const roRank = STATUS_PRECEDENCE[ro.status] || 0;
                 const loRank = STATUS_PRECEDENCE[lo.status] || 0;
                 const roTime = ro.updatedAt ? new Date(ro.updatedAt).getTime() : 0;
@@ -1221,35 +1339,36 @@ class StoreService {
                   roMovesCount > loMovesCount
                 ) {
                   this.removeOrderFromSyncQueue(lo.id);
-                  merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+                  merged.push({ ...baseOrder, _cloudSyncStatus: 'SYNCED' });
                 } else if (pendingIds.has(lo.id)) {
                   // Keep true pending local changes that have not yet reached remote
                   merged.push(lo);
                 } else {
-                  merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+                  merged.push({ ...baseOrder, _cloudSyncStatus: 'SYNCED' });
                 }
               }
             }
 
-            // Add any remaining remote orders not yet present in local storage
+            // Add any remaining remote orders not yet present in local storage (excluding tombstones)
             for (const ro of remoteMap.values()) {
-              merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+              if (!deletedIds.has(ro.id)) {
+                merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+              }
             }
 
             merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
             localStorage.setItem('gf_orders', JSON.stringify(merged));
-
-            // Apply automated assignment rule: if exactly 1 active driver exists, auto-assign
-            this.applyAutomaticDriverAssignment();
           } else if (localOrders.length > 0 && db) {
-            // Firestore orders was empty: seed existing local orders to Firestore
+            // Firestore orders was empty: seed existing non-deleted local orders to Firestore
             for (const lo of localOrders) {
-              this.persistOrderToFirestore(lo).catch(() => {});
+              if (!deletedIds.has(lo.id)) {
+                this.persistOrderToFirestore(lo).catch(() => {});
+              }
             }
           }
 
-          this.notify('FIRESTORE_ORDERS_SYNCED', { count: remoteOrders.length });
-          this.notify('ORDERS_UPDATED', { count: remoteOrders.length });
+          this.notify('FIRESTORE_ORDERS_SYNCED', { count: activeRemoteOrders.length });
+          this.notify('ORDERS_UPDATED', { count: activeRemoteOrders.length });
           if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_ORDERS_SYNCED' } }));
           }
@@ -2773,15 +2892,27 @@ class StoreService {
     return order;
   }
 
-  public deleteOrder(orderId: string): boolean {
+  public async deleteOrderAsync(orderId: string): Promise<{ success: boolean; error?: string }> {
     const orders = this.getOrders();
     const target = orders.find((o) => o.id === orderId);
-    if (!target) return false;
+    if (!target) {
+      if (this.isOrderDeleted(orderId)) {
+        return { success: true };
+      }
+      return { success: false, error: 'Pedido não encontrado no sistema.' };
+    }
 
+    // 1. Record in tombstone registry immediately so incoming snapshots can never resurrect it
+    this.recordDeletedOrderId(orderId);
+
+    // 2. Remove from pending sync queue
+    this.removeOrderFromSyncQueue(orderId);
+
+    // 3. Remove from local orders list
     const filtered = orders.filter((o) => o.id !== orderId);
     localStorage.setItem('gf_orders', JSON.stringify(filtered));
 
-    // Also remove from current open cash register if linked
+    // 4. Remove from current open cash register if linked
     const currentShift = this.getCurrentCashShift();
     if (currentShift) {
       const updatedMovements = currentShift.movements.filter((m: CashMovement) => m.orderId !== orderId);
@@ -2792,16 +2923,97 @@ class StoreService {
     }
 
     this.notify('ORDER_DELETED', { orderId, orderNumber: target.orderNumber });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_DELETED', payload: { orderId } } }));
+    }
 
+    let firestoreDeleted = false;
+    let deleteError: string | undefined;
+
+    // 5. Delete directly from Firestore via Client SDK if available
     if (db) {
-      deleteDoc(doc(db, 'orders', orderId)).catch((err) => {
-        console.warn('[Firestore] Fallback local para exclusão:', err.message);
-      });
-
-      if (target.trackingCode) {
-        deleteDoc(doc(db, 'public_tracking', target.trackingCode)).catch(() => {});
+      try {
+        await deleteDoc(doc(db, 'orders', orderId));
+        firestoreDeleted = true;
+        if (target.trackingCode) {
+          await deleteDoc(doc(db, 'public_tracking', target.trackingCode)).catch(() => {});
+        }
+      } catch (fsErr: any) {
+        console.warn('[Firestore] Exclusão direta pelo cliente falhou, acionando backend:', fsErr?.message);
+        deleteError = fsErr?.message;
       }
     }
+
+    // 6. Backend fallback (handles permissions, unauthenticated client sessions, and ensures persistent deletion)
+    if (!firestoreDeleted && typeof window !== 'undefined') {
+      try {
+        let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (auth?.currentUser) {
+          try {
+            const idToken = await auth.currentUser.getIdToken();
+            if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+          } catch {}
+        }
+
+        const res = await fetch(`/api/orders/${orderId}`, {
+          method: 'DELETE',
+          headers: authHeaders,
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success) {
+          firestoreDeleted = true;
+          deleteError = undefined;
+        } else {
+          // Attempt POST fallback
+          const postRes = await fetch('/api/orders/delete', {
+            method: 'POST',
+            headers: authHeaders,
+            body: JSON.stringify({ orderId }),
+          });
+          const postData = await postRes.json().catch(() => ({}));
+          if (postRes.ok && postData.success) {
+            firestoreDeleted = true;
+            deleteError = undefined;
+          } else {
+            deleteError = data.message || postData.message || `Erro ${res.status} ao excluir pedido no servidor.`;
+          }
+        }
+      } catch (backendErr: any) {
+        console.warn('[Backend] Erro de rede ao contatar API de exclusão:', backendErr);
+        deleteError = backendErr?.message || 'Falha de comunicação com o servidor ao excluir.';
+      }
+    }
+
+    // If both Firestore client and backend deletion failed, rollback local deletion to preserve integrity
+    if (!firestoreDeleted && deleteError) {
+      console.error('[Store] Falha definitiva na exclusão do pedido ' + orderId + ':', deleteError);
+      const currentOrders = this.getOrders();
+      if (!currentOrders.some((o) => o.id === orderId)) {
+        currentOrders.push(target);
+        currentOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        localStorage.setItem('gf_orders', JSON.stringify(currentOrders));
+        this.removeDeletedOrderId(orderId);
+        this.notify('ORDERS_UPDATED', { reason: 'ROLLBACK_FAILED_DELETE' });
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDERS_UPDATED' } }));
+        }
+      }
+      return { success: false, error: deleteError };
+    }
+
+    return { success: true };
+  }
+
+  public deleteOrder(orderId: string): boolean {
+    const orders = this.getOrders();
+    const target = orders.find((o) => o.id === orderId);
+    if (!target) return false;
+
+    // Trigger async deletion workflow with tombstone and backend verification
+    this.deleteOrderAsync(orderId).catch((err) => {
+      console.warn('[Store] Exclusão assíncrona do pedido falhou:', err);
+    });
 
     return true;
   }
@@ -2868,7 +3080,31 @@ class StoreService {
         // storage fallback
       }
       if (db) {
-        setDoc(doc(db, 'cash_shifts', shift.id), cleanShift).catch((err) => {
+        setDoc(doc(db, 'cash_shifts', shift.id), cleanShift).catch(async (err) => {
+          console.warn('[Firestore Cash Shift] Direct write notice:', err);
+          if (typeof window !== 'undefined' && typeof fetch === 'function') {
+            try {
+              let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+              if (auth?.currentUser) {
+                try {
+                  const idToken = await auth.currentUser.getIdToken();
+                  if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+                } catch {}
+              }
+              const res = await fetch('/api/cash-shifts', {
+                method: 'POST',
+                headers: authHeaders,
+                body: JSON.stringify({ shift: cleanShift }),
+              });
+              if (res.ok) return;
+              if (res.status === 409) {
+                console.warn('[Cash Shift] Modificação bloqueada: turno já se encontra FECHADO.');
+                return;
+              }
+            } catch {
+              // Fallback error
+            }
+          }
           handleFirestoreError(err, OperationType.WRITE, `cash_shifts/${shift.id}`);
         });
       }
@@ -2923,6 +3159,8 @@ class StoreService {
         expectedCashInDrawer -= m.amount;
       } else if (m.type === 'VENDA' && m.paymentMethod === 'DINHEIRO') {
         expectedCashInDrawer += m.amount;
+      } else if (m.type === 'ESTORNO' && m.paymentMethod === 'DINHEIRO') {
+        expectedCashInDrawer -= m.amount;
       } else if (m.type === 'AJUSTE') {
         expectedCashInDrawer += m.amount;
       }
@@ -2949,7 +3187,31 @@ class StoreService {
 
     if (db) {
       const cleanClosed = this.cleanForFirestore(closedShift);
-      setDoc(doc(db, 'cash_shifts', closedShift.id), cleanClosed).catch((err) => {
+      setDoc(doc(db, 'cash_shifts', closedShift.id), cleanClosed).catch(async (err) => {
+        console.warn('[Firestore Cash Shift Close] Direct write notice:', err);
+        if (typeof window !== 'undefined' && typeof fetch === 'function') {
+          try {
+            let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (auth?.currentUser) {
+              try {
+                const idToken = await auth.currentUser.getIdToken();
+                if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
+              } catch {}
+            }
+            const res = await fetch('/api/cash-shifts', {
+              method: 'POST',
+              headers: authHeaders,
+              body: JSON.stringify({ shift: cleanClosed }),
+            });
+            if (res.ok) return;
+            if (res.status === 409) {
+              console.warn('[Cash Shift Close] Modificação bloqueada: turno já se encontra FECHADO.');
+              return;
+            }
+          } catch {
+            // Fallback error
+          }
+        }
         handleFirestoreError(err, OperationType.WRITE, `cash_shifts/${closedShift.id}`);
       });
     }
@@ -3743,67 +4005,174 @@ class StoreService {
     }
   }
 
-  // ---- Cancel Order with Reason & Operator ----
-  public cancelOrder(orderId: string, reason: string, cancelledBy: string): boolean {
+  // ---- Cancel Order with Audit-Compliant Financial Refund Flow ----
+  public cancelOrder(
+    orderId: string,
+    reason: string,
+    cancelledBy: string,
+    refundPaymentMethodOverride?: PaymentMethod
+  ): { success: boolean; message: string; order?: Order; refundInfo?: OrderRefundInfo } {
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
-    if (!order) return false;
+    if (!order) {
+      return { success: false, message: 'Pedido não encontrado no sistema.' };
+    }
+
+    if (order.status === 'CANCELADO') {
+      return { success: false, message: 'Este pedido já se encontra cancelado.' };
+    }
+
+    if (order.refundInfo) {
+      return { success: false, message: 'Este pedido já possui uma devolução/estorno registrada anteriormente.' };
+    }
+
+    const cleanReason = reason.trim();
+    if (!cleanReason || cleanReason.length < 3) {
+      return { success: false, message: 'O motivo do cancelamento é obrigatório e deve ter pelo menos 3 caracteres.' };
+    }
 
     const previousStatus = order.status;
     const now = new Date().toISOString();
+    const cleanAuthor = cancelledBy.trim() || 'Operador';
+
+    // -------------------------------------------------------------
+    // CENÁRIO 1: PEDIDO NÃO PAGO (PENDENTE)
+    // Não gera recebimento, não gera estorno e não movimenta caixa.
+    // -------------------------------------------------------------
+    if (order.paymentStatus !== 'PAGO') {
+      order.status = 'CANCELADO';
+      order.cancellationReason = cleanReason;
+      order.cancelledBy = cleanAuthor;
+      order.cancelledAt = now;
+      order.updatedAt = now;
+      order._cloudSyncStatus = 'PENDING';
+
+      order.movements.push({
+        id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        timestamp: now,
+        fromStatus: previousStatus,
+        toStatus: 'CANCELADO',
+        author: cleanAuthor,
+        notes: `Pedido Cancelado sem Pagamento. Motivo: ${cleanReason}`,
+      });
+
+      localStorage.setItem('gf_orders', JSON.stringify(orders));
+      soundService.playSuccessTone();
+      this.notify('ORDER_UPDATED', order);
+
+      // Persist to Cloud Firestore
+      this.queueOrderForSync(order);
+      this.persistOrderToFirestore(order).catch(() => {});
+
+      return {
+        success: true,
+        message: `Pedido ${order.orderNumber} cancelado com sucesso. Como não havia pagamento registrado, nenhuma movimentação financeira foi gerada.`,
+        order,
+      };
+    }
+
+    // -------------------------------------------------------------
+    // CENÁRIO 2: PEDIDO JÁ PAGO (PAGO) -> DEVOLUÇÃO INTEGRAL OBRIGATÓRIA
+    // -------------------------------------------------------------
+    const refundPaymentMethod = refundPaymentMethodOverride || order.paymentMethod;
+    const refundAmount = order.totalAmount;
+    const refundId = `ref-${order.id}-${Date.now()}`;
+    const movementId = `cash-estorno-${order.id}`;
+
+    let cashMovementId: string | undefined = undefined;
+    let targetShiftId: string | undefined = undefined;
+    let isPendingCashRecord = false;
+
+    // Verificar se existe turno de caixa aberto no momento
+    const currentShift = this.getCurrentCashShift();
+    if (currentShift && currentShift.status === 'ABERTO') {
+      targetShiftId = currentShift.id;
+      // Trava de idempotência: verificar se este estorno já foi lançado neste turno
+      const alreadyRefunded = currentShift.movements.some(
+        (m) => m.type === 'ESTORNO' && m.orderId === order.id
+      );
+
+      if (!alreadyRefunded) {
+        const refundMovement: CashMovement = {
+          id: movementId,
+          timestamp: now,
+          type: 'ESTORNO',
+          amount: refundAmount,
+          paymentMethod: refundPaymentMethod,
+          description: `Estorno/Devolução Pedido ${order.orderNumber} (${refundPaymentMethod}) - ${order.customer.name}`,
+          author: cleanAuthor,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          refundReason: cleanReason,
+          originalShiftId: currentShift.id,
+        };
+
+        currentShift.movements.push(refundMovement);
+        this.saveCurrentCashShift(currentShift);
+        cashMovementId = movementId;
+      } else {
+        cashMovementId = movementId;
+      }
+    } else {
+      // Turno original fechado ou sem caixa aberto: NÃO violar a imutabilidade do fechamento!
+      // Registra a devolução como pendente de conciliação no próximo turno de caixa.
+      isPendingCashRecord = true;
+    }
+
+    // Estruturar dados de auditoria da devolução vinculados ao pedido
+    const refundInfo: OrderRefundInfo = {
+      id: refundId,
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      originalAmount: order.totalAmount,
+      refundAmount,
+      originalPaymentMethod: order.paymentMethod,
+      refundPaymentMethod,
+      timestamp: now,
+      reason: cleanReason,
+      author: cleanAuthor,
+      cashMovementId,
+      targetShiftId,
+      status: isPendingCashRecord ? 'PENDENTE_CAIXA' : 'CONCLUIDO',
+    };
 
     order.status = 'CANCELADO';
-    order.cancellationReason = reason.trim();
-    order.cancelledBy = cancelledBy.trim();
+    order.cancellationReason = cleanReason;
+    order.cancelledBy = cleanAuthor;
+    order.cancelledAt = now;
     order.updatedAt = now;
+    order.refundInfo = refundInfo;
+    order._cloudSyncStatus = 'PENDING';
 
     order.movements.push({
-      id: `mov-${Date.now()}`,
+      id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       timestamp: now,
       fromStatus: previousStatus,
       toStatus: 'CANCELADO',
-      author: cancelledBy,
-      notes: `Venda Cancelada. Motivo: ${reason}`,
+      author: cleanAuthor,
+      notes: `Venda Cancelada com Devolução Integral (${refundPaymentMethod}: ${formatCurrency(refundAmount)}). Motivo: ${cleanReason}`,
     });
 
     localStorage.setItem('gf_orders', JSON.stringify(orders));
-
-    const currentShift = this.getCurrentCashShift();
-    if (currentShift && currentShift.status === 'ABERTO') {
-      const initialCount = currentShift.movements.length;
-      currentShift.movements = currentShift.movements.filter((m) => m.orderId !== order.id);
-      if (currentShift.movements.length !== initialCount) {
-        currentShift.movements.push({
-          id: `cash-estorno-${Date.now()}`,
-          timestamp: now,
-          type: 'AJUSTE',
-          amount: order.totalAmount,
-          description: `Estorno de Cancelamento Pedido ${order.orderNumber} - Motivo: ${reason}`,
-          author: cancelledBy,
-          orderId: order.id,
-          orderNumber: order.orderNumber,
-        });
-        this.saveCurrentCashShift(currentShift);
-      }
-    }
-
     soundService.playSuccessTone();
     this.notify('ORDER_UPDATED', order);
 
-    if (db) {
-      setDoc(doc(db, 'orders', order.id), this.cleanForFirestore(order)).catch((err) => {
-        console.warn('[Firestore] Fallback local para pedido interno:', err.message);
-      });
+    // Persist to Cloud Firestore (both orders and public_tracking)
+    this.queueOrderForSync(order);
+    this.persistOrderToFirestore(order).catch(() => {});
 
-      if (order.trackingCode) {
-        const publicPayload = this.buildPublicTrackingPayload(order);
-        setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch((err) => {
-          console.warn('[Firestore] Fallback local para cancelamento de rastreio:', err.message);
-        });
-      }
-    }
+    const warningMsg = isPendingCashRecord
+      ? ' ATENÇÃO: Nenhum turno de caixa aberto no momento. O estorno foi registrado no pedido e aguarda conferência de caixa.'
+      : refundPaymentMethod === 'DINHEIRO'
+      ? ` O valor de ${formatCurrency(refundAmount)} foi debitado da gaveta física do caixa aberto atual.`
+      : ` O estorno PIX de ${formatCurrency(refundAmount)} foi registrado. O dinheiro físico da gaveta não foi alterado.`;
 
-    return true;
+    return {
+      success: true,
+      message: `Pedido ${order.orderNumber} cancelado e estorno integral de ${formatCurrency(refundAmount)} registrado com sucesso.${warningMsg}`,
+      order,
+      refundInfo,
+    };
   }
 
   // ---- Login & Authentication ----
