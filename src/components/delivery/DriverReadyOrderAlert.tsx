@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { soundService } from '../../services/audio';
 import { Order, User } from '../../types';
-import { formatTime } from '../../utils/formatters';
+import { formatTime, formatAddressDetails } from '../../utils/formatters';
 import { 
   Bike, 
   Volume2, 
@@ -148,9 +148,8 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
     : (current.updatedAt ? formatTime(current.updatedAt) : 'Agora');
 
   const address = current.customer.address;
-  const addressText = address
-    ? `${address.street || ''}, ${address.number || 'S/N'}${address.complement ? ` (${address.complement})` : ''} - ${address.neighborhood || ''}${address.city ? ` · ${address.city}` : ''}`
-    : null;
+  const addressDetails = address ? formatAddressDetails(address) : null;
+  const addressText = addressDetails ? addressDetails.fullSingleLine : null;
 
   return (
     <aside

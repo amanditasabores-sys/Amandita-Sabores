@@ -196,6 +196,7 @@ export interface Order {
   paymentSplits?: OrderPaymentSplit[]; // Detalhamento quando houver pagamento misto
   paymentStatus: 'PENDENTE' | 'PAGO';
   pixCode?: string; // Código PIX Copia e Cola gerado
+  pixTxId?: string; // Identificador TXID único da transação PIX
   pixQrCodeUrl?: string; // Imagem do QR Code PIX
   status: OrderStatus;
   createdBy?: string; // Identificador/nome do usuário que criou o pedido
@@ -313,6 +314,40 @@ export interface PublicOrderTracking {
   destinationSummary?: string; // e.g. "Bela Vista, Campina Grande" (bairro/cidade apenas)
 }
 
+export type DayOfWeekKey = 'seg' | 'ter' | 'qua' | 'qui' | 'sex' | 'sab' | 'dom';
+
+export interface DayOperatingHours {
+  dayKey: DayOfWeekKey;
+  label: string;
+  isOpen: boolean;
+  openTime: string; // 'HH:mm'
+  closeTime: string; // 'HH:mm'
+}
+
+export interface StoreClosedSettings {
+  operatingHours: DayOperatingHours[];
+  closedPrimaryMessage: string;
+  closedSecondaryMessage: string;
+}
+
+export interface PublicStoreAvailability {
+  verified: boolean;
+  isOpen: boolean;
+  reason: 'CASH_OPEN' | 'CASH_CLOSED' | 'MULTIPLE_OPEN_SHIFTS' | 'UNABLE_TO_VERIFY_CASH';
+  message?: string;
+  activeShiftId?: string | null;
+  closedSettings: StoreClosedSettings;
+  restaurantPublicInfo: {
+    name: string;
+    whatsapp: string;
+    phone: string;
+    address: string;
+    city: string;
+  };
+  hasServerRestaurantInfo?: boolean;
+  checkedAt: string;
+}
+
 export interface RestaurantConfig {
   name: string;
   phone: string;
@@ -330,6 +365,9 @@ export interface RestaurantConfig {
   customPublicUrl?: string; // Optional override for shared URL
   receiptFooterText?: string; // Texto configurável do rodapé do cupom térmico (ex: @nomedoperfil)
   dailyMenu?: DailyMenuConfig; // Configuração do cardápio do dia publicado
+  operatingHours?: DayOperatingHours[]; // Horários semanais informativos exibidos quando o estabelecimento estiver fechado
+  closedPrimaryMessage?: string; // Mensagem principal da página de estabelecimento fechado
+  closedSecondaryMessage?: string; // Mensagem complementar opcional da página de estabelecimento fechado
   // Configurações independentes de Notificações Push
   notifyNewOrders?: boolean; // [ ] Notificar chegada de novos pedidos (padrão true)
   notifyDeliveryConfirmed?: boolean; // [ ] Notificar confirmação de entrega (padrão true)

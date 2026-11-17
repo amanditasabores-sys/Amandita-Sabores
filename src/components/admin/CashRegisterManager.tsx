@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { store } from '../../services/store';
 import { CashRegisterShift, CashMovement, PaymentMethod } from '../../types';
 import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel } from '../../utils/formatters';
@@ -49,9 +49,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
   const [adjustDrawerReason, setAdjustDrawerReason] = useState('');
   const [adjustToast, setAdjustToast] = useState<string | null>(null);
 
+  const defaultOperatorName = store.getCurrentUser()?.name || store.getCurrentUser()?.username || 'admin';
+
   // Open shift form
   const [initialBalanceInput, setInitialBalanceInput] = useState('150.00');
-  const [openedByInput, setOpenedByInput] = useState('admin');
+  const [openedByInput, setOpenedByInput] = useState(defaultOperatorName);
 
   // Close shift form
   const [countedCashInput, setCountedCashInput] = useState('');
@@ -61,8 +63,14 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
   const [movAmountInput, setMovAmountInput] = useState('');
   const [movDescInput, setMovDescInput] = useState('');
   const [movEmployeeInput, setMovEmployeeInput] = useState('');
-  const [movAuthorInput, setMovAuthorInput] = useState('admin');
+  const [movAuthorInput, setMovAuthorInput] = useState(defaultOperatorName);
   const [movPaymentMethod, setMovPaymentMethod] = useState<PaymentMethod>('DINHEIRO');
+
+  // Server confirmation & retry safety state
+  const [isSubmittingShiftOp, setIsSubmittingShiftOp] = useState(false);
+  const [shiftActionError, setShiftActionError] = useState<string | null>(null);
+  const pendingShiftIdRef = useRef<string | null>(null);
+  const pendingMovementIdRef = useRef<string | null>(null);
 
   const reloadData = () => {
     setCurrentShift(store.getCurrentCashShift());
@@ -171,73 +179,185 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
     };
   }, [currentShift]);
 
-  // Adjust Drawer Balance handler
-  const handleSaveAdjustDrawer = (e: React.FormEvent) => {
+  // Adjust Drawer Balance handler (awaits server confirmation)
+  const handleSaveAdjustDrawer = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingShiftOp) return;
+    setShiftActionError(null);
+
     const parsed = parseFloat(adjustDrawerNewValue);
     if (isNaN(parsed) || parsed < 0) {
-      alert('Por favor, informe um valor válido para o saldo da gaveta.');
+      setShiftActionError('Por favor, informe um valor válido para o saldo da gaveta.');
       return;
     }
 
-    const mov = store.adjustDrawerBalance(parsed, adjustDrawerReason, openedByInput || 'admin');
-    if (mov) {
+    if (!pendingMovementIdRef.current) {
+      pendingMovementIdRef.current = `cash-adj-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    }
+
+    setIsSubmittingShiftOp(true);
+    try {
+      const operator = openedByInput.trim() || defaultOperatorName;
+      const res = await store.adjustDrawerBalanceAsync(
+        parsed,
+        adjustDrawerReason,
+        operator,
+        { movementId: pendingMovementIdRef.current, shiftId: currentShift?.id }
+      );
+      if (!res.success) {
+        setShiftActionError(res.error || 'Não foi possível ajustar o saldo da gaveta no servidor.');
+        return;
+      }
+
+      pendingMovementIdRef.current = null;
+      setIsAdjustModalOpen(false);
       setAdjustToast(`Saldo da gaveta atualizado com sucesso para ${formatCurrency(parsed)}!`);
       setTimeout(() => setAdjustToast(null), 3500);
       reloadData();
-    }
-    setIsAdjustModalOpen(false);
-  };
-
-  // Open Cash Register
-  const handleOpenShift = (e: React.FormEvent) => {
-    e.preventDefault();
-    const val = parseFloat(initialBalanceInput) || 0;
-    store.openCashRegister(val, openedByInput.trim() || 'admin');
-    setIsOpenModalActive(false);
-    reloadData();
-  };
-
-  // Close Cash Register
-  const handleCloseShift = (e: React.FormEvent) => {
-    e.preventDefault();
-    const counted = parseFloat(countedCashInput) || 0;
-    const closed = store.closeCashRegister(counted, 'admin', closingNotesInput.trim());
-    setIsCloseModalActive(false);
-    setCountedCashInput('');
-    setClosingNotesInput('');
-    reloadData();
-    if (closed) {
-      setSelectedHistoryShift(closed);
+    } finally {
+      setIsSubmittingShiftOp(false);
     }
   };
 
-  // Add Movement (Sangria, Suprimento ou Vale)
-  const handleAddMovement = (e: React.FormEvent) => {
+  // Open Cash Register (awaits server confirmation before updating local UI/state)
+  const handleOpenShift = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingShiftOp) return;
+    setShiftActionError(null);
+
+    const val = parseFloat(initialBalanceInput);
+    if (isNaN(val) || val < 0) {
+      setShiftActionError('Informe um valor de fundo inicial válido (maior ou igual a zero).');
+      return;
+    }
+    if (!openedByInput.trim()) {
+      setShiftActionError('Informe o operador responsável pela abertura.');
+      return;
+    }
+
+    if (!pendingShiftIdRef.current) {
+      pendingShiftIdRef.current = `shift-${Date.now()}`;
+    }
+
+    setIsSubmittingShiftOp(true);
+    try {
+      const res = await store.openCashRegisterAsync(val, openedByInput.trim(), {
+        shiftId: pendingShiftIdRef.current,
+      });
+      if (!res.success) {
+        setShiftActionError(res.error || 'Não foi possível abrir o caixa no servidor.');
+        return;
+      }
+
+      pendingShiftIdRef.current = null;
+      setIsOpenModalActive(false);
+      reloadData();
+    } finally {
+      setIsSubmittingShiftOp(false);
+    }
+  };
+
+  // Close Cash Register (awaits server confirmation before closing locally)
+  const handleCloseShift = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmittingShiftOp) return;
+    setShiftActionError(null);
+
+    const counted = parseFloat(countedCashInput);
+    if (isNaN(counted) || counted < 0) {
+      setShiftActionError('Informe o valor em dinheiro contado na gaveta (maior ou igual a zero).');
+      return;
+    }
+
+    setIsSubmittingShiftOp(true);
+    try {
+      const operator = store.getCurrentUser()?.name || store.getCurrentUser()?.username || openedByInput.trim() || 'admin';
+      const res = await store.closeCashRegisterAsync(
+        counted,
+        operator,
+        closingNotesInput.trim(),
+        { shiftId: currentShift?.id }
+      );
+      if (!res.success) {
+        setShiftActionError(res.error || 'Não foi possível fechar o caixa no servidor. O turno permanece aberto.');
+        return;
+      }
+
+      setIsCloseModalActive(false);
+      setCountedCashInput('');
+      setClosingNotesInput('');
+      reloadData();
+      if (res.shift) {
+        setSelectedHistoryShift(res.shift);
+      }
+    } finally {
+      setIsSubmittingShiftOp(false);
+    }
+  };
+
+  // Add Movement (Sangria, Suprimento ou Vale) (awaits server confirmation)
+  const handleAddMovement = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmittingShiftOp) return;
+    setShiftActionError(null);
+
     const amt = parseFloat(movAmountInput);
-    if (!amt || amt <= 0 || !movDescInput.trim()) return;
+    if (!amt || amt <= 0 || !movDescInput.trim()) {
+      setShiftActionError('Informe um valor maior que zero e a justificativa do lançamento.');
+      return;
+    }
+    if (movementType === 'VALE' && !movEmployeeInput.trim()) {
+      setShiftActionError('Informe o nome do funcionário beneficiário do vale.');
+      return;
+    }
 
-    store.addCashMovement(
-      movementType, 
-      amt, 
-      movDescInput.trim(), 
-      movAuthorInput.trim() || 'admin', 
-      movPaymentMethod,
-      movementType === 'VALE' ? movEmployeeInput.trim() : undefined
-    );
-    setIsMovementModalActive(false);
-    setMovAmountInput('');
-    setMovDescInput('');
-    setMovEmployeeInput('');
-    reloadData();
+    if (!pendingMovementIdRef.current) {
+      pendingMovementIdRef.current = `cash-mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    }
+
+    setIsSubmittingShiftOp(true);
+    try {
+      const res = await store.addCashMovementAsync(
+        movementType,
+        amt,
+        movDescInput.trim(),
+        movAuthorInput.trim() || defaultOperatorName,
+        movPaymentMethod,
+        movementType === 'VALE' ? movEmployeeInput.trim() : undefined,
+        { movementId: pendingMovementIdRef.current, shiftId: currentShift?.id }
+      );
+      if (!res.success) {
+        setShiftActionError(res.error || 'Não foi possível registrar o lançamento no servidor.');
+        return;
+      }
+
+      pendingMovementIdRef.current = null;
+      setIsMovementModalActive(false);
+      setMovAmountInput('');
+      setMovDescInput('');
+      setMovEmployeeInput('');
+      reloadData();
+    } finally {
+      setIsSubmittingShiftOp(false);
+    }
   };
 
-  // Delete Cash Movement with Custom Modal (Replaces window.confirm)
-  const executeDeleteMovement = (movementId: string) => {
-    store.deleteCashMovement(movementId);
-    setConfirmDeleteMov(null);
-    reloadData();
+  // Delete Cash Movement with Custom Modal (awaits server confirmation)
+  const executeDeleteMovement = async (movementId: string) => {
+    if (isSubmittingShiftOp) return;
+    setShiftActionError(null);
+    setIsSubmittingShiftOp(true);
+    try {
+      const res = await store.deleteCashMovementAsync(movementId, { shiftId: currentShift?.id });
+      if (!res.success) {
+        setShiftActionError(res.error || 'Não foi possível excluir o lançamento no servidor.');
+        return;
+      }
+      setConfirmDeleteMov(null);
+      reloadData();
+    } finally {
+      setIsSubmittingShiftOp(false);
+    }
   };
 
   const printCurrentShiftSummary = () => {
@@ -283,7 +403,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
           {currentShift?.status === 'ABERTO' ? (
             <>
               <button
-                onClick={() => { setMovementType('SANGRIA'); setIsMovementModalActive(true); }}
+                onClick={() => {
+                  pendingMovementIdRef.current = `cash-mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                  setShiftActionError(null);
+                  setMovementType('SANGRIA');
+                  setIsMovementModalActive(true);
+                }}
                 className="flex items-center gap-1.5 px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-xl text-xs font-bold transition"
               >
                 <ArrowDownCircle className="w-4 h-4" />
@@ -291,7 +416,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               </button>
 
               <button
-                onClick={() => { setMovementType('SUPRIMENTO'); setIsMovementModalActive(true); }}
+                onClick={() => {
+                  pendingMovementIdRef.current = `cash-mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                  setShiftActionError(null);
+                  setMovementType('SUPRIMENTO');
+                  setIsMovementModalActive(true);
+                }}
                 className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-xl text-xs font-bold transition"
               >
                 <ArrowUpCircle className="w-4 h-4" />
@@ -299,7 +429,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               </button>
 
               <button
-                onClick={() => { setMovementType('VALE'); setIsMovementModalActive(true); }}
+                onClick={() => {
+                  pendingMovementIdRef.current = `cash-mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                  setShiftActionError(null);
+                  setMovementType('VALE');
+                  setIsMovementModalActive(true);
+                }}
                 className="flex items-center gap-1.5 px-3.5 py-2 bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 rounded-xl text-xs font-bold transition"
               >
                 <UserCheck className="w-4 h-4" />
@@ -308,6 +443,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
 
               <button
                 onClick={() => {
+                  setShiftActionError(null);
                   setCountedCashInput(metrics.expectedCashInDrawer.toFixed(2));
                   setIsCloseModalActive(true);
                 }}
@@ -319,7 +455,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
             </>
           ) : (
             <button
-              onClick={() => setIsOpenModalActive(true)}
+              onClick={() => {
+                pendingShiftIdRef.current = `shift-${Date.now()}`;
+                setShiftActionError(null);
+                setIsOpenModalActive(true);
+              }}
               className="flex items-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
             >
               <Unlock className="w-4 h-4" />
@@ -402,6 +542,8 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <button
                   type="button"
                   onClick={() => {
+                    pendingMovementIdRef.current = `cash-adj-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                    setShiftActionError(null);
                     setAdjustDrawerNewValue(metrics.expectedCashInDrawer.toFixed(2));
                     setAdjustDrawerReason('');
                     setIsAdjustModalOpen(true);
@@ -420,6 +562,8 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               <button
                 type="button"
                 onClick={() => {
+                  pendingMovementIdRef.current = `cash-adj-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                  setShiftActionError(null);
                   setAdjustDrawerNewValue(metrics.expectedCashInDrawer.toFixed(2));
                   setAdjustDrawerReason('');
                   setIsAdjustModalOpen(true);
@@ -542,7 +686,10 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                         </td>
                         <td className="py-3 px-2 text-center whitespace-nowrap">
                           <button
-                            onClick={() => setConfirmDeleteMov({ id: mov.id, desc: mov.description, amount: mov.amount })}
+                            onClick={() => {
+                              setShiftActionError(null);
+                              setConfirmDeleteMov({ id: mov.id, desc: mov.description, amount: mov.amount });
+                            }}
                             className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition"
                             title="Excluir este lançamento"
                           >
@@ -647,7 +794,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <Unlock className="w-5 h-5 text-emerald-600" />
                 <h3 className="text-base font-bold text-slate-900">Abertura de Caixa</h3>
               </div>
-              <button onClick={() => setIsOpenModalActive(false)} className="text-slate-400 hover:text-slate-800 p-1">
+              <button
+                disabled={isSubmittingShiftOp}
+                onClick={() => { pendingShiftIdRef.current = null; setShiftActionError(null); setIsOpenModalActive(false); }}
+                className="text-slate-400 hover:text-slate-800 p-1 disabled:opacity-50"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -685,19 +836,28 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 />
               </div>
 
+              {shiftActionError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{shiftActionError}</span>
+                </div>
+              )}
+
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setIsOpenModalActive(false)}
-                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold"
+                  disabled={isSubmittingShiftOp}
+                  onClick={() => { pendingShiftIdRef.current = null; setShiftActionError(null); setIsOpenModalActive(false); }}
+                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold disabled:opacity-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl"
+                  disabled={isSubmittingShiftOp}
+                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl disabled:opacity-60 cursor-pointer"
                 >
-                  Confirmar Abertura
+                  {isSubmittingShiftOp ? 'Processando...' : 'Confirmar Abertura'}
                 </button>
               </div>
             </form>
@@ -714,7 +874,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <Lock className="w-5 h-5 text-amber-600" />
                 <h3 className="text-base font-bold text-slate-900">Fechamento e Apuração de Caixa</h3>
               </div>
-              <button onClick={() => setIsCloseModalActive(false)} className="text-slate-400 hover:text-slate-800 p-1">
+              <button
+                disabled={isSubmittingShiftOp}
+                onClick={() => { setShiftActionError(null); setIsCloseModalActive(false); }}
+                className="text-slate-400 hover:text-slate-800 p-1 disabled:opacity-50"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -830,19 +994,28 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 />
               </div>
 
+              {shiftActionError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{shiftActionError}</span>
+                </div>
+              )}
+
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setIsCloseModalActive(false)}
-                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold"
+                  disabled={isSubmittingShiftOp}
+                  onClick={() => { setShiftActionError(null); setIsCloseModalActive(false); }}
+                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold disabled:opacity-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl"
+                  disabled={isSubmittingShiftOp}
+                  className="px-5 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl disabled:opacity-60 cursor-pointer"
                 >
-                  Fechar Caixa Definitivamente
+                  {isSubmittingShiftOp ? 'Processando...' : 'Fechar Caixa Definitivamente'}
                 </button>
               </div>
             </form>
@@ -871,7 +1044,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                     : 'Registrar Suprimento (Entrada)'}
                 </h3>
               </div>
-              <button onClick={() => setIsMovementModalActive(false)} className="text-slate-400 hover:text-slate-800 p-1">
+              <button
+                disabled={isSubmittingShiftOp}
+                onClick={() => { pendingMovementIdRef.current = null; setShiftActionError(null); setIsMovementModalActive(false); }}
+                className="text-slate-400 hover:text-slate-800 p-1 disabled:opacity-50"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -972,17 +1149,26 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 />
               </div>
 
+              {shiftActionError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{shiftActionError}</span>
+                </div>
+              )}
+
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setIsMovementModalActive(false)}
-                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold"
+                  disabled={isSubmittingShiftOp}
+                  onClick={() => { pendingMovementIdRef.current = null; setShiftActionError(null); setIsMovementModalActive(false); }}
+                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold disabled:opacity-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className={`px-5 py-2 font-bold rounded-xl text-white ${
+                  disabled={isSubmittingShiftOp}
+                  className={`px-5 py-2 font-bold rounded-xl text-white disabled:opacity-60 cursor-pointer ${
                     movementType === 'SANGRIA' 
                       ? 'bg-rose-600 hover:bg-rose-700' 
                       : movementType === 'VALE'
@@ -990,7 +1176,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                       : 'bg-emerald-600 hover:bg-emerald-700'
                   }`}
                 >
-                  Salvar Lançamento
+                  {isSubmittingShiftOp ? 'Processando...' : 'Salvar Lançamento'}
                 </button>
               </div>
             </form>
@@ -1131,8 +1317,9 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               </div>
               <button
                 type="button"
-                onClick={() => setIsAdjustModalOpen(false)}
-                className="text-slate-400 hover:text-slate-700 p-1 rounded-lg"
+                disabled={isSubmittingShiftOp}
+                onClick={() => { pendingMovementIdRef.current = null; setShiftActionError(null); setIsAdjustModalOpen(false); }}
+                className="text-slate-400 hover:text-slate-700 p-1 rounded-lg disabled:opacity-50"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1192,19 +1379,28 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 />
               </div>
 
+              {shiftActionError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{shiftActionError}</span>
+                </div>
+              )}
+
               <div className="flex gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setIsAdjustModalOpen(false)}
-                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition cursor-pointer"
+                  disabled={isSubmittingShiftOp}
+                  onClick={() => { pendingMovementIdRef.current = null; setShiftActionError(null); setIsAdjustModalOpen(false); }}
+                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition cursor-pointer disabled:opacity-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-xl font-bold transition shadow-xs cursor-pointer"
+                  disabled={isSubmittingShiftOp}
+                  className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-xl font-bold transition shadow-xs cursor-pointer disabled:opacity-60"
                 >
-                  Salvar Novo Saldo
+                  {isSubmittingShiftOp ? 'Processando...' : 'Salvar Novo Saldo'}
                 </button>
               </div>
             </form>
@@ -1221,8 +1417,10 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
           confirmLabel="Excluir Lançamento"
           cancelLabel="Cancelar"
           isDanger={true}
+          isLoading={isSubmittingShiftOp}
+          errorMessage={shiftActionError}
           onConfirm={() => executeDeleteMovement(confirmDeleteMov.id)}
-          onCancel={() => setConfirmDeleteMov(null)}
+          onCancel={() => { setShiftActionError(null); setConfirmDeleteMov(null); }}
         />
       )}
     </div>

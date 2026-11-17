@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { store } from '../../services/store';
 import { Order } from '../../types';
-import { formatCurrency, formatTime, getPaymentMethodLabel } from '../../utils/formatters';
+import { formatCurrency, formatTime, getPaymentMethodLabel, formatAddressDetails, getFortalezaDateKey } from '../../utils/formatters';
 import { 
   Bike, 
   QrCode, 
@@ -19,7 +19,9 @@ import {
   LogOut,
   ArrowLeft,
   Shield,
-  ShieldCheck
+  ShieldCheck,
+  AlertCircle,
+  AlertTriangle
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { User } from '../../types';
@@ -88,6 +90,8 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
   const [deliveredOrders, setDeliveredOrders] = useState<Order[]>([]);
   const [deliveredCount, setDeliveredCount] = useState(0);
   const [deliveryTab, setDeliveryTab] = useState<'pendentes' | 'concluidas'>('pendentes');
+  const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
+  const [statusFeedback, setStatusFeedback] = useState<{ type: 'error' | 'warning'; message: string } | null>(null);
 
   // Scanner state
   const [isScannerOpen, setIsScannerOpen] = useState(false);
@@ -144,8 +148,14 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
       return true;
     });
 
+    const todayKey = getFortalezaDateKey();
+    const doneToday = done.filter((o) => {
+      const refDate = o.deliveryPerson?.deliveredAt || o.updatedAt || o.createdAt;
+      return getFortalezaDateKey(refDate) === todayKey;
+    });
+
     setDeliveredOrders(done);
-    setDeliveredCount(done.length);
+    setDeliveredCount(doneToday.length);
 
     if (activeOrder) {
       const refreshed = store.getOrderById(activeOrder.id);
@@ -179,6 +189,7 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
   const handleSelectOrder = (order: Order) => {
     if (order.fulfillmentType !== 'DELIVERY') return;
+    setStatusFeedback(null);
     setActiveOrder(order);
     setIsScannerOpen(false);
     stopCamera();
@@ -237,54 +248,86 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
   // Status transitions
   const handleStartDelivery = async () => {
-    if (!activeOrder) return;
-    const authorStr = `Entregador ${driverName}`;
-    const notesStr = `Entregador ${driverName} retirou o pedido e iniciou o trajeto de entrega.`;
-    const res = await store.updateOrderStatusAsync(
-      activeOrder.id,
-      'EM_ROTA',
-      authorStr,
-      notesStr
-    );
-    const refreshed = store.getOrderById(activeOrder.id) || res.order;
-    if (refreshed) {
-      setActiveOrder(refreshed);
-      loadData();
+    if (!activeOrder || isUpdatingStatus) return;
+    setIsUpdatingStatus(true);
+    setStatusFeedback(null);
+    try {
+      const authorStr = `Entregador ${driverName}`;
+      const notesStr = `Entregador ${driverName} retirou o pedido e iniciou o trajeto de entrega.`;
+      const res = await store.updateOrderStatusAsync(
+        activeOrder.id,
+        'EM_ROTA',
+        authorStr,
+        notesStr
+      );
+      if (!res.synced) {
+        setStatusFeedback({
+          type: res.rejected ? 'error' : 'warning',
+          message: res.rejected
+            ? `Não foi possível iniciar a rota: ${res.error || 'Alteração recusada pelo servidor.'}`
+            : `Sem conexão no momento: saída para entrega salva localmente e aguardando sincronização (${res.error || 'Offline'}).`,
+        });
+      }
+      const refreshed = store.getOrderById(activeOrder.id) || res.order;
+      if (refreshed) {
+        setActiveOrder(refreshed);
+        loadData();
+      }
+    } finally {
+      setIsUpdatingStatus(false);
     }
   };
 
   const handleCompleteDelivery = async () => {
-    if (!activeOrder) return;
-    const authorStr = `Entregador ${driverName}`;
-    const notesStr = `Entrega confirmada pelo entregador ${driverName} no endereço do cliente.`;
-    const res = await store.updateOrderStatusAsync(
-      activeOrder.id,
-      'ENTREGUE',
-      authorStr,
-      notesStr
-    );
-    const refreshed = store.getOrderById(activeOrder.id) || res.order;
-    if (refreshed) {
-      setActiveOrder(refreshed);
-      loadData();
-      confetti({
-        particleCount: 80,
-        spread: 70,
-        origin: { y: 0.6 }
-      });
+    if (!activeOrder || isUpdatingStatus) return;
+    setIsUpdatingStatus(true);
+    setStatusFeedback(null);
+    try {
+      const authorStr = `Entregador ${driverName}`;
+      const notesStr = `Entrega confirmada pelo entregador ${driverName} no endereço do cliente.`;
+      const res = await store.updateOrderStatusAsync(
+        activeOrder.id,
+        'ENTREGUE',
+        authorStr,
+        notesStr
+      );
+      if (!res.synced) {
+        setStatusFeedback({
+          type: res.rejected ? 'error' : 'warning',
+          message: res.rejected
+            ? `Não foi possível concluir a entrega: ${res.error || 'Alteração recusada pelo servidor.'}`
+            : `Sem conexão no momento: conclusão salva localmente e aguardando envio ao servidor (${res.error || 'Offline'}).`,
+        });
+      }
+      const refreshed = store.getOrderById(activeOrder.id) || res.order;
+      if (refreshed) {
+        setActiveOrder(refreshed);
+        loadData();
+        if (res.synced) {
+          confetti({
+            particleCount: 80,
+            spread: 70,
+            origin: { y: 0.6 }
+          });
+        }
+      }
+    } finally {
+      setIsUpdatingStatus(false);
     }
   };
 
   const formatMapsUrl = (order: Order) => {
     if (!order.customer.address) return '#';
-    const addr = `${order.customer.address.street}, ${order.customer.address.number}, ${order.customer.address.neighborhood}, ${order.customer.address.city}`;
-    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}`;
+    const details = formatAddressDetails(order.customer.address);
+    const query = details.navigationQuery || details.fullSingleLine;
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
   };
 
   const formatWazeUrl = (order: Order) => {
     if (!order.customer.address) return '#';
-    const addr = `${order.customer.address.street}, ${order.customer.address.number}, ${order.customer.address.city}`;
-    return `https://waze.com/ul?q=${encodeURIComponent(addr)}`;
+    const details = formatAddressDetails(order.customer.address);
+    const query = details.navigationQuery || details.fullSingleLine;
+    return `https://waze.com/ul?q=${encodeURIComponent(query)}`;
   };
 
   const formatWhatsAppUrl = (order: Order) => {
@@ -310,6 +353,8 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                 <span className="truncate">Portal do Entregador</span>
                 {isSupervisor && !isDriverRole ? (
                   <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 text-[10px] font-mono shrink-0 border border-blue-500/40">SUPERVISÃO</span>
+                ) : store.getAuthSessionMode() === 'local_contingency' ? (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-mono shrink-0 border border-amber-500/40">CONTINGÊNCIA LOCAL</span>
                 ) : (
                   <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono shrink-0">ONLINE</span>
                 )}
@@ -574,23 +619,26 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                       <p className="text-sm font-bold text-white">
                         Retirada no Balcão do Restaurante
                       </p>
-                    ) : (
-                      <>
-                        <p className="text-sm font-bold text-white">
-                          {activeOrder.customer.address.street}, {activeOrder.customer.address.number}
-                        </p>
-                        <p className="text-xs text-slate-400">
-                          {activeOrder.customer.address.neighborhood}
-                          {activeOrder.customer.address.complement && ` · ${activeOrder.customer.address.complement}`}
-                          {` · ${activeOrder.customer.address.city}`}
-                        </p>
-                        {activeOrder.customer.address.reference && (
-                          <p className="text-xs text-amber-300 mt-1">
-                            Ponto de Ref: {activeOrder.customer.address.reference}
+                    ) : (() => {
+                      const addrDetails = formatAddressDetails(activeOrder.customer.address);
+                      return (
+                        <>
+                          <p className="text-sm font-bold text-white leading-snug">
+                            {addrDetails.primaryLine}
                           </p>
-                        )}
-                      </>
-                    )}
+                          {addrDetails.secondaryLine && (
+                            <p className="text-xs text-slate-300 mt-0.5">
+                              {addrDetails.secondaryLine}
+                            </p>
+                          )}
+                          {addrDetails.referenceLine && (
+                            <p className="text-xs text-amber-300 mt-1">
+                              Ponto de Ref: {addrDetails.referenceLine}
+                            </p>
+                          )}
+                        </>
+                      );
+                    })()}
                     {activeOrder.customer.notes && (
                       <p className="text-xs text-slate-300 bg-slate-800/80 p-2 rounded-lg mt-2 border border-slate-700">
                         Instruções do Cliente: {activeOrder.customer.notes}
@@ -684,6 +732,30 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
 
               {/* Main Driver Status Action Buttons */}
               <div className="space-y-2 pt-2">
+                {statusFeedback && (
+                  <div
+                    className={`p-3 rounded-xl text-xs flex items-start gap-2 border ${
+                      statusFeedback.type === 'error'
+                        ? 'bg-rose-500/15 border-rose-500/40 text-rose-200'
+                        : 'bg-amber-500/15 border-amber-500/40 text-amber-200'
+                    }`}
+                  >
+                    {statusFeedback.type === 'error' ? (
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    )}
+                    <span className="font-semibold flex-1">{statusFeedback.message}</span>
+                    <button
+                      type="button"
+                      onClick={() => setStatusFeedback(null)}
+                      className="text-slate-300 hover:text-white font-bold px-1 cursor-pointer"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
+
                 {isSupervisor && !isDriverRole ? (
                   <div className="p-3 bg-slate-800/80 border border-slate-700 rounded-xl space-y-2">
                     <div className="flex items-center gap-2 text-amber-300 text-xs font-bold">
@@ -701,21 +773,23 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                   <>
                     {activeOrder.status !== 'EM_ROTA' && activeOrder.status !== 'ENTREGUE' && (
                       <button
+                        disabled={isUpdatingStatus}
                         onClick={handleStartDelivery}
-                        className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
+                        className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 disabled:cursor-wait text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
                       >
                         <Bike className="w-5 h-5" />
-                        <span>Retirar Pedido e Iniciar Rota</span>
+                        <span>{isUpdatingStatus ? 'Atualizando Rota...' : 'Retirar Pedido e Iniciar Rota'}</span>
                       </button>
                     )}
 
                     {activeOrder.status === 'EM_ROTA' && (
                       <button
+                        disabled={isUpdatingStatus}
                         onClick={handleCompleteDelivery}
-                        className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
+                        className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-wait text-white rounded-xl font-bold text-sm shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
                       >
                         <CheckCircle className="w-5 h-5" />
-                        <span>Confirmar Entrega Concluída</span>
+                        <span>{isUpdatingStatus ? 'Confirmando Entrega...' : 'Confirmar Entrega Concluída'}</span>
                       </button>
                     )}
                   </>
@@ -827,11 +901,11 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                             </span>
                           </div>
                           <p className="text-sm font-semibold text-slate-200 mt-1 truncate">{ord.customer.name}</p>
-                          <p className="text-xs text-slate-400 flex items-center gap-1 mt-0.5">
-                            <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                            <span className="truncate">
-                              {ord.customer.address 
-                                ? `${ord.customer.address.street}, ${ord.customer.address.number} · ${ord.customer.address.neighborhood}`
+                          <p className="text-xs text-slate-400 flex items-start gap-1 mt-0.5">
+                            <MapPin className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                            <span className="line-clamp-2">
+                              {ord.customer.address
+                                ? formatAddressDetails(ord.customer.address).fullSingleLine
                                 : 'Retirada no Balcão'}
                             </span>
                           </p>
@@ -877,11 +951,11 @@ export const DeliveryPortal: React.FC<DeliveryPortalProps> = ({
                             </span>
                           </div>
                           <p className="text-sm font-semibold text-slate-200 mt-1 truncate">{ord.customer.name}</p>
-                          <p className="text-xs text-slate-400 flex items-center gap-1 mt-0.5">
-                            <MapPin className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                            <span className="truncate">
-                              {ord.customer.address 
-                                ? `${ord.customer.address.street}, ${ord.customer.address.number} · ${ord.customer.address.neighborhood}`
+                          <p className="text-xs text-slate-400 flex items-start gap-1 mt-0.5">
+                            <MapPin className="w-3.5 h-3.5 text-slate-500 shrink-0 mt-0.5" />
+                            <span className="line-clamp-2">
+                              {ord.customer.address
+                                ? formatAddressDetails(ord.customer.address).fullSingleLine
                                 : 'Retirada no Balcão'}
                             </span>
                           </p>

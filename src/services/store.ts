@@ -18,12 +18,28 @@ import {
   DeliveryPermissions,
   DeliveryShift,
   DeliveryShiftSummary,
-  OrderRefundInfo
+  OrderRefundInfo,
+  PublicStoreAvailability,
+  StoreClosedSettings,
+  DayOperatingHours
 } from '../types';
-import { formatCurrency } from '../utils/formatters';
+import { formatCurrency, getFortalezaDateKey } from '../utils/formatters';
 import { soundService } from './audio';
 import { thermalPrinterService } from './thermalPrinter';
-import { generatePixCopiaECola } from '../utils/pix';
+import { generatePurchasePixPayload, generateOrderPixTxId, validatePixKey, validatePixReceiver, validatePixPayload } from '../utils/pix';
+import {
+  DEFAULT_CLOSED_PRIMARY_MESSAGE,
+  DEFAULT_CLOSED_SECONDARY_MESSAGE,
+  DEFAULT_OPERATING_HOURS,
+  normalizeClosedSettings,
+  validateOperatingHours,
+  validateWhatsAppNumber,
+} from '../utils/storeHours';
+
+const roundCurrency = (value: number): number => {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+};
 import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_USERS, INITIAL_ORDERS, OFFICIAL_ADDONS, INITIAL_COMBOS, INITIAL_DAILY_MENU } from '../data/initialData';
 import { 
   db, 
@@ -48,6 +64,7 @@ import {
   updateDoc,
   deleteDoc, 
   getDocs, 
+  getDocsFromServer,
   getDoc,
   getDocFromServer,
   query,
@@ -83,6 +100,59 @@ class StoreService {
   private isStaffSyncActive = false;
   private isFlushingPendingQueue = false;
   private inFlightOrderWrites = new Set<string>();
+  private inFlightOrderDeletes = new Set<string>();
+  private pendingOrderRewrites = new Set<string>();
+  private orderWriteChains = new Map<string, Promise<any>>();
+  private staffSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private serverAtomicPaymentTestOverride = false;
+  private lastPublicAvailability: PublicStoreAvailability | null = null;
+  private uncertainServerOps = new Map<string, number>();
+  private lastUncertainOpenShiftId: string | null = null;
+  private cloudSyncState: {
+    status: 'IDLE' | 'SYNCING' | 'CONNECTED' | 'ERROR';
+    lastSyncedAt: string | null;
+    lastError: string | null;
+  } = {
+    status: 'IDLE',
+    lastSyncedAt: null,
+    lastError: null,
+  };
+
+  public getCloudSyncState() {
+    return { ...this.cloudSyncState };
+  }
+
+  public getAuthSessionMode(): 'firebase_cloud' | 'local_contingency' | 'unauthenticated' {
+    const current = this.getCurrentUser();
+    if (!current) return 'unauthenticated';
+    if (isFirebaseReady()) {
+      return auth?.currentUser ? 'firebase_cloud' : 'unauthenticated';
+    }
+    return 'local_contingency';
+  }
+
+  private async waitForFirebaseAuthReady(): Promise<void> {
+    if (isFirebaseReady() && auth && !auth.currentUser && typeof (auth as any).authStateReady === 'function') {
+      try {
+        await (auth as any).authStateReady();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private isOfflineErrorMessage(msg?: string): boolean {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+    const lower = (msg || '').toLowerCase();
+    return (
+      lower.includes('failed to fetch') ||
+      lower.includes('networkerror') ||
+      lower.includes('network request failed') ||
+      lower.includes('unavailable') ||
+      lower.includes('offline') ||
+      lower.includes('timeout')
+    );
+  }
 
   /**
    * Sanitizes objects recursively for Firestore by eliminating unsupported 'undefined' values
@@ -428,6 +498,104 @@ class StoreService {
     } catch {}
   }
 
+  public getSyncedOrderIds(): Set<string> {
+    try {
+      const data = localStorage.getItem('gf_synced_order_ids');
+      if (data) {
+        const list = JSON.parse(data);
+        if (Array.isArray(list)) return new Set(list);
+      }
+    } catch {}
+    return new Set();
+  }
+
+  public recordSyncedOrderId(orderId: string): void {
+    try {
+      const set = this.getSyncedOrderIds();
+      set.add(orderId);
+      const list = Array.from(set).slice(-800);
+      localStorage.setItem('gf_synced_order_ids', JSON.stringify(list));
+    } catch {}
+  }
+
+  public recordSyncedOrderIds(orderIds: string[]): void {
+    try {
+      if (orderIds.length === 0) return;
+      const set = this.getSyncedOrderIds();
+      orderIds.forEach((id) => set.add(id));
+      const list = Array.from(set).slice(-800);
+      localStorage.setItem('gf_synced_order_ids', JSON.stringify(list));
+    } catch {}
+  }
+
+  public removeSyncedOrderId(orderId: string): void {
+    try {
+      const set = this.getSyncedOrderIds();
+      if (set.has(orderId)) {
+        set.delete(orderId);
+        localStorage.setItem('gf_synced_order_ids', JSON.stringify(Array.from(set)));
+      }
+    } catch {}
+  }
+
+  private applyRemoteTombstonesLocally(remoteDeletedIds: string[]): number {
+    if (!remoteDeletedIds || remoteDeletedIds.length === 0) return 0;
+    const set = this.getDeletedOrderIds();
+    let changedTombstones = false;
+    for (const id of remoteDeletedIds) {
+      if (id && !set.has(id)) {
+        set.add(id);
+        changedTombstones = true;
+      }
+    }
+    if (changedTombstones) {
+      try {
+        localStorage.setItem('gf_deleted_order_ids', JSON.stringify(Array.from(set).slice(-500)));
+      } catch {}
+    }
+
+    const orders = this.getOrders();
+    const filteredOrders = orders.filter((o) => !set.has(o.id));
+    const removedCount = orders.length - filteredOrders.length;
+    if (removedCount > 0) {
+      try {
+        localStorage.setItem('gf_orders', JSON.stringify(filteredOrders));
+      } catch {}
+    }
+
+    const pending = this.getPendingSyncOrders();
+    const filteredPending = pending.filter((o) => !set.has(o.id));
+    if (filteredPending.length !== pending.length) {
+      this.savePendingSyncOrders(filteredPending);
+    }
+
+    if (removedCount > 0) {
+      this.notify('ORDERS_UPDATED', { reason: 'REMOTE_TOMBSTONE_APPLIED', removedCount });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_DELETED' } }));
+      }
+    }
+    return removedCount;
+  }
+
+  public async syncTombstonesFromServer(): Promise<string[]> {
+    if (typeof window === 'undefined' || !auth?.currentUser) return [];
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      if (!idToken) return [];
+      const res = await fetch('/api/orders/tombstones', {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!res.ok) return [];
+      const data = await res.json().catch(() => ({}));
+      if (Array.isArray(data.deletedOrderIds)) {
+        this.applyRemoteTombstonesLocally(data.deletedOrderIds);
+        return data.deletedOrderIds;
+      }
+    } catch {}
+    return [];
+  }
+
   public updateLocalOrderSyncStatus(orderId: string, status: 'SYNCED' | 'PENDING' | 'ERROR'): void {
     const orders = this.getOrders();
     const idx = orders.findIndex((o) => o.id === orderId);
@@ -443,133 +611,830 @@ class StoreService {
   }
 
   /**
-   * Persists an order directly to Cloud Firestore with confirmation and queue tracking
+   * Persists an order directly to Cloud Firestore with per-order promise serialization,
+   * deletion-resurrection guard, and backend status/order fallback.
    */
-  public async persistOrderToFirestore(order: Order): Promise<{ success: boolean; error?: string }> {
-    if (!db) {
-      this.queueOrderForSync(order);
-      this.updateLocalOrderSyncStatus(order.id, 'PENDING');
-      return { success: false, error: 'Cloud Firestore não inicializado' };
+  public persistOrderToFirestore(
+    order: Order,
+    options?: { isStatusTransition?: boolean; requireServerConfirmation?: boolean; publicMenuOrder?: boolean; timeoutMs?: number }
+  ): Promise<{ success: boolean; error?: string; rejected?: boolean; isStoreClosed?: boolean; offline?: boolean; uncertain?: boolean; recoveredFromTimeout?: boolean; serverOrder?: Order }> {
+    const prevChain = this.orderWriteChains.get(order.id) || Promise.resolve();
+    const run = prevChain
+      .catch(() => {})
+      .then(() => this.persistOrderToFirestoreInternal(order, options));
+    this.orderWriteChains.set(order.id, run);
+    run.finally(() => {
+      if (this.orderWriteChains.get(order.id) === run) {
+        this.orderWriteChains.delete(order.id);
+      }
+    });
+    return run;
+  }
+
+  private async getFirebaseAuthHeaders(forceRefresh = false): Promise<Record<string, string>> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    await this.waitForFirebaseAuthReady();
+    if (auth?.currentUser) {
+      try {
+        const idToken = await auth.currentUser.getIdToken(forceRefresh);
+        if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+      } catch {
+        // fallback
+      }
+    }
+    return headers;
+  }
+
+  private async readServerJsonResponse(res: Response): Promise<{
+    status: number;
+    ok: boolean;
+    contentType: string;
+    rawText: string;
+    isHtml: boolean;
+    isValidJson: boolean;
+    data: Record<string, any> | null;
+  }> {
+    const status = typeof res?.status === 'number' ? res.status : 0;
+    const ok = Boolean(res?.ok);
+    const rawContentType =
+      res?.headers && typeof res.headers.get === 'function'
+        ? String(res.headers.get('content-type') || '').trim()
+        : '';
+    const contentTypeLower = rawContentType.toLowerCase();
+
+    let rawText = '';
+    let data: Record<string, any> | null = null;
+    let isValidJson = false;
+    let isHtml =
+      contentTypeLower.includes('text/html') ||
+      contentTypeLower.includes('application/xhtml+xml');
+
+    if (typeof res?.text === 'function') {
+      try {
+        rawText = await res.text();
+      } catch {
+        rawText = '';
+      }
+      const trimmed = rawText.trim();
+      if (!isHtml && trimmed) {
+        const lowerHead = trimmed.slice(0, 300).toLowerCase();
+        if (
+          lowerHead.startsWith('<!doctype') ||
+          lowerHead.startsWith('<html') ||
+          /<(html|head|body|title)\b/i.test(lowerHead)
+        ) {
+          isHtml = true;
+        }
+      }
+
+      const expectsNonJsonType =
+        Boolean(contentTypeLower) &&
+        !contentTypeLower.includes('application/json') &&
+        !contentTypeLower.includes('+json') &&
+        !contentTypeLower.includes('text/plain');
+
+      if (!isHtml && !expectsNonJsonType && trimmed) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            data = parsed as Record<string, any>;
+            isValidJson = true;
+          }
+        } catch {
+          isValidJson = false;
+        }
+      }
+    } else if (typeof (res as any)?.json === 'function') {
+      if (!isHtml) {
+        try {
+          const parsed = await (res as any).json();
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            data = parsed as Record<string, any>;
+            isValidJson = true;
+          }
+        } catch {
+          isValidJson = false;
+        }
+      }
     }
 
-    if (this.inFlightOrderWrites.has(order.id)) {
-      return { success: false, error: 'Gravação em andamento para este pedido' };
+    return {
+      status,
+      ok,
+      contentType: rawContentType,
+      rawText,
+      isHtml,
+      isValidJson,
+      data,
+    };
+  }
+
+  private async checkServerAdminSdkHealth(): Promise<{
+    reachable: boolean;
+    hasAdminSdk: boolean | null;
+  }> {
+    if (typeof fetch !== 'function') {
+      return { reachable: false, hasAdminSdk: null };
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 4000) : null;
+    try {
+      const healthRes = await fetch('/api/health', {
+        method: 'GET',
+        cache: 'no-store',
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(healthRes);
+      if (parsed.ok && !parsed.isHtml && parsed.isValidJson && parsed.data) {
+        return {
+          reachable: true,
+          hasAdminSdk:
+            typeof parsed.data.hasAdminSdk === 'boolean' ? parsed.data.hasAdminSdk : null,
+        };
+      }
+      return { reachable: parsed.status > 0, hasAdminSdk: null };
+    } catch {
+      return { reachable: false, hasAdminSdk: null };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async consultCashShiftState(
+    shiftId: string,
+    authHeaders: Record<string, string>
+  ): Promise<{
+    verified: boolean;
+    exists: boolean;
+    shift: CashRegisterShift | null;
+    isHtml: boolean;
+    status: number;
+  }> {
+    if (typeof fetch !== 'function') {
+      return { verified: false, exists: false, shift: null, isHtml: false, status: 0 };
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 4000) : null;
+    try {
+      const stateRes = await fetch(`/api/cash-shifts/${encodeURIComponent(shiftId)}/state`, {
+        method: 'GET',
+        headers: authHeaders,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(stateRes);
+      if (parsed.ok && !parsed.isHtml && parsed.isValidJson && parsed.data?.success === true) {
+        return {
+          verified: true,
+          exists: Boolean(parsed.data.exists),
+          shift: (parsed.data.shift as CashRegisterShift) || null,
+          isHtml: false,
+          status: parsed.status,
+        };
+      }
+      return {
+        verified: false,
+        exists: false,
+        shift: null,
+        isHtml: parsed.isHtml,
+        status: parsed.status,
+      };
+    } catch {
+      return { verified: false, exists: false, shift: null, isHtml: false, status: 0 };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async consultOrderPaymentState(
+    orderId: string,
+    authHeaders: Record<string, string>
+  ): Promise<{ verified: boolean; data: Record<string, any> | null; isHtml: boolean; status: number }> {
+    if (typeof fetch !== 'function') {
+      return { verified: false, data: null, isHtml: false, status: 0 };
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 4000) : null;
+    try {
+      const stateRes = await fetch(`/api/orders/${encodeURIComponent(orderId)}/payment-state`, {
+        method: 'GET',
+        headers: authHeaders,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(stateRes);
+      if (parsed.ok && !parsed.isHtml && parsed.isValidJson && parsed.data?.success === true) {
+        return { verified: true, data: parsed.data, isHtml: false, status: parsed.status };
+      }
+      return { verified: false, data: null, isHtml: parsed.isHtml, status: parsed.status };
+    } catch {
+      return { verified: false, data: null, isHtml: false, status: 0 };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async consultOrderCancelState(
+    orderId: string,
+    authHeaders: Record<string, string>
+  ): Promise<{ verified: boolean; data: Record<string, any> | null; isHtml: boolean; status: number }> {
+    if (typeof fetch !== 'function') {
+      return { verified: false, data: null, isHtml: false, status: 0 };
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 4000) : null;
+    try {
+      const stateRes = await fetch(`/api/orders/${encodeURIComponent(orderId)}/cancel-state`, {
+        method: 'GET',
+        headers: authHeaders,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(stateRes);
+      if (parsed.ok && !parsed.isHtml && parsed.isValidJson && parsed.data?.success === true) {
+        return { verified: true, data: parsed.data, isHtml: false, status: parsed.status };
+      }
+      return { verified: false, data: null, isHtml: parsed.isHtml, status: parsed.status };
+    } catch {
+      return { verified: false, data: null, isHtml: false, status: 0 };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private formatHttpErrorWithStatus(message: string, status: number): string {
+    const clean = message.trim();
+    if (!status || clean.includes(`HTTP ${status}`) || clean.includes(`(${status})`)) {
+      return clean;
+    }
+    return `${clean} (HTTP ${status})`;
+  }
+
+  private isTimeoutFetchError(err: unknown): boolean {
+    if (!err) return false;
+    const name = typeof err === 'object' && err !== null && 'name' in err ? String((err as any).name) : '';
+    const msg = err instanceof Error ? err.message : String(err);
+    return name === 'AbortError' || /aborted|abort|timeout|timed out|tempo esgotado/i.test(msg);
+  }
+
+  private clearUncertainOpPrefix(prefix: string): void {
+    for (const key of Array.from(this.uncertainServerOps.keys())) {
+      if (key.startsWith(prefix)) {
+        this.uncertainServerOps.delete(key);
+      }
+    }
+  }
+
+  private async resolveFinancialHttpFailure(
+    parsed: {
+      status: number;
+      ok: boolean;
+      isHtml: boolean;
+      isValidJson: boolean;
+      data: Record<string, any> | null;
+    },
+    actionLabel: string
+  ): Promise<
+    | { kind: 'rejected'; error: string }
+    | { kind: 'needs_state_check'; nonCommittedError: string; uncertainError: string }
+  > {
+    const statusLabel = parsed.status ? `HTTP ${parsed.status}` : 'sem status HTTP';
+    const serverMsg = typeof parsed.data?.message === 'string' ? parsed.data.message.trim() : '';
+    const errorCode = typeof parsed.data?.code === 'string' ? parsed.data.code.trim() : '';
+
+    // 1. Gateway errors (502/504) even with JSON might have happened after commit -> check state
+    const isGatewayError = parsed.status === 502 || parsed.status === 504;
+
+    // 2. Explicit valid JSON rejection (4xx, 503 ADMIN_SDK_UNAVAILABLE, 500, or HTTP 200 with success: false)
+    if (
+      !isGatewayError &&
+      !parsed.isHtml &&
+      parsed.isValidJson &&
+      parsed.data &&
+      (!parsed.ok || parsed.data.success === false)
+    ) {
+      if (parsed.status === 503 || errorCode === 'ADMIN_SDK_UNAVAILABLE') {
+        const base =
+          serverMsg ||
+          `Operação bloqueada para ${actionLabel}: Firebase Admin SDK não configurado/indisponível no servidor.`;
+        return {
+          kind: 'rejected',
+          error: this.formatHttpErrorWithStatus(base, parsed.status || 503),
+        };
+      }
+
+      if (parsed.status === 409 || errorCode === 'SHIFT_ALREADY_CLOSED') {
+        const base = serverMsg || `Operação recusada por conflito de estado ao ${actionLabel}.`;
+        return {
+          kind: 'rejected',
+          error: this.formatHttpErrorWithStatus(base, parsed.status || 409),
+        };
+      }
+
+      if (serverMsg) {
+        return {
+          kind: 'rejected',
+          error: this.formatHttpErrorWithStatus(serverMsg, parsed.status),
+        };
+      }
+
+      return {
+        kind: 'rejected',
+        error:
+          parsed.status === 200
+            ? `Servidor recusou ${actionLabel} sem detalhar o motivo (${statusLabel}).`
+            : `Servidor recusou ${actionLabel} (${statusLabel}).`,
+      };
+    }
+
+    // 3. Unexpected response: HTML (including proxy converting 503->200), invalid/empty JSON, or 2xx JSON missing required fields
+    const health = await this.checkServerAdminSdkHealth();
+    if (health.reachable && health.hasAdminSdk === false) {
+      const reasonDetail = parsed.isHtml
+        ? 'o servidor/proxy retornou uma página HTML inesperada'
+        : !parsed.isValidJson
+        ? 'a resposta do servidor não é um JSON válido'
+        : 'os dados obrigatórios da operação não foram retornados';
+      return {
+        kind: 'rejected',
+        error: `Não foi possível confirmar ${actionLabel} (${statusLabel}): Firebase Admin SDK indisponível no servidor (hasAdminSdk: false) e ${reasonDetail}. Nenhuma alteração foi gravada.`,
+      };
+    }
+
+    const detail = parsed.isHtml
+      ? `resposta HTML inesperada em vez de JSON (${statusLabel})`
+      : !parsed.isValidJson
+      ? `resposta JSON inválida ou vazia (${statusLabel})`
+      : `resposta JSON incompleta sem os campos obrigatórios (${statusLabel})`;
+
+    return {
+      kind: 'needs_state_check',
+      nonCommittedError: `Não foi possível confirmar ${actionLabel}: ${detail}. Consulta ao servidor confirmou que a operação não foi concluída.`,
+      uncertainError: `Não foi possível confirmar ${actionLabel}: ${detail} e não foi possível verificar o estado atual no servidor. Não repita automaticamente antes de conferir o estado.`,
+    };
+  }
+
+  private async persistOrderStatusViaBackend(
+    order: Order,
+    authHeaders: Record<string, string>
+  ): Promise<{ success: boolean; error?: string; rejected?: boolean; offline?: boolean; deleted?: boolean }> {
+    if (typeof window === 'undefined') {
+      return { success: false, offline: true, error: 'Ambiente sem janela para chamada HTTP.' };
+    }
+    try {
+      const cleanOrder = this.cleanForFirestore(order);
+      const res = await fetch(`/api/orders/${encodeURIComponent(order.id)}/status`, {
+        method: 'PATCH',
+        headers: authHeaders,
+        body: JSON.stringify({
+          status: order.status,
+          updatedAt: order.updatedAt,
+          movements: cleanOrder.movements,
+          deliveryPerson: cleanOrder.deliveryPerson,
+          deliveryPersonId: cleanOrder.deliveryPersonId,
+          deliveryPersonName: cleanOrder.deliveryPersonName,
+          deliveryAssignmentHistory: cleanOrder.deliveryAssignmentHistory,
+          paymentStatus: cleanOrder.paymentStatus,
+          cancellationReason: cleanOrder.cancellationReason,
+          cancelledBy: cleanOrder.cancelledBy,
+          cancelledAt: cleanOrder.cancelledAt,
+          refundInfo: cleanOrder.refundInfo,
+          order: cleanOrder,
+        }),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data || {};
+      if (parsed.status === 410 || data?.deleted) {
+        this.applyRemoteTombstonesLocally([order.id]);
+        this.removeSyncedOrderId(order.id);
+        return { success: false, rejected: true, deleted: true, error: data.message || 'Pedido excluído definitivamente em outro dispositivo.' };
+      }
+      if (parsed.ok && !parsed.isHtml && parsed.isValidJson && data.success === true) {
+        this.removeOrderFromSyncQueue(order.id);
+        this.recordSyncedOrderId(order.id);
+        this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+        this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+        this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+        return { success: true };
+      }
+      const isRejected = parsed.status === 400 || parsed.status === 401 || parsed.status === 403 || parsed.status === 404 || parsed.status === 409;
+      return {
+        success: false,
+        rejected: isRejected,
+        error:
+          data.message ||
+          (parsed.isHtml
+            ? `Resposta HTML inesperada ao sincronizar status (HTTP ${parsed.status}).`
+            : `Erro HTTP ${parsed.status} ao sincronizar status.`),
+      };
+    } catch (fetchErr: unknown) {
+      const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      return {
+        success: false,
+        offline: this.isOfflineErrorMessage(msg),
+        error: msg,
+      };
+    }
+  }
+
+  private async verifyPublicOrderConfirmationOnServer(order: Order): Promise<boolean> {
+    if (!order.trackingCode || order.trackingCode.length < 20) return false;
+    // 1. Check backend confirmation endpoint if fetch is available
+    if (typeof fetch === 'function') {
+      try {
+        const res = await fetch(
+          `/api/orders/${encodeURIComponent(order.id)}/public-confirmation?trackingCode=${encodeURIComponent(order.trackingCode)}`,
+          { method: 'GET' }
+        );
+        const parsed = await this.readServerJsonResponse(res);
+        if (parsed.ok && !parsed.isHtml && parsed.isValidJson && parsed.data) {
+          const data = parsed.data;
+          if (
+            data?.confirmed === true &&
+            data?.orderId === order.id &&
+            Math.abs(roundCurrency(Number(data?.totalAmount) || 0) - roundCurrency(order.totalAmount)) <= 0.01
+          ) {
+            return true;
+          }
+        }
+      } catch {
+        // Fallback to direct Firestore public_tracking read below if SDK active
+      }
+    }
+    // 2. Check Firestore public_tracking document directly via Client SDK
+    if (db) {
+      try {
+        const snap = await getDoc(doc(db, 'public_tracking', order.trackingCode));
+        if (snap.exists()) {
+          const data = snap.data() as Record<string, any>;
+          if (
+            data?.id === order.id &&
+            Math.abs(roundCurrency(Number(data?.totalAmount) || 0) - roundCurrency(order.totalAmount)) <= 0.01
+          ) {
+            return true;
+          }
+        }
+      } catch {}
+    }
+    return false;
+  }
+
+  private async persistOrderToFirestoreInternal(
+    order: Order,
+    options?: { isStatusTransition?: boolean; requireServerConfirmation?: boolean; publicMenuOrder?: boolean; timeoutMs?: number }
+  ): Promise<{ success: boolean; error?: string; rejected?: boolean; isStoreClosed?: boolean; offline?: boolean; uncertain?: boolean; recoveredFromTimeout?: boolean; serverOrder?: Order }> {
+    const requireServerConfirmation = Boolean(options?.requireServerConfirmation);
+    const isPublicMenuOrder = Boolean(options?.publicMenuOrder || this.isPublicCustomerContext());
+
+    if (this.isOrderDeleted(order.id)) {
+      this.removeOrderFromSyncQueue(order.id);
+      return { success: false, rejected: true, error: 'Pedido já excluído e marcado para não ressincronização.' };
+    }
+
+    if (!db) {
+      if (requireServerConfirmation && typeof fetch === 'function') {
+        const timeoutMs = options?.timeoutMs ?? 15000;
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+        try {
+          const authHeaders = await this.getFirebaseAuthHeaders();
+          const res = await fetch('/api/orders', {
+            method: 'POST',
+            headers: authHeaders,
+            body: JSON.stringify({ order, ...(isPublicMenuOrder ? { source: 'PUBLIC_MENU' } : {}) }),
+            ...(controller ? { signal: controller.signal } : {}),
+          });
+          const parsed = await this.readServerJsonResponse(res);
+          const data = parsed.data || {};
+          if (parsed.ok && !parsed.isHtml && parsed.isValidJson && data?.success === true) {
+            this.removeOrderFromSyncQueue(order.id);
+            this.recordSyncedOrderId(order.id);
+            this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+            this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+            this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+            return { success: true, ...(data?.order ? { serverOrder: data.order as Order } : {}) };
+          }
+          const isStoreClosed = Boolean(data?.isStoreClosed || data?.code === 'STORE_CLOSED' || data?.code === 'STORE_AVAILABILITY_UNVERIFIED');
+          if (isStoreClosed) {
+            this.markLastPublicAvailabilityClosed(data?.reason === 'UNABLE_TO_VERIFY_CASH' ? 'UNABLE_TO_VERIFY_CASH' : 'CASH_CLOSED', data?.message);
+          }
+          const isRejected = parsed.status === 400 || parsed.status === 401 || parsed.status === 403 || parsed.status === 409;
+          return {
+            success: false,
+            rejected: isRejected,
+            ...(isStoreClosed ? { isStoreClosed: true } : {}),
+            error:
+              data?.message ||
+              (parsed.isHtml
+                ? `Resposta HTML inesperada do servidor ao enviar pedido (HTTP ${parsed.status}).`
+                : `Erro HTTP ${parsed.status} ao confirmar pedido no servidor.`),
+          };
+        } catch (err: unknown) {
+          const confirmedAfterDrop = await this.verifyPublicOrderConfirmationOnServer(order);
+          if (confirmedAfterDrop) {
+            this.removeOrderFromSyncQueue(order.id);
+            this.recordSyncedOrderId(order.id);
+            this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+            this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+            this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+            return { success: true, recoveredFromTimeout: true };
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            success: false,
+            uncertain: true,
+            offline: this.isOfflineErrorMessage(msg),
+            error: msg || 'Não foi possível confirmar o registro do pedido no servidor.',
+          };
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+
+      if (!requireServerConfirmation && !isPublicMenuOrder) {
+        this.queueOrderForSync(order);
+        this.updateLocalOrderSyncStatus(order.id, 'PENDING');
+      }
+      return { success: false, offline: true, error: 'Cloud Firestore não inicializado' };
     }
 
     this.inFlightOrderWrites.add(order.id);
     try {
-      // Build auth headers if staff user is logged in
-      let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (auth?.currentUser) {
-        try {
-          const idToken = await auth.currentUser.getIdToken();
-          if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
-        } catch {
-          // fallback
+      await this.waitForFirebaseAuthReady();
+      const currentSnapshot = this.getOrderById(order.id) || order;
+      const authHeaders = await this.getFirebaseAuthHeaders();
+
+      // For status transitions on existing/queued orders, prefer targeted updateDoc / backend status endpoint
+      if (options?.isStatusTransition) {
+        if (currentSnapshot.status === 'CANCELADO') {
+          return {
+            success: false,
+            rejected: true,
+            error: 'Cancelamento de pedidos deve ser executado exclusivamente pelo procedimento oficial /api/orders/:id/cancel.',
+          };
         }
+        if (isFirebaseReady() && !auth?.currentUser) {
+          return {
+            success: false,
+            rejected: true,
+            error: 'Sessão Firebase não autenticada. Faça login novamente para atualizar o pedido.',
+          };
+        }
+
+        const cleanOrder = this.cleanForFirestore(currentSnapshot);
+        let directPermissionDenied = false;
+        if (auth?.currentUser && db) {
+          try {
+            await updateDoc(doc(db, 'orders', currentSnapshot.id), {
+              status: cleanOrder.status,
+              updatedAt: cleanOrder.updatedAt,
+              movements: cleanOrder.movements || [],
+              ...(cleanOrder.deliveryPerson !== undefined ? { deliveryPerson: cleanOrder.deliveryPerson } : {}),
+              ...(cleanOrder.deliveryPersonId !== undefined ? { deliveryPersonId: cleanOrder.deliveryPersonId } : {}),
+              ...(cleanOrder.deliveryPersonName !== undefined ? { deliveryPersonName: cleanOrder.deliveryPersonName } : {}),
+              ...(cleanOrder.deliveryAssignmentHistory !== undefined ? { deliveryAssignmentHistory: cleanOrder.deliveryAssignmentHistory } : {}),
+              ...(cleanOrder.cancellationReason !== undefined ? { cancellationReason: cleanOrder.cancellationReason } : {}),
+              ...(cleanOrder.cancelledBy !== undefined ? { cancelledBy: cleanOrder.cancelledBy } : {}),
+              ...(cleanOrder.cancelledAt !== undefined ? { cancelledAt: cleanOrder.cancelledAt } : {}),
+              ...(cleanOrder.refundInfo !== undefined ? { refundInfo: cleanOrder.refundInfo } : {}),
+            } as Record<string, any>);
+
+            if (currentSnapshot.trackingCode) {
+              const publicPayload = this.buildPublicTrackingPayload(currentSnapshot);
+              await setDoc(doc(db, 'public_tracking', currentSnapshot.trackingCode), publicPayload).catch(() => {});
+            }
+
+            this.removeOrderFromSyncQueue(currentSnapshot.id);
+            this.recordSyncedOrderId(currentSnapshot.id);
+            this.updateLocalOrderSyncStatus(currentSnapshot.id, 'SYNCED');
+            this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+            this.notify('ORDER_SYNC_CONFIRMED', { orderId: currentSnapshot.id });
+            return { success: true };
+          } catch (directErr: any) {
+            const code = String(directErr?.code || '');
+            const msg = String(directErr?.message || directErr || '');
+            if (code === 'permission-denied' || msg.includes('Missing or insufficient permissions')) {
+              directPermissionDenied = true;
+            } else if (code === 'not-found' || msg.includes('No document to update')) {
+              const wasPreviouslySynced = this.getSyncedOrderIds().has(currentSnapshot.id);
+              if (wasPreviouslySynced) {
+                this.applyRemoteTombstonesLocally([currentSnapshot.id]);
+                this.removeSyncedOrderId(currentSnapshot.id);
+                return { success: false, rejected: true, error: 'Este pedido foi excluído definitivamente em outro dispositivo.' };
+              }
+            }
+            console.warn('[Firestore Status] updateDoc direto falhou, acionando /api/orders/:id/status:', code || msg);
+          }
+        }
+
+        const backendStatusRes = await this.persistOrderStatusViaBackend(currentSnapshot, authHeaders);
+        if (backendStatusRes.success) {
+          return { success: true };
+        }
+        if (backendStatusRes.rejected || directPermissionDenied) {
+          const finalErr = backendStatusRes.error || 'Permissão negada no Cloud Firestore (403). Verifique se o usuário possui perfil ATIVO em /users/{uid}.';
+          this.cloudSyncState = { status: 'ERROR', lastSyncedAt: this.cloudSyncState.lastSyncedAt, lastError: finalErr };
+          return { success: false, rejected: true, error: finalErr };
+        }
+        const errMsg = backendStatusRes.error || 'Falha ao sincronizar alteração de status.';
+        this.queueOrderForSync(currentSnapshot);
+        this.updateLocalOrderSyncStatus(currentSnapshot.id, 'PENDING');
+        this.cloudSyncState = { status: 'ERROR', lastSyncedAt: this.cloudSyncState.lastSyncedAt, lastError: errMsg };
+        return { success: false, offline: this.isOfflineErrorMessage(errMsg), error: errMsg };
       }
 
-      // For large carts exceeding direct client Firestore Rules read budgets (> 8 items)
-      // or unauthenticated orders with high item volume, route through the secure backend validator:
-      if (order.items && order.items.length > 8) {
+      // Route ALL public menu orders and large carts (> 8 items) strictly through the backend /api/orders
+      // so open cash-register validation and catalog pricing invariants can NEVER be bypassed via Client SDK.
+      if (isPublicMenuOrder || (currentSnapshot.items && currentSnapshot.items.length > 8)) {
+        const timeoutMs = options?.timeoutMs ?? 15000;
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
         try {
           const res = await fetch('/api/orders', {
             method: 'POST',
             headers: authHeaders,
-            body: JSON.stringify({ order }),
+            body: JSON.stringify({ order: currentSnapshot, ...(isPublicMenuOrder ? { source: 'PUBLIC_MENU' } : {}) }),
+            ...(controller ? { signal: controller.signal } : {}),
           });
           const rawText = await res.text().catch(() => '');
           let data: any = {};
           if (rawText && rawText.trim()) {
             try { data = JSON.parse(rawText); } catch {}
           }
+          if (res.status === 410 || data?.deleted) {
+            this.applyRemoteTombstonesLocally([currentSnapshot.id]);
+            return { success: false, rejected: true, error: data.message || 'Pedido excluído em outro dispositivo.' };
+          }
           if (res.ok && data.success) {
-            this.removeOrderFromSyncQueue(order.id);
-            this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
-            this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
-            return { success: true };
+            this.removeOrderFromSyncQueue(currentSnapshot.id);
+            this.recordSyncedOrderId(currentSnapshot.id);
+            this.updateLocalOrderSyncStatus(currentSnapshot.id, 'SYNCED');
+            this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+            this.notify('ORDER_SYNC_CONFIRMED', { orderId: currentSnapshot.id });
+            return { success: true, ...(data?.order ? { serverOrder: data.order as Order } : {}) };
           } else {
             const errorMsg = data.message || `Erro ${res.status} no backend (${rawText.slice(0, 60)})`;
-            console.warn('[Firestore] Backend recusou persistência do pedido ' + order.id + ':', errorMsg);
-            this.queueOrderForSync(order);
-            this.updateLocalOrderSyncStatus(order.id, 'PENDING');
-            return { success: false, error: errorMsg };
+            const isStoreClosed = Boolean(data?.isStoreClosed || data?.code === 'STORE_CLOSED' || data?.code === 'STORE_AVAILABILITY_UNVERIFIED');
+            if (isStoreClosed) {
+              this.markLastPublicAvailabilityClosed(data?.reason === 'UNABLE_TO_VERIFY_CASH' ? 'UNABLE_TO_VERIFY_CASH' : 'CASH_CLOSED', errorMsg);
+            }
+            const isRejected = res.status === 400 || res.status === 401 || res.status === 403 || res.status === 409;
+            console.warn('[Firestore] Backend recusou persistência do pedido ' + currentSnapshot.id + ':', errorMsg);
+            if (!isRejected && !requireServerConfirmation && !isPublicMenuOrder) {
+              this.queueOrderForSync(currentSnapshot);
+              this.updateLocalOrderSyncStatus(currentSnapshot.id, 'PENDING');
+            }
+            this.cloudSyncState = { status: 'ERROR', lastSyncedAt: this.cloudSyncState.lastSyncedAt, lastError: errorMsg };
+            return { success: false, rejected: isRejected, ...(isStoreClosed ? { isStoreClosed: true } : {}), error: errorMsg };
           }
         } catch (fetchErr: unknown) {
+          if (requireServerConfirmation) {
+            const confirmedAfterDrop = await this.verifyPublicOrderConfirmationOnServer(currentSnapshot);
+            if (confirmedAfterDrop) {
+              this.removeOrderFromSyncQueue(currentSnapshot.id);
+              this.recordSyncedOrderId(currentSnapshot.id);
+              this.updateLocalOrderSyncStatus(currentSnapshot.id, 'SYNCED');
+              this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+              this.notify('ORDER_SYNC_CONFIRMED', { orderId: currentSnapshot.id });
+              return { success: true, recoveredFromTimeout: true };
+            }
+          }
           const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-          this.queueOrderForSync(order);
-          this.updateLocalOrderSyncStatus(order.id, 'PENDING');
-          return { success: false, error: msg };
+          if (!requireServerConfirmation && !isPublicMenuOrder) {
+            this.queueOrderForSync(currentSnapshot);
+            this.updateLocalOrderSyncStatus(currentSnapshot.id, 'PENDING');
+          }
+          this.cloudSyncState = { status: 'ERROR', lastSyncedAt: this.cloudSyncState.lastSyncedAt, lastError: msg };
+          return { success: false, uncertain: requireServerConfirmation, offline: this.isOfflineErrorMessage(msg), error: msg };
+        } finally {
+          if (timer) clearTimeout(timer);
         }
       }
 
-      const cleanOrder = this.cleanForFirestore(order);
-      await setDoc(doc(db, 'orders', order.id), cleanOrder);
-
-      if (order.trackingCode) {
-        const publicPayload = this.buildPublicTrackingPayload(order);
-        await setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch(() => {});
+      if (isPublicMenuOrder) {
+        return {
+          success: false,
+          rejected: true,
+          error: 'Pedidos públicos devem ser confirmados pelo servidor antes da finalização.',
+        };
       }
 
-      this.removeOrderFromSyncQueue(order.id);
-      this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
-      this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+      if (currentSnapshot.status === 'CANCELADO') {
+        this.removeOrderFromSyncQueue(currentSnapshot.id);
+        return {
+          success: false,
+          rejected: true,
+          error: 'Cancelamento de pedidos deve ser executado exclusivamente pelo procedimento oficial /api/orders/:id/cancel.',
+        };
+      }
+
+      const cleanOrder = this.cleanForFirestore(currentSnapshot);
+      const isPreviouslySynced = this.getSyncedOrderIds().has(currentSnapshot.id);
+
+      if (isPreviouslySynced && auth?.currentUser) {
+        try {
+          await updateDoc(doc(db, 'orders', currentSnapshot.id), cleanOrder as Record<string, any>);
+        } catch (updateErr: any) {
+          if (updateErr?.code === 'not-found' || String(updateErr?.message || '').includes('No document to update')) {
+            this.applyRemoteTombstonesLocally([currentSnapshot.id]);
+            this.removeSyncedOrderId(currentSnapshot.id);
+            return { success: false, rejected: true, error: 'Este pedido foi excluído em outro dispositivo.' };
+          }
+          throw updateErr;
+        }
+      } else {
+        await setDoc(doc(db, 'orders', currentSnapshot.id), cleanOrder);
+      }
+
+      if (currentSnapshot.trackingCode) {
+        const publicPayload = this.buildPublicTrackingPayload(currentSnapshot);
+        await setDoc(doc(db, 'public_tracking', currentSnapshot.trackingCode), publicPayload).catch(() => {});
+      }
+
+      this.removeOrderFromSyncQueue(currentSnapshot.id);
+      this.recordSyncedOrderId(currentSnapshot.id);
+      this.updateLocalOrderSyncStatus(currentSnapshot.id, 'SYNCED');
+      this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+      this.notify('ORDER_SYNC_CONFIRMED', { orderId: currentSnapshot.id });
 
       return { success: true };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      
-      // If direct write was rejected (e.g. security rules or auth token pending), attempt backend fallback
-      if (typeof window !== 'undefined') {
-        try {
-          let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-          if (auth?.currentUser) {
-            try {
-              const idToken = await auth.currentUser.getIdToken();
-              if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
-            } catch {
-              // fallback
-            }
-          }
 
+      if (typeof window !== 'undefined' || requireServerConfirmation) {
+        const timeoutMs = options?.timeoutMs ?? 15000;
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+        try {
+          const authHeaders = await this.getFirebaseAuthHeaders();
           const fallbackRes = await fetch('/api/orders', {
             method: 'POST',
             headers: authHeaders,
             body: JSON.stringify({ order }),
+            ...(controller ? { signal: controller.signal } : {}),
           });
           const rawFallbackText = await fallbackRes.text().catch(() => '');
           let fallbackData: any = {};
           if (rawFallbackText && rawFallbackText.trim()) {
             try { fallbackData = JSON.parse(rawFallbackText); } catch {}
           }
+          if (fallbackRes.status === 410 || fallbackData?.deleted) {
+            this.applyRemoteTombstonesLocally([order.id]);
+            this.removeSyncedOrderId(order.id);
+            return { success: false, rejected: true, error: fallbackData.message || 'Pedido excluído em outro dispositivo.' };
+          }
           if (fallbackRes.ok && fallbackData.success) {
             this.removeOrderFromSyncQueue(order.id);
+            this.recordSyncedOrderId(order.id);
             this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+            this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
             this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
             return { success: true };
           } else {
-            console.warn('[Firestore] Backend fallback não persistiu o pedido ' + order.id + ':', fallbackData.message || rawFallbackText.slice(0, 60));
+            const errMsg = fallbackData.message || rawFallbackText.slice(0, 120) || msg;
+            const isRejected = fallbackRes.status === 400 || fallbackRes.status === 401 || fallbackRes.status === 403 || fallbackRes.status === 409;
+            console.warn('[Firestore] Backend fallback não persistiu o pedido ' + order.id + ':', errMsg);
+            if (isRejected) {
+              return { success: false, rejected: true, error: errMsg };
+            }
           }
         } catch {
-          // Handled below
+          if (requireServerConfirmation) {
+            const confirmedAfterDrop = await this.verifyPublicOrderConfirmationOnServer(order);
+            if (confirmedAfterDrop) {
+              this.removeOrderFromSyncQueue(order.id);
+              this.recordSyncedOrderId(order.id);
+              this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
+              this.cloudSyncState = { status: 'CONNECTED', lastSyncedAt: new Date().toISOString(), lastError: null };
+              this.notify('ORDER_SYNC_CONFIRMED', { orderId: order.id });
+              return { success: true, recoveredFromTimeout: true };
+            }
+          }
+        } finally {
+          if (timer) clearTimeout(timer);
         }
+      }
+
+      if (requireServerConfirmation) {
+        this.cloudSyncState = { status: 'ERROR', lastSyncedAt: this.cloudSyncState.lastSyncedAt, lastError: msg };
+        return { success: false, uncertain: true, offline: this.isOfflineErrorMessage(msg), error: msg };
       }
 
       console.warn('[Firestore] Falha na sincronização do pedido ' + order.id + ' (mantido na fila resiliente):', msg);
       this.queueOrderForSync(order);
       this.updateLocalOrderSyncStatus(order.id, 'PENDING');
-      return { success: false, error: msg };
+      this.cloudSyncState = { status: 'ERROR', lastSyncedAt: this.cloudSyncState.lastSyncedAt, lastError: msg };
+      return { success: false, offline: this.isOfflineErrorMessage(msg), error: msg };
     } finally {
       this.inFlightOrderWrites.delete(order.id);
     }
   }
 
   /**
-   * Flushes all pending queued operations to Cloud Firestore once connection is available
+   * Flushes all pending queued operations to Cloud Firestore safely,
+   * checking tombstones and remote state first so stale queues never overwrite newer cloud data.
    */
   public async flushPendingSyncQueue(): Promise<{ processed: number; succeeded: number }> {
-    if (!db || this.isFlushingPendingQueue) return { processed: 0, succeeded: 0 };
+    if (!db || this.isFlushingPendingQueue || this.isPublicCustomerContext()) return { processed: 0, succeeded: 0 };
     const deletedIds = this.getDeletedOrderIds();
+    const syncedIds = this.getSyncedOrderIds();
     const pending = this.getPendingSyncOrders();
     const activePending = pending.filter((o) => {
       if (deletedIds.has(o.id)) {
@@ -580,47 +1445,53 @@ class StoreService {
     });
     if (activePending.length === 0) return { processed: 0, succeeded: 0 };
 
+    const STATUS_PRECEDENCE: Record<string, number> = {
+      NOVO: 1,
+      EM_PREPARO: 2,
+      PRONTO: 3,
+      EM_ROTA: 4,
+      ENTREGUE: 5,
+      CANCELADO: 6,
+    };
+
     this.isFlushingPendingQueue = true;
     let succeeded = 0;
 
     try {
       for (const order of activePending) {
-        try {
-          const cleanOrder = this.cleanForFirestore(order);
-          await setDoc(doc(db, 'orders', order.id), cleanOrder);
+        if (this.inFlightOrderWrites.has(order.id) || this.isOrderDeleted(order.id)) {
+          continue;
+        }
 
-          if (order.trackingCode) {
-            const publicPayload = this.buildPublicTrackingPayload(order);
-            await setDoc(doc(db, 'public_tracking', order.trackingCode), publicPayload).catch(() => {});
-          }
-
-          this.removeOrderFromSyncQueue(order.id);
-          this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
-          succeeded++;
-        } catch {
-          // Backend fallback attempt for resilient persistence
+        // Before overwriting an existing remote document, check if Firestore was updated/deleted by another device
+        if (auth?.currentUser && syncedIds.has(order.id)) {
           try {
-            let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-            if (auth?.currentUser) {
-              try {
-                const idToken = await auth.currentUser.getIdToken();
-                if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
-              } catch {}
+            const remoteSnap = await getDoc(doc(db, 'orders', order.id));
+            if (!remoteSnap.exists()) {
+              this.applyRemoteTombstonesLocally([order.id]);
+              this.removeSyncedOrderId(order.id);
+              continue;
             }
-            const res = await fetch('/api/orders', {
-              method: 'POST',
-              headers: authHeaders,
-              body: JSON.stringify({ order }),
-            });
-            const data = await res.json().catch(() => ({}));
-            if (res.ok && data.success) {
+            const ro = remoteSnap.data() as Order;
+            const roRank = STATUS_PRECEDENCE[ro.status] || 0;
+            const loRank = STATUS_PRECEDENCE[order.status] || 0;
+            const roTime = ro.updatedAt ? new Date(ro.updatedAt).getTime() : 0;
+            const loTime = order.updatedAt ? new Date(order.updatedAt).getTime() : 0;
+            if (roRank > loRank || (roRank === loRank && roTime > loTime)) {
+              // Remote is already newer — let remote win instead of overwriting with stale queue entry
+              this.reconcileRemoteOrders([ro], { authoritative: false });
               this.removeOrderFromSyncQueue(order.id);
-              this.updateLocalOrderSyncStatus(order.id, 'SYNCED');
               succeeded++;
+              continue;
             }
           } catch {
-            // Keep in queue for next transmission cycle
+            // Proceed to persistOrderToFirestore (which handles fallback)
           }
+        }
+
+        const res = await this.persistOrderToFirestore(order);
+        if (res.success) {
+          succeeded++;
         }
       }
     } finally {
@@ -631,60 +1502,69 @@ class StoreService {
   }
 
   /**
-   * Auto-authenticates active staff member with Firebase Auth in the background
-   * ensuring that security rules recognize the operator without requiring manual login screens
+   * Synchronizes the active authenticated Firebase user profile to /users/{uid}
+   * WITHOUT silently falling back to hardcoded default passwords or faking sessions.
    */
   public async ensureFirebaseAuthForStaff(): Promise<void> {
     if (!isFirebaseReady() || !auth) return;
 
-    const user = this.getCurrentUser();
-    if (!user || !this.isAuthorizedStaffRole(user.role)) return;
-
-    let email = user.email || '';
-    if (!email.includes('@')) {
-      email = `${user.username}@staff.amanditasabores.com.br`;
-    }
-    if (user.role === 'ADMINISTRADOR' || user.username === 'admin') {
-      email = this.getInitialAdminEmail();
-    }
-
-    const passwords = this.getUserPasswords();
-    const password = passwords[user.id] || '123456';
-
+    await this.waitForFirebaseAuthReady();
     if (!auth.currentUser) {
-      try {
-        await signInWithEmail(email, password);
-      } catch {
-        try {
-          await createUserWithEmail(email, password);
-        } catch {
-          // Fallback
-        }
-      }
+      return;
     }
 
-    // Ensure staff profile document exists in Firestore so hasActiveProfile() rule succeeds
-    if (auth.currentUser && db) {
+    const user = this.getCurrentUser();
+    if (!user || !this.isAuthorizedStaffRole(user.role) || user.status !== 'ATIVO') return;
+
+    const fbUid = auth.currentUser.uid;
+
+    // Ensure staff profile document exists at /users/{uid} so hasActiveProfile() rule succeeds
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      if (idToken && typeof window !== 'undefined') {
+        await fetch('/api/auth/sync-profile', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            name: user.name,
+            username: user.username,
+            allowedModules: user.allowedModules,
+          }),
+        }).catch(() => {});
+      }
+    } catch {
+      // ignore network fetch error
+    }
+
+    if (db) {
       try {
-        const userDocRef = doc(db, 'users', auth.currentUser.uid);
+        const userDocRef = doc(db, 'users', fbUid);
         const snap = await getDoc(userDocRef);
         if (!snap.exists()) {
-          const profile: User = {
-            id: auth.currentUser.uid,
-            name: user.name || 'Colaborador',
-            username: user.username || 'colaborador',
-            email: auth.currentUser.email || email,
-            role: user.role,
-            status: 'ATIVO',
-            allowedModules: user.allowedModules || [],
-            createdAt: new Date().toISOString(),
-            lastLoginAt: new Date().toISOString(),
-            isEmailVerified: true
-          };
-          await setDoc(userDocRef, profile);
+          const verifiedRole = await this.verifyStaffRole(auth.currentUser);
+          if (verifiedRole) {
+            const profile: User = {
+              id: fbUid,
+              name: user.name || 'Colaborador',
+              username: user.username || 'colaborador',
+              email: auth.currentUser.email || user.email || '',
+              role: verifiedRole,
+              status: 'ATIVO',
+              allowedModules: user.allowedModules || [],
+              createdAt: user.createdAt || new Date().toISOString(),
+              lastLoginAt: new Date().toISOString(),
+              isEmailVerified: Boolean(auth.currentUser.emailVerified),
+              authProvider: user.authProvider || 'firebase_email',
+              firebaseUid: fbUid,
+            };
+            await setDoc(userDocRef, this.cleanForFirestore(profile));
+          }
         }
       } catch {
-        // Handled silently (contingency mode)
+        // Handled safely by caller / rules
       }
     }
   }
@@ -767,48 +1647,56 @@ class StoreService {
                     profile = snap.data() as User;
                   }
                 } catch {
-                  // Fallback to local profile check
+                  // Fallback to local profile check if offline
                 }
               }
               if (!profile) {
                 const localUsers = this.getUsers();
-                profile = localUsers.find(
+                const matched = localUsers.find(
                   (u) => u.id === firebaseUser.uid || (firebaseUser.email && (u.email || '').toLowerCase() === firebaseUser.email.toLowerCase())
-                ) || null;
+                );
+                if (matched) {
+                  profile = {
+                    ...matched,
+                    id: firebaseUser.uid,
+                    firebaseUid: firebaseUser.uid,
+                    role: confirmedRole,
+                  };
+                }
               }
               if (profile && profile.status === 'ATIVO') {
                 this.setCurrentUser(profile);
+                await this.initStaffFirestoreSync(firebaseUser);
+                this.flushPendingSyncQueue();
+              } else {
+                this.stopStaffFirestoreSync();
+                if (isFirebaseReady()) {
+                  this.setCurrentUser(null);
+                  signOutFirebase().catch(() => {});
+                }
+              }
+            } else {
+              this.stopStaffFirestoreSync();
+              if (isFirebaseReady()) {
+                this.setCurrentUser(null);
               }
             }
           } catch (e) {
             console.warn('[Store] Falha ao restaurar perfil do usuário autenticado:', e);
           }
-          await this.initStaffFirestoreSync(firebaseUser);
-          this.flushPendingSyncQueue();
         } else {
-          // If staff is logged in locally, auto-authenticate to Firebase Auth in background
-          const curr = this.getCurrentUser();
-          if (curr && this.isAuthorizedStaffRole(curr.role)) {
-            this.ensureFirebaseAuthForStaff().then(() => {
-              if (auth?.currentUser) {
-                this.initStaffFirestoreSync(auth.currentUser);
-              }
-            }).catch(() => {});
-          } else {
-            this.stopStaffFirestoreSync();
+          await this.waitForFirebaseAuthReady();
+          if (auth?.currentUser) return;
+          this.stopStaffFirestoreSync();
+          // When Firebase is configured, never allow a stale local session without a real Firebase Auth session
+          if (isFirebaseReady()) {
+            const curr = this.getCurrentUser();
+            if (curr) {
+              this.setCurrentUser(null);
+            }
           }
         }
       });
-
-      // If already logged in locally as staff on startup, trigger staff sync auto-connect
-      const startupUser = this.getCurrentUser();
-      if (startupUser && this.isAuthorizedStaffRole(startupUser.role)) {
-        setTimeout(() => {
-          this.ensureFirebaseAuthForStaff().then(() => {
-            this.initStaffFirestoreSync();
-          }).catch(() => {});
-        }, 1000);
-      }
     }
   }
 
@@ -972,19 +1860,56 @@ class StoreService {
     return role === 'ADMINISTRADOR' || user.username === 'admin';
   }
 
+  public setServerAtomicPaymentMode(enabled: boolean): void {
+    this.serverAtomicPaymentTestOverride = enabled;
+    this.uncertainServerOps.clear();
+    this.lastUncertainOpenShiftId = null;
+  }
+
+  private shouldUseServerAtomicPayment(): boolean {
+    return isFirebaseReady() || Boolean(db) || this.serverAtomicPaymentTestOverride;
+  }
+
+  public isCloudAtomicRequired(): boolean {
+    return this.shouldUseServerAtomicPayment();
+  }
+
   public canUserManageCash(): boolean {
     const user = this.getCurrentUser();
-    if (!user) return false;
+    if (!user || user.status !== 'ATIVO') return false;
     const role = user.role?.toUpperCase();
-    if (role === 'ADMINISTRADOR' || user.username === 'admin' || role === 'GERENTE') return true;
-    if (role === 'CAIXA') return true;
-    return Boolean(user.allowedModules && user.allowedModules.includes('caixa'));
+    if (role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA') return true;
+    return user.username === 'admin' && role !== 'ATENDENTE' && role !== 'COZINHA' && role !== 'ENTREGADOR';
+  }
+
+  public canUserConfirmPayments(user?: User | null): boolean {
+    const target = user !== undefined ? user : this.getCurrentUser();
+    if (!target || target.status !== 'ATIVO') return false;
+    const role = (target.role || '').toUpperCase();
+    return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'ATENDENTE'].includes(role);
+  }
+
+  public canUserDeleteOrder(user?: User | null): boolean {
+    const target = user !== undefined ? user : this.getCurrentUser();
+    if (!target || target.status !== 'ATIVO') return false;
+    const role = (target.role || '').toUpperCase();
+    return role === 'ADMINISTRADOR' || role === 'GERENTE' || (target.username === 'admin' && role !== 'ATENDENTE' && role !== 'CAIXA' && role !== 'COZINHA' && role !== 'ENTREGADOR');
+  }
+
+  public canUserManageConfig(user?: User | null): boolean {
+    const target = user !== undefined ? user : this.getCurrentUser();
+    if (!target || target.status !== 'ATIVO') return false;
+    const role = (target.role || '').toUpperCase();
+    return role === 'ADMINISTRADOR' || role === 'GERENTE';
   }
 
   public canUserUpdateOrderStatus(user: User | null, targetStatus: OrderStatus): boolean {
-    if (!user) return false;
+    if (!user || user.status !== 'ATIVO') return false;
+    if (targetStatus === 'CANCELADO') return false;
     const role = user.role?.toUpperCase();
-    if (role === 'ADMINISTRADOR' || user.username === 'admin' || role === 'GERENTE') return true;
+    if (role === 'ADMINISTRADOR' || user.username === 'admin' || role === 'GERENTE') {
+      return ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'].includes(targetStatus);
+    }
     if (role === 'COZINHA') {
       return targetStatus === 'EM_PREPARO' || targetStatus === 'PRONTO';
     }
@@ -992,9 +1917,9 @@ class StoreService {
       return targetStatus === 'EM_ROTA' || targetStatus === 'ENTREGUE';
     }
     if (role === 'ATENDENTE' || role === 'CAIXA') {
-      return true;
+      return ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'].includes(targetStatus);
     }
-    return true;
+    return false;
   }
 
   /**
@@ -1025,50 +1950,72 @@ class StoreService {
 
   /**
    * Verifies if an authenticated Firebase User has a confirmed authorized staff role.
-   * Does NOT blindly trust localStorage; checks remote Firestore /users/{uid} and the staff registry.
+   * Trusts Firestore /users/{uid} authoritatively when reachable and never auto-promotes
+   * non-bootstrap users to ADMINISTRADOR from local storage.
    */
   public async verifyStaffRole(firebaseUser: { uid: string; email?: string | null } | null): Promise<UserRole | null> {
     if (!firebaseUser) return null;
 
-    // 1. Check remote Firestore users collection if database is reachable
+    // 1. Check remote Firestore users/{uid} document first (authoritative source of truth)
     if (db) {
       try {
         const userDocRef = doc(db, 'users', firebaseUser.uid);
         const userSnap = await getDoc(userDocRef);
         if (userSnap.exists()) {
           const remoteData = userSnap.data() as Partial<User>;
-          if (remoteData.status === 'ATIVO' && remoteData.role && this.isAuthorizedStaffRole(remoteData.role)) {
-            return remoteData.role as UserRole;
+          if (remoteData.status && remoteData.status !== 'ATIVO') {
+            return null;
           }
+          if (remoteData.role && this.isAuthorizedStaffRole(remoteData.role)) {
+            return remoteData.role.toUpperCase() as UserRole;
+          }
+          return null;
         }
       } catch (err) {
-        console.warn('[Store Security] Verificação de papel no Firestore remoto falhou (modo contingência):', err);
+        console.warn('[Store Security] Verificação de papel no Firestore remoto falhou:', err);
       }
     }
 
-    // 2. Check local authorized staff registry for matched UID or email
-    const localUsers = this.getUsers();
-    const matched = localUsers.find(
-      (u) => u.id === firebaseUser.uid || (firebaseUser.email && u.email?.toLowerCase() === firebaseUser.email.toLowerCase())
-    );
-
-    if (matched && matched.status === 'ATIVO' && this.isAuthorizedStaffRole(matched.role)) {
-      return matched.role as UserRole;
-    }
-
-    // 3. Admin email bootstrap check
+    // 2. Whitelisted bootstrap administrator emails (matches firestore.rules isBootstrappedAdmin())
     if (firebaseUser.email && this.isBootstrappedAdminEmail(firebaseUser.email)) {
       return 'ADMINISTRADOR';
     }
 
-    // 4. Staff domain email check (@staff.amanditasabores.com.br or @amanditasabores.com.br)
-    if (firebaseUser.email && (firebaseUser.email.endsWith('@staff.amanditasabores.com.br') || firebaseUser.email.endsWith('@amanditasabores.com.br'))) {
-      const username = firebaseUser.email.split('@')[0].toLowerCase();
-      const byUser = localUsers.find((u) => (u.username || '').toLowerCase() === username);
-      if (byUser && this.isAuthorizedStaffRole(byUser.role)) {
-        return byUser.role as UserRole;
+    // 3. Seeded Gerente account (matches firestore.rules line 530)
+    if (firebaseUser.email && firebaseUser.email.trim().toLowerCase() === 'gerente@amanditasabores.com.br') {
+      return 'GERENTE';
+    }
+
+    // 4. Local operational staff registry match (never elevates to ADMINISTRADOR via localStorage)
+    const localUsers = this.getUsers();
+    const cleanEmail = (firebaseUser.email || '').trim().toLowerCase();
+    const matched = localUsers.find(
+      (u) => u.id === firebaseUser.uid || (cleanEmail && (u.email || '').trim().toLowerCase() === cleanEmail)
+    );
+
+    if (matched) {
+      if (matched.status !== 'ATIVO') return null;
+      const roleUpper = (matched.role || '').toUpperCase();
+      if (roleUpper !== 'ADMINISTRADOR' && this.isAuthorizedStaffRole(roleUpper)) {
+        return roleUpper as UserRole;
       }
-      return 'ATENDENTE';
+    }
+
+    // 5. Base operational roles for @staff.amanditasabores.com.br (matches firestore.rules line 534-537)
+    if (cleanEmail.endsWith('@staff.amanditasabores.com.br') || cleanEmail.endsWith('@amanditasabores.com.br')) {
+      const username = cleanEmail.split('@')[0].toLowerCase();
+      const byUser = localUsers.find((u) => (u.username || '').toLowerCase() === username);
+      if (byUser) {
+        if (byUser.status !== 'ATIVO') return null;
+        const roleUpper = (byUser.role || '').toUpperCase();
+        if (roleUpper !== 'ADMINISTRADOR' && this.isAuthorizedStaffRole(roleUpper)) {
+          return roleUpper as UserRole;
+        }
+      }
+      if (username.startsWith('cozinha')) return 'COZINHA';
+      if (username.startsWith('entregador')) return 'ENTREGADOR';
+      if (username.startsWith('caixa')) return 'CAIXA';
+      if (username.startsWith('atendente')) return 'ATENDENTE';
     }
 
     return null;
@@ -1142,13 +2089,22 @@ class StoreService {
       this.publicUnsubscribers.push(unsubMenu);
 
       // 2. Synchronize Restaurant Config in Real Time (Public info: WhatsApp, PIX, store status)
+      // Merges into existing config so internal/private fields (receiptFooterText, defaultDeliveryPersonId, notify*) are never wiped.
+      const applyRemotePublicConfig = (remotePublic: Partial<RestaurantConfig>) => {
+        const currentLocal = this.getRestaurantConfig();
+        const mergedConfig: RestaurantConfig = {
+          ...currentLocal,
+          ...remotePublic,
+        };
+        localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+        this.notify('CONFIG_UPDATED', mergedConfig);
+      };
+
       const unsubConfig = onSnapshot(
         doc(db, 'configs', 'restaurant'),
         (docSnap) => {
           if (docSnap.exists()) {
-            const config = docSnap.data() as RestaurantConfig;
-            localStorage.setItem('gf_restaurant_config', JSON.stringify(config));
-            this.notify('CONFIG_UPDATED', config);
+            applyRemotePublicConfig(docSnap.data() as Partial<RestaurantConfig>);
           }
         },
         (error) => {
@@ -1157,12 +2113,20 @@ class StoreService {
       );
       this.publicUnsubscribers.push(unsubConfig);
 
+      // Ensure fresh server fetch on app open so updated PIX key is always recovered immediately
+      getDocFromServer(doc(db, 'configs', 'restaurant'))
+        .then((serverSnap) => {
+          if (serverSnap.exists()) {
+            applyRemotePublicConfig(serverSnap.data() as Partial<RestaurantConfig>);
+          }
+        })
+        .catch(() => {});
+
     } catch (err) {
       console.warn('[Firestore Public Sync Setup Error]:', err);
     }
   }
 
-  /**
   /**
    * Internal Staff Firestore listeners: Orders collection, Cash register shifts, and Staff users.
    * STRICT SECURITY:
@@ -1170,16 +2134,12 @@ class StoreService {
    * 2. Confirms that the authenticated user possesses an authorized staff role.
    * Never leaks internal operational order lists to unauthenticated visitors.
    */
-  public async initStaffFirestoreSync(firebaseUser?: unknown): Promise<void> {
+  public async initStaffFirestoreSync(_firebaseUser?: unknown): Promise<void> {
     if (!db || this.isStaffSyncActive) return;
 
-    // 1. If no active Firebase Auth session, attempt background auto-auth for local staff
+    await this.waitForFirebaseAuthReady();
     if (!auth?.currentUser) {
-      await this.ensureFirebaseAuthForStaff();
-    }
-
-    if (!auth?.currentUser) {
-      console.info('[Firestore Security] Aguardando sessão de colaborador no Firebase Auth para sincronização interna.');
+      console.info('[Firestore Security] Aguardando sessão real de colaborador no Firebase Auth para sincronização interna.');
       return;
     }
 
@@ -1200,192 +2160,76 @@ class StoreService {
       const role = currentLocalUser?.role?.toUpperCase();
       const allowedModules = currentLocalUser?.allowedModules || [];
 
-      const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA' || allowedModules.includes('caixa');
+      const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA';
       const canAccessUsers = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('usuarios');
       const canManageMenu = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('menu') || allowedModules.includes('relatorios');
+
+      // Sync shared tombstones before attaching snapshot so deleted orders never resurrect
+      this.syncTombstonesFromServer().catch(() => {});
 
       // 1. Synchronize All Orders in Real Time (Staff only: Kitchen KDS, POS Balcão, Entregadores, Admin)
       const unsubOrders = onSnapshot(
         collection(db, 'orders'),
         (snapshot) => {
+          // Process explicit Firestore removals immediately
+          snapshot.docChanges().forEach((change) => {
+            if (change.type === 'removed') {
+              this.recordDeletedOrderId(change.doc.id);
+              this.removeOrderFromSyncQueue(change.doc.id);
+              this.removeSyncedOrderId(change.doc.id);
+            }
+          });
+
           const remoteOrders: Order[] = [];
           snapshot.forEach((docSnap) => {
             const data = docSnap.data() as Order;
             remoteOrders.push(data);
           });
 
-          const deletedIds = this.getDeletedOrderIds();
-
-          // Discard remote orders that were deleted locally (tombstones) and trigger remote cleanup if needed
-          const activeRemoteOrders: Order[] = [];
-          for (const ro of remoteOrders) {
-            if (deletedIds.has(ro.id)) {
-              if (db) {
-                deleteDoc(doc(db, 'orders', ro.id)).catch(() => {});
-                if (ro.trackingCode) {
-                  deleteDoc(doc(db, 'public_tracking', ro.trackingCode)).catch(() => {});
-                }
-              }
-            } else {
-              activeRemoteOrders.push(ro);
-            }
-          }
-
-          activeRemoteOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-          const localOrders = this.getOrders().filter((lo) => !deletedIds.has(lo.id));
-          const localIds = new Set(localOrders.map((o) => o.id));
-          const newIncoming = activeRemoteOrders.filter((ro) => !localIds.has(ro.id) && ro.status === 'NOVO');
-          
-          if (newIncoming.length > 0) {
-            newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
-            const activeUser = this.getCurrentUser();
-            // Strictly alert kitchen/cashier/attendant only (never delivery drivers for new orders)
-            if (activeUser && this.isOrderPrepStaffRole(activeUser.role)) {
-              soundService.startPersistentOrderAlert(3500);
-            }
-
-            // Auto-print newly received pickup orders on 58mm thermal printer if enabled
-            try {
-              const printerCfg = thermalPrinterService.getConfig();
-              if (printerCfg.enabled && printerCfg.autoPrintPickup) {
-                newIncoming.forEach((o) => {
-                  if (o.fulfillmentType === 'RETIRADA' && !thermalPrinterService.hasOrderBeenPrinted(o.id)) {
-                    thermalPrinterService.printOrder(o).catch((err) => {
-                      console.info('[Impressora Térmica 58mm] Aviso ao auto-imprimir pedido:', err);
-                    });
-                  }
-                });
-              }
-            } catch {
-              // Non-blocking
-            }
-          }
-
-          // Check for orders transitioning to PRONTO for delivery (dedicated driver notification)
-          const newlyReadyDeliveries = activeRemoteOrders.filter((ro) => {
-            if (ro.status !== 'PRONTO' || ro.fulfillmentType !== 'DELIVERY') return false;
-            const prev = localOrders.find((lo) => lo.id === ro.id);
-            return !prev || prev.status !== 'PRONTO';
+          const reconcileSummary = this.reconcileRemoteOrders(remoteOrders, {
+            authoritative: !snapshot.metadata.fromCache,
           });
+          this.cloudSyncState = {
+            status: 'CONNECTED',
+            lastSyncedAt: new Date().toISOString(),
+            lastError: null,
+          };
 
-          if (newlyReadyDeliveries.length > 0) {
-            newlyReadyDeliveries.forEach((o) => this.recordDriverReadyOrder(o.id));
-            const activeUser = this.getCurrentUser();
-            const relevantReady = newlyReadyDeliveries.find((o) => this.isDriverAssignedToOrder(o, activeUser));
-            if (activeUser && relevantReady) {
-              soundService.startDriverReadyAlert(3500, 4, relevantReady.id);
-            }
-            this.notify('DRIVER_ORDER_READY', newlyReadyDeliveries);
-          }
-
-          if (activeRemoteOrders.length > 0) {
-            const pendingOrders = this.getPendingSyncOrders();
-            const pendingIds = new Set(pendingOrders.map((o) => o.id));
-            const remoteMap = new Map(activeRemoteOrders.map((o) => [o.id, o]));
-
-            // Strict status precedence hierarchy: newer pipeline progression always wins
-            const STATUS_PRECEDENCE: Record<string, number> = {
-              NOVO: 1,
-              EM_PREPARO: 2,
-              PRONTO: 3,
-              EM_ROTA: 4,
-              ENTREGUE: 5,
-              CANCELADO: 6,
-            };
-
-            const merged: Order[] = [];
-
-            // Reconcile local orders against incoming remote Firestore data
-            for (const lo of localOrders) {
-              const ro = remoteMap.get(lo.id);
-              if (!ro) {
-                // Exists only locally
-                merged.push(lo);
-              } else {
-                remoteMap.delete(lo.id);
-
-                // Preserve driver assignment if present on local but absent on incoming remote document
-                // This prevents status changes from stripping driver info and triggering auto-assignment loops
-                const mergedDeliveryPersonId = ro.deliveryPersonId || lo.deliveryPersonId;
-                const mergedDeliveryPersonName = ro.deliveryPersonName || lo.deliveryPersonName;
-                const mergedDeliveryPerson = ro.deliveryPerson || lo.deliveryPerson;
-                const mergedAssignmentHistory = (ro.deliveryAssignmentHistory && ro.deliveryAssignmentHistory.length > 0)
-                  ? ro.deliveryAssignmentHistory
-                  : lo.deliveryAssignmentHistory;
-
-                const baseOrder: Order = {
-                  ...ro,
-                  deliveryPersonId: mergedDeliveryPersonId,
-                  deliveryPersonName: mergedDeliveryPersonName,
-                  deliveryPerson: mergedDeliveryPerson,
-                  deliveryAssignmentHistory: mergedAssignmentHistory,
-                };
-
-                const roRank = STATUS_PRECEDENCE[ro.status] || 0;
-                const loRank = STATUS_PRECEDENCE[lo.status] || 0;
-                const roTime = ro.updatedAt ? new Date(ro.updatedAt).getTime() : 0;
-                const loTime = lo.updatedAt ? new Date(lo.updatedAt).getTime() : 0;
-                const roMovesCount = ro.movements?.length || 0;
-                const loMovesCount = lo.movements?.length || 0;
-
-                // Remote WINS if:
-                // 1. Remote status is further along the pipeline (e.g. EM_ROTA or ENTREGUE vs PRONTO)
-                // 2. OR remote timestamp is newer than or equal to local
-                // 3. OR remote has more movement audit records
-                if (
-                  roRank > loRank ||
-                  (roRank === loRank && roTime >= loTime) ||
-                  roMovesCount > loMovesCount
-                ) {
-                  this.removeOrderFromSyncQueue(lo.id);
-                  merged.push({ ...baseOrder, _cloudSyncStatus: 'SYNCED' });
-                } else if (pendingIds.has(lo.id)) {
-                  // Keep true pending local changes that have not yet reached remote
-                  merged.push(lo);
-                } else {
-                  merged.push({ ...baseOrder, _cloudSyncStatus: 'SYNCED' });
-                }
-              }
-            }
-
-            // Add any remaining remote orders not yet present in local storage (excluding tombstones)
-            for (const ro of remoteMap.values()) {
-              if (!deletedIds.has(ro.id)) {
-                merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
-              }
-            }
-
-            merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-            localStorage.setItem('gf_orders', JSON.stringify(merged));
-          } else if (localOrders.length > 0 && db) {
-            // Firestore orders was empty: seed existing non-deleted local orders to Firestore
-            for (const lo of localOrders) {
-              if (!deletedIds.has(lo.id)) {
-                this.persistOrderToFirestore(lo).catch(() => {});
-              }
-            }
-          }
-
-          this.notify('FIRESTORE_ORDERS_SYNCED', { count: activeRemoteOrders.length });
-          this.notify('ORDERS_UPDATED', { count: activeRemoteOrders.length });
+          this.notify('FIRESTORE_ORDERS_SYNCED', { count: reconcileSummary.count });
+          this.notify('ORDERS_UPDATED', { count: reconcileSummary.count });
           if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_ORDERS_SYNCED' } }));
           }
         },
         (error) => {
           console.warn('[Firestore Staff Sync] Aviso no listener de pedidos:', error.message);
+          this.cloudSyncState = {
+            status: 'ERROR',
+            lastSyncedAt: this.cloudSyncState.lastSyncedAt,
+            lastError: error.message || 'Erro no listener em tempo real do Firestore.',
+          };
           this.stopStaffFirestoreSync();
-          if (error.code === 'permission-denied') {
-            setTimeout(() => {
-              this.ensureFirebaseAuthForStaff().then(() => this.initStaffFirestoreSync()).catch(() => {});
-            }, 10000);
+          this.notify('FIRESTORE_SYNC_ERROR', { error: error.message });
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_SYNC_ERROR' } }));
           }
+          // Reschedule resilient reconnect on ANY transient or permission error
+          if (this.staffSyncRetryTimer) {
+            clearTimeout(this.staffSyncRetryTimer);
+          }
+          this.staffSyncRetryTimer = setTimeout(() => {
+            this.staffSyncRetryTimer = null;
+            if (error.code === 'permission-denied') {
+              this.ensureFirebaseAuthForStaff().then(() => this.initStaffFirestoreSync()).catch(() => {});
+            } else {
+              this.initStaffFirestoreSync().catch(() => {});
+            }
+          }, 5000);
         }
       );
       this.staffUnsubscribers.push(unsubOrders);
 
-      // 2. Synchronize Cash Register Shifts in Real Time (Restricted to roles authorized for cash)
+      // 2. Synchronize Cash Register Shifts in Real Time
       if (canAccessCash) {
         const unsubShifts = onSnapshot(
           collection(db, 'cash_shifts'),
@@ -1395,12 +2239,25 @@ class StoreService {
               shifts.push(docSnap.data() as CashRegisterShift);
             });
 
-            // Detect active open shift
-            const openShift = shifts.find((s) => s.status === 'ABERTO') || null;
+            // Detect active open shifts deterministically and flag multiple open shifts
+            const openShifts = shifts
+              .filter((s) => s.status === 'ABERTO')
+              .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime());
+            if (openShifts.length > 1) {
+              console.warn(`[Firestore Staff Sync] ALERTA: Existem ${openShifts.length} turnos de caixa ABERTO simultaneamente.`);
+              try {
+                localStorage.setItem('gf_multiple_open_shifts_count', String(openShifts.length));
+              } catch {}
+            } else {
+              try {
+                localStorage.removeItem('gf_multiple_open_shifts_count');
+              } catch {}
+            }
+            const openShift = openShifts[0] || null;
             if (openShift) {
               localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
             } else {
-              localStorage.removeItem('gf_current_cash_shift');
+              localStorage.setItem('gf_current_cash_shift', 'null');
             }
 
             // Detect closed shift history
@@ -1415,12 +2272,82 @@ class StoreService {
           },
           (error) => {
             console.warn('[Firestore Staff Sync] Cash shift notice:', error.message);
-            if (error.code === 'permission-denied') {
-              this.stopStaffFirestoreSync();
-            }
           }
         );
         this.staffUnsubscribers.push(unsubShifts);
+      } else if (role === 'ATENDENTE') {
+        // ATENDENTE can strictly observe ONLY active ABERTO shift (zero access to closed shifts/history)
+        const openShiftsQuery = query(collection(db, 'cash_shifts'), where('status', '==', 'ABERTO'));
+        const unsubOpenShift = onSnapshot(
+          openShiftsQuery,
+          (snapshot) => {
+            let openShift: CashRegisterShift | null = null;
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data() as CashRegisterShift;
+              if (data && data.status === 'ABERTO' && !openShift) {
+                openShift = data;
+              }
+            });
+            if (openShift) {
+              localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
+            } else {
+              localStorage.setItem('gf_current_cash_shift', 'null');
+            }
+            this.notify('CASH_SHIFT_UPDATED', openShift);
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Open shift notice (Atendente):', error.message);
+          }
+        );
+        this.staffUnsubscribers.push(unsubOpenShift);
+      }
+
+      // 2b. Synchronize Internal Config for Administrator (receipt footer, default driver, push flags)
+      if (role === 'ADMINISTRADOR') {
+        const unsubInternalConfig = onSnapshot(
+          doc(db, 'configs', 'internal'),
+          (docSnap) => {
+            if (docSnap.exists()) {
+              const remoteInternal = docSnap.data() as Partial<RestaurantConfig>;
+              const currentLocal = this.getRestaurantConfig();
+              const mergedConfig: RestaurantConfig = {
+                ...currentLocal,
+                ...remoteInternal,
+              };
+              localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+              this.notify('CONFIG_UPDATED', mergedConfig);
+            }
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Internal config notice:', error.message);
+          }
+        );
+        this.staffUnsubscribers.push(unsubInternalConfig);
+      }
+
+      // 2c. Synchronize Store Schedule & Closed Messages for Administrator & Gerente
+      if (role === 'ADMINISTRADOR' || role === 'GERENTE') {
+        const unsubScheduleConfig = onSnapshot(
+          doc(db, 'configs', 'store_schedule'),
+          (docSnap) => {
+            if (docSnap.exists()) {
+              const closedSettings = normalizeClosedSettings(docSnap.data() as Partial<StoreClosedSettings>);
+              const currentLocal = this.getRestaurantConfig();
+              const mergedConfig: RestaurantConfig = {
+                ...currentLocal,
+                operatingHours: closedSettings.operatingHours,
+                closedPrimaryMessage: closedSettings.closedPrimaryMessage,
+                closedSecondaryMessage: closedSettings.closedSecondaryMessage,
+              };
+              localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+              this.notify('CONFIG_UPDATED', mergedConfig);
+            }
+          },
+          (error) => {
+            console.warn('[Firestore Staff Sync] Store schedule notice:', error.message);
+          }
+        );
+        this.staffUnsubscribers.push(unsubScheduleConfig);
       }
 
       // 3. Synchronize Staff Users in Real Time (Restricted to Administrator & Management)
@@ -1429,7 +2356,7 @@ class StoreService {
           collection(db, 'users'),
           (snapshot) => {
             if (!snapshot.empty) {
-              const remoteUsers: User[] = [];
+              const rawRemoteUsers: User[] = [];
               snapshot.forEach((docSnap) => {
                 const data = docSnap.data() as Partial<User>;
                 if (data) {
@@ -1445,13 +2372,43 @@ class StoreService {
                     phone: data.phone || '',
                     lastLoginAt: data.lastLoginAt,
                     createdAt: data.createdAt || new Date().toISOString(),
+                    authProvider: data.authProvider,
+                    firebaseUid: data.firebaseUid || (docSnap.id && !docSnap.id.startsWith('user-') && !docSnap.id.startsWith('usr-') ? docSnap.id : undefined),
                   };
-                  remoteUsers.push(sanitizedUser);
+                  rawRemoteUsers.push(sanitizedUser);
                 }
               });
 
+              // Deduplicate remote users preferring real Firebase UID documents over legacy placeholder IDs
+              const dedupedRemote: User[] = [];
+              const findMatchIdx = (candidate: User) => {
+                const cUser = (candidate.username || '').trim().toLowerCase();
+                const cEmail = (candidate.email || '').trim().toLowerCase();
+                return dedupedRemote.findIndex((existing) => {
+                  if (existing.id === candidate.id) return true;
+                  const eEmail = (existing.email || '').trim().toLowerCase();
+                  if (cEmail && eEmail && cEmail === eEmail) return true;
+                  const eUser = (existing.username || '').trim().toLowerCase();
+                  if (cUser && eUser && cUser === eUser) return true;
+                  return false;
+                });
+              };
+              const isRealUid = (id: string) => Boolean(id && !id.startsWith('user-') && !id.startsWith('usr-'));
+
+              for (const ru of rawRemoteUsers) {
+                const idx = findMatchIdx(ru);
+                if (idx === -1) {
+                  dedupedRemote.push(ru);
+                } else {
+                  const existing = dedupedRemote[idx];
+                  if (isRealUid(ru.id) && !isRealUid(existing.id)) {
+                    dedupedRemote[idx] = ru;
+                  }
+                }
+              }
+
               const localUsers = this.getUsers();
-              const merged = [...remoteUsers];
+              const merged = [...dedupedRemote];
               for (const lu of localUsers) {
                 const luUser = (lu.username || '').trim().toLowerCase();
                 const luEmail = (lu.email || '').trim().toLowerCase();
@@ -1474,9 +2431,6 @@ class StoreService {
           },
           (error) => {
             console.warn('[Firestore Staff Sync] Users listener notice:', error.message);
-            if (error.code === 'permission-denied') {
-              this.stopStaffFirestoreSync();
-            }
           }
         );
         this.staffUnsubscribers.push(unsubUsers);
@@ -1668,7 +2622,234 @@ class StoreService {
     return { inspected, costsPreserved, sanitized, errors };
   }
 
+  public reconcileRemoteOrders(
+    remoteOrders: Order[],
+    options: { authoritative: boolean }
+  ): { count: number; updated: number; removed: number } {
+    const deletedIds = this.getDeletedOrderIds();
+    const syncedIds = this.getSyncedOrderIds();
+
+    // Discard remote orders that were deleted locally (tombstones) and trigger remote cleanup if needed
+    const activeRemoteOrders: Order[] = [];
+    for (const ro of remoteOrders) {
+      if (deletedIds.has(ro.id)) {
+        if (db) {
+          deleteDoc(doc(db, 'orders', ro.id)).catch(() => {});
+          if (ro.trackingCode) {
+            deleteDoc(doc(db, 'public_tracking', ro.trackingCode)).catch(() => {});
+          }
+        }
+      } else {
+        activeRemoteOrders.push(ro);
+      }
+    }
+
+    activeRemoteOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    this.recordSyncedOrderIds(activeRemoteOrders.map((o) => o.id));
+
+    const localOrders = this.getOrders().filter((lo) => !deletedIds.has(lo.id));
+    const localIds = new Set(localOrders.map((o) => o.id));
+    const newIncoming = activeRemoteOrders.filter((ro) => !localIds.has(ro.id) && ro.status === 'NOVO');
+
+    if (newIncoming.length > 0) {
+      newIncoming.forEach((o) => this.recordUnseenCustomerOrder(o.id));
+      const activeUser = this.getCurrentUser();
+      if (activeUser && this.isOrderPrepStaffRole(activeUser.role)) {
+        soundService.startPersistentOrderAlert(3500);
+      }
+
+      try {
+        const printerCfg = thermalPrinterService.getConfig();
+        if (printerCfg.enabled && printerCfg.autoPrintPickup) {
+          newIncoming.forEach((o) => {
+            if (o.fulfillmentType === 'RETIRADA' && !thermalPrinterService.hasOrderBeenPrinted(o.id)) {
+              thermalPrinterService.printOrder(o).catch((err) => {
+                console.info('[Impressora Térmica 58mm] Aviso ao auto-imprimir pedido:', err);
+              });
+            }
+          });
+        }
+      } catch {
+        // Non-blocking
+      }
+    }
+
+    const newlyReadyDeliveries = activeRemoteOrders.filter((ro) => {
+      if (ro.status !== 'PRONTO' || ro.fulfillmentType !== 'DELIVERY') return false;
+      const prev = localOrders.find((lo) => lo.id === ro.id);
+      return !prev || prev.status !== 'PRONTO';
+    });
+
+    if (newlyReadyDeliveries.length > 0) {
+      newlyReadyDeliveries.forEach((o) => this.recordDriverReadyOrder(o.id));
+      const activeUser = this.getCurrentUser();
+      const relevantReady = newlyReadyDeliveries.find((o) => this.isDriverAssignedToOrder(o, activeUser));
+      if (activeUser && relevantReady) {
+        soundService.startDriverReadyAlert(3500, 4, relevantReady.id);
+      }
+      this.notify('DRIVER_ORDER_READY', newlyReadyDeliveries);
+    }
+
+    const pendingOrders = this.getPendingSyncOrders();
+    const pendingIds = new Set(pendingOrders.map((o) => o.id));
+    const remoteMap = new Map(activeRemoteOrders.map((o) => [o.id, o]));
+
+    const STATUS_PRECEDENCE: Record<string, number> = {
+      NOVO: 1,
+      EM_PREPARO: 2,
+      PRONTO: 3,
+      EM_ROTA: 4,
+      ENTREGUE: 5,
+      CANCELADO: 6,
+    };
+
+    const merged: Order[] = [];
+    let updatedCount = 0;
+    let removedCount = 0;
+
+    for (const lo of localOrders) {
+      const ro = remoteMap.get(lo.id);
+      if (!ro) {
+        // Missing in Firestore: if this snapshot is authoritative from server AND either
+        // the order was previously synced OR is not an unuploaded offline creation, it was deleted remotely.
+        const isUnuploadedOfflineCreation = pendingIds.has(lo.id) && !syncedIds.has(lo.id);
+        if (options.authoritative && !isUnuploadedOfflineCreation) {
+          this.recordDeletedOrderId(lo.id);
+          this.removeOrderFromSyncQueue(lo.id);
+          this.removeSyncedOrderId(lo.id);
+          removedCount++;
+        } else {
+          merged.push(lo);
+        }
+      } else {
+        remoteMap.delete(lo.id);
+
+        const roRank = STATUS_PRECEDENCE[ro.status] || 0;
+        const loRank = STATUS_PRECEDENCE[lo.status] || 0;
+        const roTime = ro.updatedAt ? new Date(ro.updatedAt).getTime() : 0;
+        const loTime = lo.updatedAt ? new Date(lo.updatedAt).getTime() : 0;
+        const roMovesCount = ro.movements?.length || 0;
+        const loMovesCount = lo.movements?.length || 0;
+
+        const isLocalPendingAhead =
+          pendingIds.has(lo.id) &&
+          (loRank > roRank || (loRank === roRank && loTime > roTime));
+
+        if (isLocalPendingAhead) {
+          merged.push(lo);
+        } else {
+          if (
+            ro.status !== lo.status ||
+            ro.updatedAt !== lo.updatedAt ||
+            ro.deliveryPersonId !== lo.deliveryPersonId ||
+            ro.paymentStatus !== lo.paymentStatus
+          ) {
+            updatedCount++;
+          }
+          this.removeOrderFromSyncQueue(lo.id);
+          merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+        }
+      }
+    }
+
+    for (const ro of remoteMap.values()) {
+      if (!deletedIds.has(ro.id)) {
+        merged.push({ ...ro, _cloudSyncStatus: 'SYNCED' });
+        updatedCount++;
+      }
+    }
+
+    merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    try {
+      localStorage.setItem('gf_orders', JSON.stringify(merged));
+    } catch {}
+
+    return { count: merged.length, updated: updatedCount, removed: removedCount };
+  }
+
+  /**
+   * Manual order refresh: fetches authoritative orders from Firestore server
+   * WITHOUT destroying real-time onSnapshot listeners, preserving unsynced local creations
+   * and removing remotely deleted orders.
+   */
+  public async refreshOrdersFromFirestore(): Promise<{
+    success: boolean;
+    count: number;
+    updated: number;
+    removed: number;
+    message: string;
+    error?: string;
+  }> {
+    if (!db) {
+      const msg = 'Cloud Firestore não configurado neste ambiente.';
+      return { success: false, count: this.getOrders().length, updated: 0, removed: 0, message: msg, error: msg };
+    }
+
+    try {
+      if (!auth?.currentUser) {
+        await this.ensureFirebaseAuthForStaff();
+      }
+
+      await this.syncTombstonesFromServer();
+      await this.flushPendingSyncQueue();
+
+      const snapshot = await getDocsFromServer(collection(db, 'orders'));
+      const remoteOrders: Order[] = [];
+      snapshot.forEach((docSnap) => {
+        remoteOrders.push(docSnap.data() as Order);
+      });
+
+      const summary = this.reconcileRemoteOrders(remoteOrders, { authoritative: true });
+      this.cloudSyncState = {
+        status: 'CONNECTED',
+        lastSyncedAt: new Date().toISOString(),
+        lastError: null,
+      };
+
+      // Restart real-time listener in background ONLY if it was stopped due to prior error
+      if (!this.isStaffSyncActive) {
+        this.initStaffFirestoreSync().catch(() => {});
+      }
+
+      this.notify('FIRESTORE_ORDERS_SYNCED', { count: summary.count, manualRefresh: true });
+      this.notify('ORDERS_UPDATED', { count: summary.count, manualRefresh: true });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'MANUAL_ORDERS_REFRESH' } }));
+      }
+
+      return {
+        success: true,
+        count: summary.count,
+        updated: summary.updated,
+        removed: summary.removed,
+        message:
+          summary.updated > 0 || summary.removed > 0
+            ? `Pedidos atualizados do servidor (${summary.updated} atualizado(s), ${summary.removed} removido(s)).`
+            : `Pedidos sincronizados com o servidor (${summary.count} registro(s)).`,
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.cloudSyncState = {
+        status: 'ERROR',
+        lastSyncedAt: this.cloudSyncState.lastSyncedAt,
+        lastError: msg,
+      };
+      return {
+        success: false,
+        count: this.getOrders().length,
+        updated: 0,
+        removed: 0,
+        message: `Falha ao atualizar pedidos do servidor: ${msg}`,
+        error: msg,
+      };
+    }
+  }
+
   public stopStaffFirestoreSync(): void {
+    if (this.staffSyncRetryTimer) {
+      clearTimeout(this.staffSyncRetryTimer);
+      this.staffSyncRetryTimer = null;
+    }
     this.staffUnsubscribers.forEach((unsub) => unsub());
     this.staffUnsubscribers = [];
     this.isStaffSyncActive = false;
@@ -1987,33 +3168,63 @@ class StoreService {
     return orders.find((o) => o.id === id || o.orderNumber.replace('#', '') === id.replace('#', ''));
   }
 
-  public createOrder(
-    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & { status?: OrderStatus },
-    autoPersist = true
+  private buildSanitizedOrderObject(
+    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & {
+      id?: string;
+      orderNumber?: string;
+      trackingCode?: string;
+      status?: OrderStatus;
+      pixDescription?: string;
+    }
   ): Order {
     const orders = this.getOrders();
-    const nextNumber = 1000 + orders.length + 1;
+    const maxOrderNum = orders.reduce((max, o) => {
+      const parsed = parseInt((o.orderNumber || '').replace(/\D/g, ''), 10);
+      return Number.isFinite(parsed) && parsed > max ? parsed : max;
+    }, 1000);
+    const nextNumber = maxOrderNum + 1;
     const now = new Date().toISOString();
-    const orderId = `ord-${Date.now()}`;
+    const orderId =
+      orderInput.id && /^[a-zA-Z0-9_\-]+$/.test(orderInput.id)
+        ? orderInput.id
+        : `ord-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const resolvedOrderNumber =
+      orderInput.orderNumber && /^#\d+$/.test(orderInput.orderNumber.trim())
+        ? orderInput.orderNumber.trim()
+        : `#${nextNumber}`;
 
-    const isRetirada = orderInput.fulfillmentType === 'RETIRADA';
-    const effectiveDeliveryFee = isRetirada ? 0 : orderInput.deliveryFee;
-    const effectiveTotal = orderInput.subtotal + effectiveDeliveryFee - (orderInput.discount || 0);
+    const { pixDescription, id: _ignoredId, orderNumber: _ignoredNum, trackingCode: _ignoredTk, ...cleanOrderInput } = orderInput;
+    const isRetirada = cleanOrderInput.fulfillmentType === 'RETIRADA';
+    const roundedItems = (cleanOrderInput.items || []).map((it) => ({
+      ...it,
+      unitPrice: roundCurrency(it.unitPrice),
+      subtotal: roundCurrency(it.subtotal),
+    }));
+    const roundedSubtotal = roundCurrency(cleanOrderInput.subtotal);
+    const effectiveDeliveryFee = isRetirada ? 0 : roundCurrency(cleanOrderInput.deliveryFee);
+    const effectiveDiscount = roundCurrency(cleanOrderInput.discount || 0);
+    const effectiveTotal = Math.max(0, roundCurrency(roundedSubtotal + effectiveDeliveryFee - effectiveDiscount));
 
     // Cryptographic unguessable high-entropy tracking code (protects customer privacy against ID guessing)
-    const trackingCode = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID().replace(/-/g, '')
-      : `tk_${Date.now()}_${Math.random().toString(36).substring(2, 12)}`;
+    const trackingCode =
+      orderInput.trackingCode && /^[a-zA-Z0-9_\-]+$/.test(orderInput.trackingCode) && orderInput.trackingCode.length >= 20
+        ? orderInput.trackingCode
+        : typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID().replace(/-/g, '')
+        : `tk_${Date.now()}_${Math.random().toString(36).substring(2, 12)}_${Math.random().toString(36).substring(2, 8)}`;
 
-    // Automated driver assignment rule:
-    // 1. Exactly 1 active driver: automatically assigns the order to this driver without requiring admin action.
-    // 2. Two or more active drivers: remains unassigned for the administrator to choose.
-    // 3. Zero active drivers: remains unassigned with clear alert for the administration.
     const cfg = this.getRestaurantConfig();
     let assignedDriver: { id: string; name: string; phone: string } | undefined = undefined;
     let initialAssignmentHistory: any[] | undefined = undefined;
 
-    if (!isRetirada) {
+    const activeStaffCaller = this.getCurrentUser();
+    const isStaffOrderCreator = Boolean(
+      activeStaffCaller &&
+        this.isAuthorizedStaffRole(activeStaffCaller.role) &&
+        !this.isPublicCustomerContext()
+    );
+
+    if (!isRetirada && isStaffOrderCreator) {
       const activeDrivers = this.getActiveDeliveryDrivers();
       if (activeDrivers.length === 1) {
         const soleDriver = activeDrivers[0];
@@ -2033,7 +3244,6 @@ class StoreService {
           }
         ];
       } else if (cfg.defaultDeliveryPersonId && activeDrivers.length > 1) {
-        // Fallback to configured default only if that driver is confirmed active among the multiple drivers
         const driver = activeDrivers.find((u) => u.id === cfg.defaultDeliveryPersonId);
         if (driver) {
           const dName = driver.name || driver.username;
@@ -2055,14 +3265,17 @@ class StoreService {
     }
 
     const newOrder: Order = {
-      ...orderInput,
+      ...cleanOrderInput,
+      items: roundedItems,
       id: orderId,
-      orderNumber: `#${nextNumber}`,
+      orderNumber: resolvedOrderNumber,
       createdAt: now,
       updatedAt: now,
+      subtotal: roundedSubtotal,
       deliveryFee: effectiveDeliveryFee,
+      discount: effectiveDiscount,
       totalAmount: effectiveTotal,
-      status: orderInput.status || 'NOVO',
+      status: cleanOrderInput.status || 'NOVO',
       deliveryPersonId: assignedDriver?.id,
       deliveryPersonName: assignedDriver?.name,
       deliveryPerson: assignedDriver,
@@ -2073,8 +3286,8 @@ class StoreService {
         {
           id: `mov-${Date.now()}`,
           timestamp: now,
-          toStatus: orderInput.status || 'NOVO',
-          author: orderInput.createdBy || (isRetirada ? 'Balcão' : 'Cliente via Cardápio Web'),
+          toStatus: cleanOrderInput.status || 'NOVO',
+          author: cleanOrderInput.createdBy || (isRetirada ? 'Balcão' : 'Cliente via Cardápio Web'),
           notes: isRetirada 
             ? 'Pedido para retirada no balcão' 
             : (assignedDriver ? `Pedido delivery atribuído a ${assignedDriver.name}` : 'Pedido delivery aguardando atribuição de entregador'),
@@ -2082,26 +3295,95 @@ class StoreService {
       ]
     };
 
-    // Save tracking code in client browser session so creator can always track their order
-    this.saveClientTrackingCode(newOrder.id, trackingCode);
-
-    // If payment method is PIX, generate official PIX payload with exact purchase amount
     if (newOrder.paymentMethod === 'PIX') {
-      if (cfg.pixKey) {
-        try {
-          newOrder.pixCode = generatePixCopiaECola({
-            pixKey: cfg.pixKey,
-            keyType: cfg.pixKeyType,
-            receiverName: cfg.pixReceiverName || cfg.name,
-            receiverCity: cfg.pixReceiverCity || 'CAMPINA GRANDE',
-            amount: newOrder.totalAmount,
-            txId: newOrder.orderNumber.replace(/[^a-zA-Z0-9]/g, ''),
-            description: `Pedido ${newOrder.orderNumber}`
-          });
-        } catch {
-          newOrder.pixCode = cfg.pixKey;
+      let reusedValidPreview = false;
+      if (cleanOrderInput.pixCode && cleanOrderInput.pixTxId && cfg.pixKey) {
+        const previewAudit = validatePixPayload(cleanOrderInput.pixCode);
+        const keyCheck = cfg.pixKeyType ? validatePixKey(cfg.pixKey, cfg.pixKeyType) : null;
+        const expectedNormalizedKey = keyCheck?.valid ? keyCheck.normalized : undefined;
+        const previewAmount = roundCurrency(parseFloat(previewAudit.amount || '0'));
+        if (
+          previewAudit.valid &&
+          previewAudit.txId === cleanOrderInput.pixTxId &&
+          (!expectedNormalizedKey || previewAudit.pixKey === expectedNormalizedKey) &&
+          previewAmount === effectiveTotal
+        ) {
+          newOrder.pixCode = cleanOrderInput.pixCode;
+          newOrder.pixTxId = cleanOrderInput.pixTxId;
+          reusedValidPreview = true;
         }
       }
+
+      if (!reusedValidPreview) {
+        const txId = cleanOrderInput.pixTxId || generateOrderPixTxId(newOrder.orderNumber, newOrder.id);
+        const pixResult = generatePurchasePixPayload({
+          pixKey: cfg.pixKey,
+          keyType: cfg.pixKeyType,
+          receiverName: cfg.pixReceiverName,
+          receiverCity: cfg.pixReceiverCity,
+          storeName: cfg.name,
+          amount: newOrder.totalAmount,
+          txId,
+          orderNumber: newOrder.orderNumber,
+          orderId: newOrder.id,
+          description: pixDescription || `Pedido ${newOrder.orderNumber}`,
+        });
+        if (pixResult.success) {
+          newOrder.pixCode = pixResult.payload;
+          newOrder.pixTxId = pixResult.txId;
+        } else {
+          delete newOrder.pixCode;
+          delete newOrder.pixTxId;
+        }
+      }
+    }
+
+    return newOrder;
+  }
+
+  private commitConfirmedServerOrderAndShift(confirmedOrder: Order, confirmedShift?: CashRegisterShift | null): Order {
+    const syncedOrder: Order = { ...confirmedOrder, _cloudSyncStatus: 'SYNCED' };
+    const orders = this.getOrders();
+    const idx = orders.findIndex((o) => o.id === syncedOrder.id);
+    if (idx >= 0) {
+      orders[idx] = syncedOrder;
+    } else {
+      orders.unshift(syncedOrder);
+    }
+    try {
+      localStorage.setItem('gf_orders', JSON.stringify(orders));
+    } catch {}
+
+    if (syncedOrder.trackingCode) {
+      this.saveClientTrackingCode(syncedOrder.id, syncedOrder.trackingCode);
+    }
+    this.removeOrderFromSyncQueue(syncedOrder.id);
+    this.recordSyncedOrderId(syncedOrder.id);
+
+    if (confirmedShift) {
+      try {
+        localStorage.setItem('gf_current_cash_shift', JSON.stringify(confirmedShift));
+      } catch {}
+      this.notify('CASH_SHIFT_UPDATED', confirmedShift);
+    }
+
+    return syncedOrder;
+  }
+
+  public createOrder(
+    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & {
+      id?: string;
+      status?: OrderStatus;
+      pixDescription?: string;
+    },
+    autoPersist = true
+  ): Order {
+    const orders = this.getOrders();
+    const newOrder = this.buildSanitizedOrderObject(orderInput);
+
+    // Save tracking code in client browser session so creator can always track their order
+    if (newOrder.trackingCode) {
+      this.saveClientTrackingCode(newOrder.id, newOrder.trackingCode);
     }
 
     const updated = [newOrder, ...orders];
@@ -2140,8 +3422,50 @@ class StoreService {
   }
 
   public async createOrderAsync(
-    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & { status?: OrderStatus }
-  ): Promise<{ order: Order; synced: boolean; error?: string }> {
+    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & {
+      id?: string;
+      orderNumber?: string;
+      trackingCode?: string;
+      status?: OrderStatus;
+      pixDescription?: string;
+    },
+    options?: { requireServerConfirmation?: boolean; publicMenuOrder?: boolean; timeoutMs?: number }
+  ): Promise<{ order: Order; synced: boolean; isStoreClosed?: boolean; rejected?: boolean; recoveredFromTimeout?: boolean; error?: string }> {
+    const isPublicOrder = Boolean(options?.publicMenuOrder || this.isPublicCustomerContext());
+    if (options?.requireServerConfirmation || isPublicOrder) {
+      const draft = this.buildSanitizedOrderObject(orderInput);
+      const res = await this.persistOrderToFirestore(draft, {
+        requireServerConfirmation: true,
+        publicMenuOrder: isPublicOrder,
+        timeoutMs: options?.timeoutMs,
+      });
+      if (!res.success) {
+        this.removeOrderFromSyncQueue(draft.id);
+        return {
+          order: draft,
+          synced: false,
+          ...(res.rejected ? { rejected: true } : {}),
+          ...(res.isStoreClosed ? { isStoreClosed: true } : {}),
+          error: res.error || 'Não foi possível confirmar a gravação do pedido no servidor.',
+        };
+      }
+      const committed = this.commitConfirmedServerOrderAndShift(res.serverOrder || draft);
+      const activeStaffUser = this.getCurrentUser();
+      if (!this.isPublicCustomerContext() && activeStaffUser && this.isOrderPrepStaffRole(activeStaffUser.role)) {
+        soundService.playNewOrderAlert();
+      }
+      this.notify('ORDER_CREATED', committed);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_CREATED', payload: committed } }));
+      }
+      this.dispatchOrderPushNotification(committed, 'NEW_ORDER');
+      return {
+        order: committed,
+        synced: true,
+        ...(res.recoveredFromTimeout ? { recoveredFromTimeout: true } : {}),
+      };
+    }
+
     const order = this.createOrder(orderInput, false);
     const res = await this.persistOrderToFirestore(order);
     this.dispatchOrderPushNotification(order, 'NEW_ORDER');
@@ -2150,6 +3474,322 @@ class StoreService {
       synced: res.success,
       error: res.error,
     };
+  }
+
+  public async createAndConfirmPaidOrderAsync(
+    orderInput: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'movements' | 'status'> & {
+      id?: string;
+      status?: OrderStatus;
+      pixDescription?: string;
+    },
+    author = 'Caixa',
+    options?: { shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    order: Order | null;
+    shift?: CashRegisterShift | null;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    alreadyConfirmed?: boolean;
+    error?: string;
+  }> {
+    const currentUser = this.getCurrentUser();
+    if (!this.canUserConfirmPayments(currentUser)) {
+      return {
+        order: null,
+        synced: false,
+        rejected: true,
+        error: `Permissão insuficiente: perfil ${currentUser?.role || 'não autenticado'} não pode confirmar vendas pagas.`,
+      };
+    }
+
+    const draftOrder = this.buildSanitizedOrderObject({
+      ...orderInput,
+      paymentStatus: 'PAGO',
+    });
+
+    if (roundCurrency(draftOrder.totalAmount) <= 0) {
+      return {
+        order: null,
+        synced: false,
+        rejected: true,
+        error: 'Valor total da venda deve ser maior que zero.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const localShift = this.getCurrentCashShift();
+      if (!localShift || localShift.status !== 'ABERTO') {
+        return {
+          order: null,
+          synced: false,
+          rejected: true,
+          error: 'Nenhum turno de caixa aberto para registrar a venda.',
+        };
+      }
+      const movementId = `cash-sale-${draftOrder.id}`;
+      if (!localShift.movements.some((m: CashMovement) => m.orderId === draftOrder.id || m.id === movementId)) {
+        localShift.movements.push({
+          id: movementId,
+          timestamp: new Date().toISOString(),
+          type: 'VENDA',
+          amount: roundCurrency(draftOrder.totalAmount),
+          paymentMethod: draftOrder.paymentMethod,
+          description: `Recebimento Pedido ${draftOrder.orderNumber} - ${draftOrder.customer?.name || 'Cliente'}`.slice(0, 300),
+          orderId: draftOrder.id,
+          orderNumber: draftOrder.orderNumber,
+          author,
+        });
+      }
+      localStorage.setItem('gf_current_cash_shift', JSON.stringify(localShift));
+      const orders = this.getOrders();
+      localStorage.setItem('gf_orders', JSON.stringify([draftOrder, ...orders]));
+      if (draftOrder.trackingCode) {
+        this.saveClientTrackingCode(draftOrder.id, draftOrder.trackingCode);
+      }
+      this.notify('ORDER_CREATED', draftOrder);
+      this.notify('CASH_SHIFT_UPDATED', localShift);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_CREATED', payload: draftOrder } }));
+      }
+      return { order: draftOrder, shift: localShift, synced: false };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          order: null,
+          synced: false,
+          rejected: true,
+          error: 'Sessão Firebase não autenticada. Faça login novamente antes de finalizar a venda.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        order: null,
+        synced: false,
+        rejected: true,
+        error: 'Cliente HTTP indisponível para confirmar venda atômica no servidor.',
+      };
+    }
+
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = `pay:${draftOrder.id}`;
+
+    if (this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultOrderPaymentState(draftOrder.id, authHeaders);
+      if (
+        preState.verified &&
+        preState.data?.exists &&
+        preState.data?.paymentStatus === 'PAGO' &&
+        preState.data?.cashRecorded &&
+        preState.data?.order
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const recovered = this.commitConfirmedServerOrderAndShift(
+          preState.data.order as Order,
+          (preState.data.shift as CashRegisterShift) || null
+        );
+        this.notify('ORDER_CREATED', recovered);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_CREATED', payload: recovered } }));
+        }
+        return {
+          order: recovered,
+          shift: (preState.data.shift as CashRegisterShift) || this.getCurrentCashShift(),
+          synced: true,
+          recoveredFromTimeout: true,
+        };
+      }
+      if (preState.verified && (!preState.data?.exists || preState.data?.paymentStatus !== 'PAGO')) {
+        this.uncertainServerOps.delete(opKey);
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            order: null,
+            synced: false,
+            rejected: true,
+            error:
+              'Não foi possível confirmar a venda paga: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          order: null,
+          synced: false,
+          uncertain: true,
+          error:
+            'Não foi possível verificar o estado anterior desta venda no servidor. A operação não foi repetida automaticamente para evitar duplicidade.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverFromPaymentState = async () => {
+      const state = await this.consultOrderPaymentState(draftOrder.id, authHeaders);
+      if (
+        state.verified &&
+        state.data?.exists &&
+        state.data?.paymentStatus === 'PAGO' &&
+        state.data?.cashRecorded &&
+        state.data?.order
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const recovered = this.commitConfirmedServerOrderAndShift(
+          state.data.order as Order,
+          (state.data.shift as CashRegisterShift) || null
+        );
+        this.notify('ORDER_CREATED', recovered);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_CREATED', payload: recovered } }));
+        }
+        return {
+          status: 'recovered' as const,
+          result: {
+            order: recovered,
+            shift: (state.data.shift as CashRegisterShift) || this.getCurrentCashShift(),
+            synced: true,
+            recoveredFromTimeout: true,
+          },
+        };
+      }
+      if (state.verified && (!state.data?.exists || state.data?.paymentStatus !== 'PAGO')) {
+        this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(`/api/orders/${encodeURIComponent(draftOrder.id)}/confirm-payment`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          newOrder: this.cleanForFirestore(draftOrder),
+          author,
+          shiftId: options?.shiftId || this.getCurrentCashShift()?.id,
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.order &&
+        data.order.id &&
+        data.order.paymentStatus === 'PAGO'
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const committed = this.commitConfirmedServerOrderAndShift(
+          data.order as Order,
+          (data.shift as CashRegisterShift) || null
+        );
+        if (!data.alreadyConfirmed) {
+          const activeStaffUser = this.getCurrentUser();
+          if (!this.isPublicCustomerContext() && activeStaffUser && this.isOrderPrepStaffRole(activeStaffUser.role)) {
+            soundService.playNewOrderAlert();
+          }
+          this.notify('ORDER_CREATED', committed);
+          this.dispatchOrderPushNotification(committed, 'NEW_ORDER');
+        } else {
+          this.notify('ORDER_UPDATED', committed);
+        }
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_CREATED', payload: committed } }));
+        }
+        return {
+          order: committed,
+          shift: (data.shift as CashRegisterShift) || this.getCurrentCashShift(),
+          synced: true,
+          alreadyConfirmed: Boolean(data.alreadyConfirmed),
+        };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'o registro da venda paga');
+      if (resolution.kind === 'rejected') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          order: null,
+          synced: false,
+          rejected: true,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverFromPaymentState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          order: null,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          error: resolution.nonCommittedError,
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        order: null,
+        synced: false,
+        rejected: false,
+        uncertain: true,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverFromPaymentState();
+      if (rec.status === 'recovered') return rec.result;
+
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+      if (rec.status === 'not_committed') {
+        return {
+          order: null,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          error: isTimeout
+            ? 'Tempo esgotado ao registrar a venda; consulta ao servidor confirmou que a venda não foi gravada.'
+            : 'Falha de conexão ao registrar a venda; consulta ao servidor confirmou que a venda não foi gravada.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          order: null,
+          synced: false,
+          rejected: true,
+          error:
+            'Não foi possível confirmar a venda paga: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        order: null,
+        synced: false,
+        rejected: false,
+        uncertain: true,
+        error: isTimeout
+          ? 'Tempo esgotado ao registrar a venda no servidor e o resultado permanece desconhecido. Antes de reenviar, o sistema consultará o estado do pedido.'
+          : 'Falha de comunicação com o servidor ao registrar a venda e não foi possível confirmar o resultado. O carrinho foi mantido sem alterações.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -2176,13 +3816,24 @@ class StoreService {
       return;
     }
 
-    fetch('/api/push/notify-order', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ order, event }),
-    }).catch((err) => {
-      console.warn('[Web Push Dispatch Notice]:', err?.message || err);
-    });
+    (async () => {
+      try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (auth?.currentUser) {
+          const idToken = await auth.currentUser.getIdToken().catch(() => null);
+          if (idToken) {
+            headers['Authorization'] = `Bearer ${idToken}`;
+          }
+        }
+        await fetch('/api/push/notify-order', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ order, event }),
+        });
+      } catch (err: any) {
+        console.warn('[Web Push Dispatch Notice]:', err?.message || err);
+      }
+    })();
   }
 
   // ==========================================
@@ -2570,12 +4221,18 @@ class StoreService {
   }
 
   public updateOrderStatus(
-    orderId: string, 
-    newStatus: OrderStatus, 
-    author: string, 
-    notes?: string, 
-    autoPersist = true
+    orderId: string,
+    newStatus: OrderStatus,
+    author: string,
+    notes?: string,
+    autoPersist = true,
+    options?: { suppressSound?: boolean }
   ): Order | null {
+    if (newStatus === 'CANCELADO') {
+      console.warn('[Security Guard] Cancelamento de pedidos deve usar exclusivamente cancelOrderAsync() (/api/orders/:id/cancel).');
+      return null;
+    }
+
     const currentUser = this.getCurrentUser();
     if (currentUser && !this.canUserUpdateOrderStatus(currentUser, newStatus)) {
       console.warn(`[Security Guard] Usuário @${currentUser.username} (${currentUser.role}) não possui permissão para avançar pedido para ${newStatus}.`);
@@ -2584,7 +4241,7 @@ class StoreService {
 
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
-    if (!order) return null;
+    if (!order || order.status === 'CANCELADO') return null;
 
     const previousStatus = order.status;
     if (previousStatus === newStatus) return order;
@@ -2614,27 +4271,6 @@ class StoreService {
         order.deliveryPerson.deliveredAt = now;
         if (!order.deliveryPerson.name || order.deliveryPerson.name === 'Entregador de Plantão') {
           order.deliveryPerson.name = cleanDriverName;
-        }
-      }
-      // Record into open cash register ONLY if payment has already been confirmed as PAGO
-      if (order.paymentStatus === 'PAGO') {
-        const shift = this.getCurrentCashShift();
-        if (shift && shift.status === 'ABERTO') {
-          const alreadyExists = shift.movements.some((m: CashMovement) => m.orderId === order.id);
-          if (!alreadyExists) {
-            shift.movements.push({
-              id: `cash-sale-${order.id}`,
-              timestamp: now,
-              type: 'VENDA',
-              amount: order.totalAmount,
-              paymentMethod: order.paymentMethod,
-              description: `Venda Pedido ${order.orderNumber} - ${order.customer.name}`,
-              orderId: order.id,
-              orderNumber: order.orderNumber,
-              author: author,
-            });
-            this.saveCurrentCashShift(shift);
-          }
         }
       }
     } else if (newStatus === 'EM_ROTA') {
@@ -2671,25 +4307,25 @@ class StoreService {
     order._cloudSyncStatus = 'PENDING';
     localStorage.setItem('gf_orders', JSON.stringify(orders));
 
-    soundService.playSuccessTone();
+    if (!options?.suppressSound) {
+      soundService.playSuccessTone();
+    }
     this.notify('ORDER_UPDATED', order);
 
     // Queue for cloud sync and attempt immediate transmission to Cloud Firestore if autoPersist is true
     this.queueOrderForSync(order);
     if (autoPersist) {
-      this.persistOrderToFirestore(order).catch(() => {});
-    }
-
-    // Dispatch appropriate push & in-app alerts based on business events
-    if (newStatus === 'ENTREGUE') {
-      this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
-    } else if (newStatus === 'PRONTO' && order.fulfillmentType === 'DELIVERY') {
-      this.recordDriverReadyOrder(order.id);
-      this.dispatchOrderPushNotification(order, 'READY_FOR_DELIVERY');
-      this.notify('DRIVER_ORDER_READY', order);
-      const activeUser = this.getCurrentUser();
-      if (activeUser && this.isDriverAssignedToOrder(order, activeUser)) {
-        soundService.startDriverReadyAlert(3500, 4, order.id);
+      this.persistOrderToFirestore(order, { isStatusTransition: true }).catch(() => {});
+      if (newStatus === 'ENTREGUE') {
+        this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
+      } else if (newStatus === 'PRONTO' && order.fulfillmentType === 'DELIVERY') {
+        this.recordDriverReadyOrder(order.id);
+        this.dispatchOrderPushNotification(order, 'READY_FOR_DELIVERY');
+        this.notify('DRIVER_ORDER_READY', order);
+        const activeUser = this.getCurrentUser();
+        if (activeUser && this.isDriverAssignedToOrder(order, activeUser)) {
+          soundService.startDriverReadyAlert(3500, 4, order.id);
+        }
       }
     }
 
@@ -2697,61 +4333,421 @@ class StoreService {
   }
 
   public async updateOrderStatusAsync(
-    orderId: string, 
-    newStatus: OrderStatus, 
-    author = 'Operador', 
+    orderId: string,
+    newStatus: OrderStatus,
+    author = 'Operador',
     notes?: string
-  ): Promise<{ order: Order | null; synced: boolean; error?: string }> {
-    const order = this.updateOrderStatus(orderId, newStatus, author, notes, false);
-    if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
-    const res = await this.persistOrderToFirestore(order);
-    if (newStatus === 'ENTREGUE') {
-      this.dispatchOrderPushNotification(order, 'DELIVERY_CONFIRMED');
-    } else if (newStatus === 'PRONTO' && order.fulfillmentType === 'DELIVERY') {
-      this.dispatchOrderPushNotification(order, 'READY_FOR_DELIVERY');
+  ): Promise<{ order: Order | null; synced: boolean; rejected?: boolean; offlineQueued?: boolean; error?: string }> {
+    if (newStatus === 'CANCELADO') {
+      return {
+        order: this.getOrderById(orderId) || null,
+        synced: false,
+        rejected: true,
+        error: 'Cancelamento de pedidos deve ser executado exclusivamente pelo procedimento oficial cancelOrderAsync() (/api/orders/:id/cancel).',
+      };
     }
-    return { order, synced: res.success, error: res.error };
+
+    const currentUser = this.getCurrentUser();
+    if (currentUser && !this.canUserUpdateOrderStatus(currentUser, newStatus)) {
+      return {
+        order: this.getOrderById(orderId) || null,
+        synced: false,
+        rejected: true,
+        error: `Permissão insuficiente: perfil ${currentUser.role} não pode alterar pedido para ${newStatus}.`,
+      };
+    }
+
+    const previousOrder = this.getOrderById(orderId);
+    if (!previousOrder) {
+      return { order: null, synced: false, rejected: true, error: 'Pedido não encontrado.' };
+    }
+    if (previousOrder.status === newStatus) {
+      return { order: previousOrder, synced: previousOrder._cloudSyncStatus === 'SYNCED' };
+    }
+
+    await this.waitForFirebaseAuthReady();
+    if (isFirebaseReady() && !auth?.currentUser) {
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: true,
+        error: 'Sessão Firebase não autenticada. Faça login novamente com sua conta de colaborador antes de alterar o status.',
+      };
+    }
+
+    const previousOrdersSnapshot = localStorage.getItem('gf_orders');
+    const previousShiftSnapshot = localStorage.getItem('gf_current_cash_shift');
+
+    const order = this.updateOrderStatus(orderId, newStatus, author, notes, false, { suppressSound: true });
+    if (!order) {
+      return { order: null, synced: false, rejected: true, error: 'Não foi possível aplicar alteração de status.' };
+    }
+
+    const res = await this.persistOrderToFirestore(order, { isStatusTransition: true });
+
+    if (res.success) {
+      const confirmed = this.getOrderById(orderId) || order;
+      soundService.playSuccessTone();
+      this.notify('ORDER_UPDATED', confirmed);
+      if (newStatus === 'ENTREGUE') {
+        this.dispatchOrderPushNotification(confirmed, 'DELIVERY_CONFIRMED');
+      } else if (newStatus === 'PRONTO' && confirmed.fulfillmentType === 'DELIVERY') {
+        this.recordDriverReadyOrder(confirmed.id);
+        this.dispatchOrderPushNotification(confirmed, 'READY_FOR_DELIVERY');
+        this.notify('DRIVER_ORDER_READY', confirmed);
+        const activeUser = this.getCurrentUser();
+        if (activeUser && this.isDriverAssignedToOrder(confirmed, activeUser)) {
+          soundService.startDriverReadyAlert(3500, 4, confirmed.id);
+        }
+      }
+      return { order: confirmed, synced: true };
+    }
+
+    const isOffline = Boolean(res.offline) || this.isOfflineErrorMessage(res.error);
+    if (res.rejected || (isFirebaseReady() && !isOffline)) {
+      // Rollback local mutations on server/Firestore rejection
+      if (previousOrdersSnapshot !== null) {
+        localStorage.setItem('gf_orders', previousOrdersSnapshot);
+      }
+      if (previousShiftSnapshot !== null) {
+        localStorage.setItem('gf_current_cash_shift', previousShiftSnapshot);
+      } else {
+        localStorage.removeItem('gf_current_cash_shift');
+      }
+      this.removeOrderFromSyncQueue(orderId);
+      this.notify('ORDERS_UPDATED', { reason: 'ROLLBACK_STATUS_REJECTED', orderId });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDERS_UPDATED' } }));
+      }
+      return {
+        order: this.getOrderById(orderId) || previousOrder,
+        synced: false,
+        rejected: true,
+        error: res.error || 'Alteração recusada pelo servidor/Firestore.',
+      };
+    }
+
+    return {
+      order: this.getOrderById(orderId) || order,
+      synced: false,
+      offlineQueued: true,
+      error: res.error || 'Sem conexão com a internet: alteração salva na fila local.',
+    };
   }
 
-  public updatePaymentStatus(
-    orderId: string, 
-    newPaymentStatus: 'PAGO' | 'PENDENTE', 
-    author = 'Caixa', 
-    notes?: string
-  ): Order | null {
-    const orders = this.getOrders();
-    const order = orders.find((o) => o.id === orderId);
-    if (!order) return null;
+  public async recordOrderSaleMovementAsync(
+    order: Order,
+    author = 'Caixa'
+  ): Promise<{ success: boolean; rejected?: boolean; uncertain?: boolean; recoveredFromTimeout?: boolean; error?: string; shift?: CashRegisterShift | null }> {
+    const currentUser = this.getCurrentUser();
+    if (!this.canUserConfirmPayments(currentUser)) {
+      return {
+        success: false,
+        rejected: true,
+        error: 'Permissão insuficiente: perfil não autorizado a registrar recebimento de venda no caixa.',
+      };
+    }
 
-    const previousPaymentStatus = order.paymentStatus;
-    if (previousPaymentStatus === newPaymentStatus) return order;
+    if (order.status === 'CANCELADO') {
+      return {
+        success: false,
+        rejected: true,
+        error: 'Não é possível registrar recebimento de um pedido cancelado.',
+      };
+    }
 
-    const now = new Date().toISOString();
-    order.paymentStatus = newPaymentStatus;
-    order.updatedAt = now;
+    const roundedAmount = roundCurrency(order.totalAmount);
+    if (roundedAmount <= 0) {
+      return {
+        success: false,
+        rejected: true,
+        error: 'Valor do pedido inválido para registro financeiro.',
+      };
+    }
 
-    // If marked as PAGO, record sale in open cash register if not recorded yet
-    if (newPaymentStatus === 'PAGO') {
-      const shift = this.getCurrentCashShift();
-      if (shift && shift.status === 'ABERTO') {
-        const alreadyExists = shift.movements.some((m: CashMovement) => m.orderId === order.id);
-        if (!alreadyExists) {
-          shift.movements.push({
-            id: `cash-sale-${order.id}`,
-            timestamp: now,
-            type: 'VENDA',
-            amount: order.totalAmount,
-            paymentMethod: order.paymentMethod,
-            description: `Recebimento Pedido ${order.orderNumber} - ${order.customer.name}`,
-            orderId: order.id,
-            orderNumber: order.orderNumber,
-            author,
-          });
-          this.saveCurrentCashShift(shift);
+    if (this.shouldUseServerAtomicPayment()) {
+      if (isFirebaseReady()) {
+        await this.waitForFirebaseAuthReady();
+        if (!auth?.currentUser) {
+          return {
+            success: false,
+            rejected: true,
+            error: 'Sessão Firebase não autenticada. Faça login novamente antes de confirmar o pagamento.',
+          };
         }
+      }
+
+      if (typeof fetch !== 'function') {
+        return {
+          success: false,
+          rejected: true,
+          error: 'Comunicação HTTP indisponível para operação financeira atômica.',
+        };
+      }
+
+      const authHeaders = await this.getFirebaseAuthHeaders();
+      const opKey = `record-sale:${order.id}`;
+
+      if (this.uncertainServerOps.has(opKey)) {
+        const preState = await this.consultOrderPaymentState(order.id, authHeaders);
+        if (
+          preState.verified &&
+          preState.data?.exists &&
+          preState.data?.paymentStatus === 'PAGO' &&
+          preState.data?.cashRecorded
+        ) {
+          this.uncertainServerOps.delete(opKey);
+          if (preState.data.order) {
+            this.commitConfirmedServerOrderAndShift(
+              preState.data.order as Order,
+              (preState.data.shift as CashRegisterShift) || null
+            );
+          } else if (preState.data.shift) {
+            this.commitOpenShiftLocally(preState.data.shift as CashRegisterShift);
+          }
+          return {
+            success: true,
+            recoveredFromTimeout: true,
+            shift: (preState.data.shift as CashRegisterShift) || null,
+          };
+        }
+        if (preState.verified && (!preState.data?.exists || !preState.data?.cashRecorded)) {
+          this.uncertainServerOps.delete(opKey);
+        } else {
+          const health = await this.checkServerAdminSdkHealth();
+          if (health.reachable && health.hasAdminSdk === false) {
+            this.uncertainServerOps.delete(opKey);
+            return {
+              success: false,
+              rejected: true,
+              error:
+                'Não foi possível registrar a venda no caixa: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+            };
+          }
+          return {
+            success: false,
+            uncertain: true,
+            error:
+              'Não foi possível confirmar o estado anterior do recebimento no servidor. A operação não foi repetida automaticamente.',
+          };
+        }
+      }
+
+      const recoverSaleState = async () => {
+        const state = await this.consultOrderPaymentState(order.id, authHeaders);
+        if (state.verified && state.data?.exists && state.data?.paymentStatus === 'PAGO' && state.data?.cashRecorded) {
+          this.uncertainServerOps.delete(opKey);
+          if (state.data.order) {
+            this.commitConfirmedServerOrderAndShift(
+              state.data.order as Order,
+              (state.data.shift as CashRegisterShift) || null
+            );
+          } else if (state.data.shift) {
+            this.commitOpenShiftLocally(state.data.shift as CashRegisterShift);
+          }
+          return {
+            status: 'recovered' as const,
+            result: {
+              success: true,
+              recoveredFromTimeout: true,
+              shift: (state.data.shift as CashRegisterShift) || null,
+            },
+          };
+        }
+        if (state.verified && (!state.data?.exists || !state.data?.cashRecorded)) {
+          this.uncertainServerOps.delete(opKey);
+          return { status: 'not_committed' as const };
+        }
+        return { status: 'unknown' as const };
+      };
+
+      try {
+        const res = await fetch('/api/cash-shifts/record-sale', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            orderId: order.id,
+            shiftId: this.getCurrentCashShift()?.id,
+            author: String(author || currentUser?.name || currentUser?.username || 'Atendente').slice(0, 128),
+          }),
+        });
+        const parsed = await this.readServerJsonResponse(res);
+        const data = parsed.data;
+        if (
+          parsed.ok &&
+          !parsed.isHtml &&
+          parsed.isValidJson &&
+          data?.success === true &&
+          (Boolean(data?.order) || Boolean(data?.shift))
+        ) {
+          this.uncertainServerOps.delete(opKey);
+          if (data.order) {
+            this.commitConfirmedServerOrderAndShift(data.order as Order, (data.shift as CashRegisterShift) || null);
+          } else if (data.shift) {
+            localStorage.setItem('gf_current_cash_shift', JSON.stringify(data.shift));
+            this.notify('CASH_SHIFT_UPDATED', data.shift);
+          }
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'CASH_SHIFT_UPDATED' } }));
+          }
+          return { success: true, shift: (data.shift as CashRegisterShift) || null };
+        }
+
+        const resolution = await this.resolveFinancialHttpFailure(parsed, 'o registro da venda no caixa');
+        if (resolution.kind === 'rejected') {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            rejected: true,
+            error: resolution.error,
+          };
+        }
+
+        const rec = await recoverSaleState();
+        if (rec.status === 'recovered') return rec.result;
+        if (rec.status === 'not_committed') {
+          return {
+            success: false,
+            rejected: false,
+            uncertain: false,
+            error: resolution.nonCommittedError,
+          };
+        }
+
+        this.uncertainServerOps.set(opKey, Date.now());
+        return {
+          success: false,
+          uncertain: true,
+          error: resolution.uncertainError,
+        };
+      } catch (fetchErr: unknown) {
+        const rec = await recoverSaleState();
+        if (rec.status === 'recovered') return rec.result;
+        const isTimeout = this.isTimeoutFetchError(fetchErr);
+        if (rec.status === 'not_committed') {
+          return {
+            success: false,
+            rejected: false,
+            uncertain: false,
+            error: isTimeout
+              ? 'Tempo esgotado ao registrar venda no caixa; consulta ao servidor confirmou que o lançamento não foi gravado.'
+              : 'Falha de conexão ao registrar venda no caixa; consulta ao servidor confirmou que o lançamento não foi gravado.',
+          };
+        }
+
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            rejected: true,
+            error:
+              'Não foi possível registrar a venda no caixa: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+
+        this.uncertainServerOps.set(opKey, Date.now());
+        return {
+          success: false,
+          uncertain: true,
+          error: isTimeout
+            ? 'Tempo esgotado ao registrar venda atômica no servidor e não foi possível confirmar o resultado.'
+            : 'Falha de comunicação ao registrar venda atômica no servidor e não foi possível confirmar o resultado.',
+        };
       }
     }
 
+    // Local contingency mode (ONLY when Firebase is not configured)
+    const localShift = this.getCurrentCashShift();
+    if (!localShift || localShift.status !== 'ABERTO') {
+      return {
+        success: false,
+        rejected: true,
+        error: 'Nenhum turno de caixa aberto para registrar a movimentação financeira.',
+      };
+    }
+
+    const movementId = `cash-sale-${order.id}`;
+    const alreadyRecorded = localShift.movements.some(
+      (m: CashMovement) => m.type === 'VENDA' && (m.orderId === order.id || m.id === movementId)
+    );
+    if (!alreadyRecorded) {
+      localShift.movements.push({
+        id: movementId,
+        timestamp: new Date().toISOString(),
+        type: 'VENDA',
+        amount: roundedAmount,
+        paymentMethod: order.paymentMethod,
+        description: `Recebimento Pedido ${order.orderNumber} - ${order.customer?.name || 'Cliente'}`.slice(0, 300),
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        author: String(author || currentUser?.name || currentUser?.username || 'Atendente').slice(0, 128),
+      });
+      try {
+        localStorage.setItem('gf_current_cash_shift', JSON.stringify(localShift));
+      } catch {}
+      this.notify('CASH_SHIFT_UPDATED', localShift);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'CASH_SHIFT_UPDATED' } }));
+      }
+    }
+    return { success: true, shift: localShift };
+  }
+
+  public updatePaymentStatus(
+    orderId: string,
+    newPaymentStatus: 'PAGO' | 'PENDENTE',
+    author = 'Caixa',
+    notes?: string,
+    autoPersist = true
+  ): Order | null {
+    const currentUser = this.getCurrentUser();
+    if (!this.canUserConfirmPayments(currentUser)) {
+      console.warn(`[Security Guard] Usuário @${currentUser?.username || 'anônimo'} (${currentUser?.role || 'N/A'}) não possui permissão para alterar status de pagamento.`);
+      return null;
+    }
+
+    if (this.shouldUseServerAtomicPayment() && autoPersist) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente updatePaymentStatusAsync().');
+      return null;
+    }
+
+    const orders = this.getOrders();
+    const order = orders.find((o) => o.id === orderId);
+    if (!order || order.status === 'CANCELADO') return null;
+
+    const previousPaymentStatus = order.paymentStatus;
+    if (previousPaymentStatus === newPaymentStatus) return order;
+    if (previousPaymentStatus === 'PAGO' && newPaymentStatus === 'PENDENTE') return null;
+
+    const now = new Date().toISOString();
+    if (newPaymentStatus === 'PAGO') {
+      const shift = this.getCurrentCashShift();
+      if (!shift || shift.status !== 'ABERTO') {
+        return null;
+      }
+      const movementId = `cash-sale-${order.id}`;
+      if (!shift.movements.some((m: CashMovement) => m.type === 'VENDA' && (m.orderId === order.id || m.id === movementId))) {
+        shift.movements.push({
+          id: movementId,
+          timestamp: now,
+          type: 'VENDA',
+          amount: roundCurrency(order.totalAmount),
+          paymentMethod: order.paymentMethod,
+          description: `Recebimento Pedido ${order.orderNumber} - ${order.customer?.name || 'Cliente'}`.slice(0, 300),
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          author,
+        });
+        try {
+          localStorage.setItem('gf_current_cash_shift', JSON.stringify(shift));
+        } catch {}
+        this.notify('CASH_SHIFT_UPDATED', shift);
+      }
+    }
+
+    order.paymentStatus = newPaymentStatus;
+    order.updatedAt = now;
     order.movements.push({
       id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       timestamp: now,
@@ -2760,31 +4756,322 @@ class StoreService {
       notes: notes || `Pagamento alterado de ${previousPaymentStatus} para ${newPaymentStatus}`,
     });
 
-    order._cloudSyncStatus = 'PENDING';
     localStorage.setItem('gf_orders', JSON.stringify(orders));
     this.notify('ORDER_UPDATED', order);
-    this.queueOrderForSync(order);
-    this.persistOrderToFirestore(order).catch(() => {});
     return order;
   }
 
   public async updatePaymentStatusAsync(
-    orderId: string, 
-    newPaymentStatus: 'PAGO' | 'PENDENTE', 
-    author = 'Caixa', 
-    notes?: string
-  ): Promise<{ order: Order | null; synced: boolean; error?: string }> {
-    const order = this.updatePaymentStatus(orderId, newPaymentStatus, author, notes);
-    if (!order) return { order: null, synced: false, error: 'Pedido não encontrado' };
-    const res = await this.persistOrderToFirestore(order);
-    return { order, synced: res.success, error: res.error };
+    orderId: string,
+    newPaymentStatus: 'PAGO' | 'PENDENTE',
+    author = 'Caixa',
+    notes?: string,
+    options?: { timeoutMs?: number; shiftId?: string }
+  ): Promise<{
+    order: Order | null;
+    shift?: CashRegisterShift | null;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    alreadyConfirmed?: boolean;
+    error?: string;
+  }> {
+    const currentUser = this.getCurrentUser();
+    if (!this.canUserConfirmPayments(currentUser)) {
+      return {
+        order: this.getOrderById(orderId) || null,
+        synced: false,
+        rejected: true,
+        error: `Permissão insuficiente: perfil ${currentUser?.role || 'não autenticado'} não pode confirmar pagamentos.`,
+      };
+    }
+
+    const previousOrder = this.getOrderById(orderId);
+    if (!previousOrder) {
+      return { order: null, synced: false, rejected: true, error: 'Pedido não encontrado' };
+    }
+    if (previousOrder.status === 'CANCELADO') {
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: true,
+        error: 'Não é possível confirmar pagamento de um pedido cancelado.',
+      };
+    }
+    if (previousOrder.paymentStatus === 'PAGO' && newPaymentStatus === 'PENDENTE') {
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: true,
+        error: 'Não é permitido reverter um pagamento já confirmado para PENDENTE. Utilize o fluxo de cancelamento com estorno.',
+      };
+    }
+    if (previousOrder.paymentStatus === newPaymentStatus && !this.shouldUseServerAtomicPayment()) {
+      return { order: previousOrder, synced: false };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      // Local contingency mode (Firebase NOT configured): validate open shift BEFORE any mutation
+      const localShift = this.getCurrentCashShift();
+      if (!localShift || localShift.status !== 'ABERTO') {
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: true,
+          error: 'Nenhum turno de caixa aberto para confirmar o pagamento.',
+        };
+      }
+      const updated = this.updatePaymentStatus(orderId, newPaymentStatus, author, notes, false);
+      if (!updated) {
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: true,
+          error: 'Não foi possível confirmar o pagamento no modo de contingência local.',
+        };
+      }
+      return {
+        order: updated,
+        shift: this.getCurrentCashShift(),
+        synced: false,
+      };
+    }
+
+    // Cloud / Server Atomic Mode: NEVER mutate local gf_orders or gf_current_cash_shift before server commit!
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: true,
+          error: 'Sessão Firebase não autenticada. Faça login novamente antes de confirmar o pagamento.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: true,
+        error: 'Cliente HTTP indisponível para confirmação atômica no servidor.',
+      };
+    }
+
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = `pay:${orderId}`;
+
+    if (this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultOrderPaymentState(orderId, authHeaders);
+      if (
+        preState.verified &&
+        preState.data?.exists &&
+        preState.data?.paymentStatus === 'PAGO' &&
+        preState.data?.cashRecorded &&
+        preState.data?.order
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const recovered = this.commitConfirmedServerOrderAndShift(
+          preState.data.order as Order,
+          (preState.data.shift as CashRegisterShift) || null
+        );
+        this.notify('ORDER_UPDATED', recovered);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_UPDATED', payload: recovered } }));
+        }
+        return {
+          order: recovered,
+          shift: (preState.data.shift as CashRegisterShift) || this.getCurrentCashShift(),
+          synced: true,
+          recoveredFromTimeout: true,
+        };
+      }
+      if (preState.verified && (!preState.data?.exists || preState.data?.paymentStatus !== 'PAGO')) {
+        this.uncertainServerOps.delete(opKey);
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            order: previousOrder,
+            synced: false,
+            rejected: true,
+            error:
+              'Não foi possível confirmar o pagamento: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          order: previousOrder,
+          synced: false,
+          uncertain: true,
+          error:
+            'Não foi possível verificar o estado atual do pagamento no servidor após falha anterior. A confirmação não foi repetida para evitar duplicidade.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverPaymentState = async () => {
+      const state = await this.consultOrderPaymentState(orderId, authHeaders);
+      if (
+        state.verified &&
+        state.data?.exists &&
+        state.data?.paymentStatus === 'PAGO' &&
+        state.data?.cashRecorded &&
+        state.data?.order
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const recovered = this.commitConfirmedServerOrderAndShift(
+          state.data.order as Order,
+          (state.data.shift as CashRegisterShift) || null
+        );
+        this.notify('ORDER_UPDATED', recovered);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_UPDATED', payload: recovered } }));
+        }
+        return {
+          status: 'recovered' as const,
+          result: {
+            order: recovered,
+            shift: (state.data.shift as CashRegisterShift) || this.getCurrentCashShift(),
+            synced: true,
+            recoveredFromTimeout: true,
+          },
+        };
+      }
+      if (state.verified && (!state.data?.exists || state.data?.paymentStatus !== 'PAGO')) {
+        this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/confirm-payment`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          author,
+          notes,
+          shiftId: options?.shiftId || this.getCurrentCashShift()?.id,
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.order &&
+        data.order.id &&
+        data.order.paymentStatus === newPaymentStatus
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const committed = this.commitConfirmedServerOrderAndShift(
+          data.order as Order,
+          (data.shift as CashRegisterShift) || null
+        );
+        this.notify('ORDER_UPDATED', committed);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_UPDATED', payload: committed } }));
+        }
+        return {
+          order: committed,
+          shift: (data.shift as CashRegisterShift) || this.getCurrentCashShift(),
+          synced: true,
+          alreadyConfirmed: Boolean(data.alreadyConfirmed),
+        };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'a confirmação do pagamento');
+      if (resolution.kind === 'rejected') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: true,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverPaymentState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          error: resolution.nonCommittedError,
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: false,
+        uncertain: true,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverPaymentState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          error: isTimeout
+            ? 'Tempo esgotado ao confirmar pagamento; consulta ao servidor confirmou que o pagamento permanece pendente.'
+            : 'Falha de conexão ao confirmar pagamento; consulta ao servidor confirmou que o pagamento permanece pendente.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          order: previousOrder,
+          synced: false,
+          rejected: true,
+          error:
+            'Não foi possível confirmar o pagamento: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: false,
+        uncertain: true,
+        error: isTimeout
+          ? 'Tempo esgotado ao confirmar pagamento no servidor e o resultado permanece desconhecido. Antes de reenviar, o sistema consultará o servidor.'
+          : 'Falha de comunicação com o servidor ao confirmar pagamento. Nenhum dado local foi adulterado.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   public assignDeliveryPerson(
     orderId: string, 
     deliveryPerson: { id: string; name: string; phone: string } | null,
     assignedBy = 'Administração',
-    reason?: string
+    reason?: string,
+    autoPersist = true
   ): Order | null {
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
@@ -2820,9 +5107,13 @@ class StoreService {
         notes: `Entregador desvinculado por ${assignedBy}${reason ? ` (Motivo: ${reason})` : ''}`,
       });
 
+      order._cloudSyncStatus = 'PENDING';
       localStorage.setItem('gf_orders', JSON.stringify(orders));
       this.notify('ORDER_UPDATED', order);
-      this.persistOrderToFirestore(order).catch(() => {});
+      this.queueOrderForSync(order);
+      if (autoPersist) {
+        this.persistOrderToFirestore(order, { isStatusTransition: true }).catch(() => {});
+      }
       return order;
     }
 
@@ -2863,9 +5154,119 @@ class StoreService {
     this.notify('ORDER_UPDATED', order);
 
     this.queueOrderForSync(order);
-    this.persistOrderToFirestore(order).catch(() => {});
+    if (autoPersist) {
+      this.persistOrderToFirestore(order, { isStatusTransition: true }).catch(() => {});
+    }
 
     return order;
+  }
+
+  public async assignDeliveryPersonAsync(
+    orderId: string,
+    deliveryPerson: { id: string; name: string; phone: string } | null,
+    assignedBy = 'Administração',
+    reason?: string
+  ): Promise<{ order: Order | null; synced: boolean; rejected?: boolean; error?: string }> {
+    const currentUser = this.getCurrentUser();
+    const role = (currentUser?.role || '').toUpperCase();
+    if (currentUser && !['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'ATENDENTE'].includes(role)) {
+      return {
+        order: this.getOrderById(orderId) || null,
+        synced: false,
+        rejected: true,
+        error: 'Permissão insuficiente para atribuir entregador.',
+      };
+    }
+
+    await this.waitForFirebaseAuthReady();
+    if (isFirebaseReady() && !auth?.currentUser) {
+      return {
+        order: this.getOrderById(orderId) || null,
+        synced: false,
+        rejected: true,
+        error: 'Sessão Firebase não autenticada. Faça login novamente para atribuir entregador.',
+      };
+    }
+
+    const previousOrdersSnapshot = localStorage.getItem('gf_orders');
+
+    const order = this.assignDeliveryPerson(orderId, deliveryPerson, assignedBy, reason, false);
+    if (!order) {
+      return { order: null, synced: false, rejected: true, error: 'Pedido não encontrado.' };
+    }
+
+    // Try direct Firestore updateDoc or backend /api/orders/:id/assign-driver
+    let synced = false;
+    let rejected = false;
+    let errorMsg: string | undefined;
+
+    if (db && auth?.currentUser) {
+      try {
+        const cleanOrder = this.cleanForFirestore(order);
+        await updateDoc(doc(db, 'orders', order.id), {
+          deliveryPerson: cleanOrder.deliveryPerson || null,
+          deliveryPersonId: cleanOrder.deliveryPersonId || null,
+          deliveryPersonName: cleanOrder.deliveryPersonName || null,
+          deliveryAssignmentHistory: cleanOrder.deliveryAssignmentHistory || [],
+          movements: cleanOrder.movements || [],
+          updatedAt: cleanOrder.updatedAt,
+        });
+        synced = true;
+      } catch (directErr: any) {
+        const code = String(directErr?.code || '');
+        errorMsg = directErr?.message;
+        if (code === 'permission-denied' || String(errorMsg || '').includes('Missing or insufficient permissions')) {
+          rejected = true;
+        }
+      }
+    }
+
+    if (!synced && typeof window !== 'undefined') {
+      try {
+        const authHeaders = await this.getFirebaseAuthHeaders();
+        const res = await fetch(`/api/orders/${encodeURIComponent(order.id)}/assign-driver`, {
+          method: 'PATCH',
+          headers: authHeaders,
+          body: JSON.stringify({
+            deliveryPerson,
+            deliveryAssignmentHistory: order.deliveryAssignmentHistory,
+            movements: order.movements,
+            updatedAt: order.updatedAt,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success) {
+          synced = true;
+          errorMsg = undefined;
+        } else if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404) {
+          rejected = true;
+          errorMsg = data.message || `Erro HTTP ${res.status} ao atribuir entregador.`;
+        } else {
+          errorMsg = data.message || `Erro HTTP ${res.status} ao atribuir entregador.`;
+        }
+      } catch (netErr: any) {
+        errorMsg = netErr?.message || 'Erro de rede ao atribuir entregador.';
+      }
+    }
+
+    if (synced) {
+      this.removeOrderFromSyncQueue(orderId);
+      this.recordSyncedOrderId(orderId);
+      this.updateLocalOrderSyncStatus(orderId, 'SYNCED');
+      return { order: this.getOrderById(orderId) || order, synced: true };
+    }
+
+    const isOffline = this.isOfflineErrorMessage(errorMsg);
+    if (rejected || (isFirebaseReady() && !isOffline)) {
+      if (previousOrdersSnapshot !== null) {
+        localStorage.setItem('gf_orders', previousOrdersSnapshot);
+      }
+      this.removeOrderFromSyncQueue(orderId);
+      this.notify('ORDERS_UPDATED', { reason: 'ROLLBACK_ASSIGN_DRIVER', orderId });
+      return { order: this.getOrderById(orderId) || null, synced: false, rejected: true, error: errorMsg };
+    }
+
+    return { order, synced: false, error: errorMsg || 'Sem conexão: atribuição pendente.' };
   }
 
   public addOrderOccurrence(orderId: string, note: string, author = 'Supervisão'): Order | null {
@@ -2887,12 +5288,24 @@ class StoreService {
     this.notify('ORDER_UPDATED', order);
 
     this.queueOrderForSync(order);
-    this.persistOrderToFirestore(order).catch(() => {});
+    this.persistOrderToFirestore(order, { isStatusTransition: true }).catch(() => {});
 
     return order;
   }
 
   public async deleteOrderAsync(orderId: string): Promise<{ success: boolean; error?: string }> {
+    const currentUser = this.getCurrentUser();
+    if (!this.canUserDeleteOrder(currentUser)) {
+      return {
+        success: false,
+        error: 'Permissão insuficiente: apenas Administrador ou Gerente podem excluir pedidos.',
+      };
+    }
+
+    if (this.inFlightOrderDeletes.has(orderId)) {
+      return { success: false, error: 'Exclusão já em andamento para este pedido. Aguarde a confirmação do servidor.' };
+    }
+
     const orders = this.getOrders();
     const target = orders.find((o) => o.id === orderId);
     if (!target) {
@@ -2902,115 +5315,136 @@ class StoreService {
       return { success: false, error: 'Pedido não encontrado no sistema.' };
     }
 
-    // 1. Record in tombstone registry immediately so incoming snapshots can never resurrect it
-    this.recordDeletedOrderId(orderId);
-
-    // 2. Remove from pending sync queue
-    this.removeOrderFromSyncQueue(orderId);
-
-    // 3. Remove from local orders list
-    const filtered = orders.filter((o) => o.id !== orderId);
-    localStorage.setItem('gf_orders', JSON.stringify(filtered));
-
-    // 4. Remove from current open cash register if linked
-    const currentShift = this.getCurrentCashShift();
-    if (currentShift) {
-      const updatedMovements = currentShift.movements.filter((m: CashMovement) => m.orderId !== orderId);
-      if (updatedMovements.length !== currentShift.movements.length) {
-        currentShift.movements = updatedMovements;
-        this.saveCurrentCashShift(currentShift);
+    this.inFlightOrderDeletes.add(orderId);
+    try {
+      await this.waitForFirebaseAuthReady();
+      if (isFirebaseReady() && !auth?.currentUser) {
+        return {
+          success: false,
+          error: 'Sessão Firebase não autenticada. Faça login novamente com uma conta de Administrador ou Gerente para excluir pedidos.',
+        };
       }
-    }
 
-    this.notify('ORDER_DELETED', { orderId, orderNumber: target.orderNumber });
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_DELETED', payload: { orderId } } }));
-    }
+      let firestoreDeleted = false;
+      let deleteError: string | undefined;
 
-    let firestoreDeleted = false;
-    let deleteError: string | undefined;
-
-    // 5. Delete directly from Firestore via Client SDK if available
-    if (db) {
-      try {
-        await deleteDoc(doc(db, 'orders', orderId));
-        firestoreDeleted = true;
-        if (target.trackingCode) {
-          await deleteDoc(doc(db, 'public_tracking', target.trackingCode)).catch(() => {});
-        }
-      } catch (fsErr: any) {
-        console.warn('[Firestore] Exclusão direta pelo cliente falhou, acionando backend:', fsErr?.message);
-        deleteError = fsErr?.message;
-      }
-    }
-
-    // 6. Backend fallback (handles permissions, unauthenticated client sessions, and ensures persistent deletion)
-    if (!firestoreDeleted && typeof window !== 'undefined') {
-      try {
-        let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (auth?.currentUser) {
-          try {
-            const idToken = await auth.currentUser.getIdToken();
-            if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
-          } catch {}
-        }
-
-        const res = await fetch(`/api/orders/${orderId}`, {
-          method: 'DELETE',
-          headers: authHeaders,
-        });
-
-        const data = await res.json().catch(() => ({}));
-        if (res.ok && data.success) {
+      // 1. Try direct Firestore deletion ONLY if authenticated with Firebase Auth
+      if (db && auth?.currentUser) {
+        try {
+          await deleteDoc(doc(db, 'orders', orderId));
           firestoreDeleted = true;
-          deleteError = undefined;
-        } else {
-          // Attempt POST fallback
-          const postRes = await fetch('/api/orders/delete', {
-            method: 'POST',
+          if (target.trackingCode) {
+            await deleteDoc(doc(db, 'public_tracking', target.trackingCode)).catch(() => {});
+          }
+          await setDoc(doc(db, 'order_tombstones', orderId), {
+            id: orderId,
+            deletedAt: new Date().toISOString(),
+          }).catch(() => {});
+        } catch (fsErr: any) {
+          const code = String(fsErr?.code || '');
+          const rawMsg = String(fsErr?.message || fsErr || '');
+          console.warn('[Firestore] Exclusão direta pelo cliente falhou, acionando backend:', rawMsg);
+          if (code === 'permission-denied' || rawMsg.includes('Missing or insufficient permissions')) {
+            deleteError = 'Permissão negada no Firestore (403). Verifique se o seu usuário possui perfil ATIVO em /users/{uid} como ADMINISTRADOR ou GERENTE.';
+          } else {
+            deleteError = rawMsg;
+          }
+        }
+      }
+
+      // Inform server tombstone registry when client deleteDoc succeeded so sibling devices stay in sync
+      if (firestoreDeleted && typeof window !== 'undefined' && auth?.currentUser) {
+        try {
+          const idToken = await auth.currentUser.getIdToken();
+          if (idToken) {
+            await fetch('/api/orders/tombstones', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`,
+              },
+              body: JSON.stringify({ orderId }),
+            }).catch(() => {});
+          }
+        } catch {}
+      }
+
+      // 2. Backend fallback / authoritative server route (strictly awaits confirmation BEFORE removing local order)
+      if (!firestoreDeleted && typeof window !== 'undefined') {
+        try {
+          const authHeaders = await this.getFirebaseAuthHeaders();
+          const qs = target.trackingCode ? `?trackingCode=${encodeURIComponent(target.trackingCode)}` : '';
+          const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}${qs}`, {
+            method: 'DELETE',
             headers: authHeaders,
-            body: JSON.stringify({ orderId }),
           });
-          const postData = await postRes.json().catch(() => ({}));
-          if (postRes.ok && postData.success) {
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.success) {
             firestoreDeleted = true;
             deleteError = undefined;
           } else {
-            deleteError = data.message || postData.message || `Erro ${res.status} ao excluir pedido no servidor.`;
+            const postRes = await fetch('/api/orders/delete', {
+              method: 'POST',
+              headers: authHeaders,
+              body: JSON.stringify({ orderId, trackingCode: target.trackingCode }),
+            });
+            const postData = await postRes.json().catch(() => ({}));
+            if (postRes.ok && postData.success) {
+              firestoreDeleted = true;
+              deleteError = undefined;
+            } else {
+              deleteError = data.message || postData.message || `Erro ${res.status} ao excluir pedido no servidor.`;
+            }
           }
-        }
-      } catch (backendErr: any) {
-        console.warn('[Backend] Erro de rede ao contatar API de exclusão:', backendErr);
-        deleteError = backendErr?.message || 'Falha de comunicação com o servidor ao excluir.';
-      }
-    }
-
-    // If both Firestore client and backend deletion failed, rollback local deletion to preserve integrity
-    if (!firestoreDeleted && deleteError) {
-      console.error('[Store] Falha definitiva na exclusão do pedido ' + orderId + ':', deleteError);
-      const currentOrders = this.getOrders();
-      if (!currentOrders.some((o) => o.id === orderId)) {
-        currentOrders.push(target);
-        currentOrders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-        localStorage.setItem('gf_orders', JSON.stringify(currentOrders));
-        this.removeDeletedOrderId(orderId);
-        this.notify('ORDERS_UPDATED', { reason: 'ROLLBACK_FAILED_DELETE' });
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDERS_UPDATED' } }));
+        } catch (backendErr: any) {
+          console.warn('[Backend] Erro de rede ao contatar API de exclusão:', backendErr);
+          deleteError = backendErr?.message || 'Falha de comunicação com o servidor ao excluir.';
         }
       }
-      return { success: false, error: deleteError };
-    }
 
-    return { success: true };
+      // In local-only mode without Firebase configured and without backend, only allow local deletion if not cloud-configured
+      if (!firestoreDeleted && !isFirebaseReady() && !db) {
+        firestoreDeleted = true;
+      }
+
+      if (!firestoreDeleted) {
+        return {
+          success: false,
+          error: deleteError || 'Não foi possível confirmar a exclusão do pedido no Cloud Firestore.',
+        };
+      }
+
+      // 3. Confirmed! Now record tombstone and remove from local orders & open cash shift
+      this.recordDeletedOrderId(orderId);
+      this.removeOrderFromSyncQueue(orderId);
+      this.removeSyncedOrderId(orderId);
+
+      const latestOrders = this.getOrders().filter((o) => o.id !== orderId);
+      localStorage.setItem('gf_orders', JSON.stringify(latestOrders));
+
+      const currentShift = this.getCurrentCashShift();
+      if (currentShift && currentShift.movements.some((m: CashMovement) => m.orderId === orderId)) {
+        currentShift.movements = currentShift.movements.filter((m: CashMovement) => m.orderId !== orderId);
+        this.saveCurrentCashShift(currentShift);
+      }
+
+      this.notify('ORDER_DELETED', { orderId, orderNumber: target.orderNumber });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_DELETED', payload: { orderId } } }));
+      }
+
+      return { success: true };
+    } finally {
+      this.inFlightOrderDeletes.delete(orderId);
+    }
   }
 
   public deleteOrder(orderId: string): boolean {
+    if (!this.canUserDeleteOrder()) return false;
     const orders = this.getOrders();
     const target = orders.find((o) => o.id === orderId);
     if (!target) return false;
 
-    // Trigger async deletion workflow with tombstone and backend verification
     this.deleteOrderAsync(orderId).catch((err) => {
       console.warn('[Store] Exclusão assíncrona do pedido falhou:', err);
     });
@@ -3027,7 +5461,7 @@ class StoreService {
       if (data) return JSON.parse(data);
 
       const initialShift: CashRegisterShift = {
-        id: 'shift-' + new Date().toISOString().slice(0, 10),
+        id: 'shift-' + getFortalezaDateKey(),
         openedAt: new Date(Date.now() - 5 * 3600 * 1000).toISOString(),
         status: 'ABERTO',
         openedBy: 'admin',
@@ -3109,7 +5543,7 @@ class StoreService {
         });
       }
     } else {
-      localStorage.removeItem('gf_current_cash_shift');
+      localStorage.setItem('gf_current_cash_shift', 'null');
     }
     this.notify('CASH_SHIFT_UPDATED', shift);
   }
@@ -3123,9 +5557,53 @@ class StoreService {
     }
   }
 
+  private commitClosedShiftHistoryLocally(closedShift: CashRegisterShift): void {
+    this.clearUncertainOpPrefix(`close:${closedShift.id}:`);
+    this.uncertainServerOps.delete(`open:${closedShift.id}`);
+    if (this.lastUncertainOpenShiftId === closedShift.id) {
+      this.lastUncertainOpenShiftId = null;
+    }
+    const history = this.getCashShiftHistory().filter((h) => h.id !== closedShift.id);
+    history.unshift(closedShift);
+    try {
+      localStorage.setItem('gf_cash_shifts_history', JSON.stringify(history));
+      localStorage.setItem('gf_current_cash_shift', 'null');
+    } catch {}
+    this.notify('CASH_SHIFT_UPDATED', null);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'CASH_SHIFT_UPDATED' } }));
+    }
+  }
+
+  private commitOpenShiftLocally(shift: CashRegisterShift): void {
+    this.uncertainServerOps.delete(`open:${shift.id}`);
+    if (this.lastUncertainOpenShiftId === shift.id) {
+      this.lastUncertainOpenShiftId = null;
+    }
+    const cleanShift = this.cleanForFirestore(shift);
+    try {
+      localStorage.setItem('gf_current_cash_shift', JSON.stringify(cleanShift));
+    } catch {}
+    this.notify('CASH_SHIFT_UPDATED', cleanShift);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'CASH_SHIFT_UPDATED' } }));
+    }
+  }
+
   public openCashRegister(initialBalance: number, openedBy: string): CashRegisterShift | null {
     if (!this.canUserManageCash()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para abrir o caixa.');
+      return null;
+    }
+
+    if (this.shouldUseServerAtomicPayment()) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente openCashRegisterAsync().');
+      return null;
+    }
+
+    const existing = this.getCurrentCashShift();
+    if (existing && existing.status === 'ABERTO') {
+      console.warn(`[Security Guard] Já existe um turno de caixa ABERTO (${existing.id}). Feche o turno atual antes de abrir outro.`);
       return null;
     }
 
@@ -3141,9 +5619,263 @@ class StoreService {
     return newShift;
   }
 
+  public async openCashRegisterAsync(
+    initialBalance: number,
+    openedBy: string,
+    options?: { shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    shift: CashRegisterShift | null;
+    error?: string;
+  }> {
+    if (!this.canUserManageCash()) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        shift: null,
+        error: 'Permissão insuficiente: apenas Caixa, Gerente ou Administrador podem abrir o caixa.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const existing = this.getCurrentCashShift();
+      if (existing && existing.status === 'ABERTO') {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: existing,
+          error: `Já existe um turno de caixa ABERTO (${existing.id}).`,
+        };
+      }
+      const created = this.openCashRegister(initialBalance, openedBy);
+      return created
+        ? { success: true, synced: false, shift: created }
+        : { success: false, synced: false, rejected: true, shift: null, error: 'Não foi possível abrir o caixa localmente.' };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: 'Sessão Firebase não autenticada. Faça login novamente antes de abrir o caixa.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        shift: null,
+        error: 'Cliente HTTP indisponível para abertura de caixa no servidor.',
+      };
+    }
+
+    const shiftId = options?.shiftId || this.lastUncertainOpenShiftId || `shift-${Date.now()}`;
+    const opKey = `open:${shiftId}`;
+    const authHeaders = await this.getFirebaseAuthHeaders();
+
+    if (this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultCashShiftState(shiftId, authHeaders);
+      if (preState.verified && preState.exists && preState.shift?.status === 'ABERTO') {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        this.commitOpenShiftLocally(preState.shift);
+        return { success: true, synced: true, recoveredFromTimeout: true, shift: preState.shift };
+      }
+      if (preState.verified && !preState.exists) {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+      } else if (preState.verified && preState.exists && preState.shift?.status === 'FECHADO') {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: `O turno '${shiftId}' já consta como FECHADO no servidor (HTTP 409).`,
+        };
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          this.lastUncertainOpenShiftId = null;
+          return {
+            success: false,
+            synced: false,
+            rejected: true,
+            shift: null,
+            error:
+              'Não foi possível abrir o caixa: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          success: false,
+          synced: false,
+          uncertain: true,
+          shift: null,
+          error:
+            'Não foi possível confirmar o estado atual da abertura de caixa no servidor após falha anterior. A requisição não foi repetida para evitar abertura duplicada.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverOpenState = async () => {
+      const state = await this.consultCashShiftState(shiftId, authHeaders);
+      if (state.verified && state.exists && state.shift?.status === 'ABERTO') {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        this.commitOpenShiftLocally(state.shift);
+        return {
+          status: 'recovered' as const,
+          result: { success: true, synced: true, recoveredFromTimeout: true, shift: state.shift },
+        };
+      }
+      if (state.verified && !state.exists) {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch('/api/cash-shifts/open', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          shiftId,
+          initialBalance: Math.max(0, roundCurrency(initialBalance)),
+          openedBy: openedBy.trim() || 'admin',
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.shift &&
+        data.shift.id &&
+        data.shift.status === 'ABERTO'
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        const committed = data.shift as CashRegisterShift;
+        this.commitOpenShiftLocally(committed);
+        return { success: true, synced: true, shift: committed };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'a abertura do caixa');
+      if (resolution.kind === 'rejected') {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverOpenState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          shift: null,
+          error: resolution.nonCommittedError,
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      this.lastUncertainOpenShiftId = shiftId;
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        shift: null,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverOpenState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          shift: null,
+          error: isTimeout
+            ? 'Tempo esgotado ao abrir caixa; consulta ao servidor confirmou que nenhum turno foi aberto.'
+            : 'Falha de conexão ao abrir caixa; consulta ao servidor confirmou que nenhum turno foi aberto.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        this.uncertainServerOps.delete(opKey);
+        this.lastUncertainOpenShiftId = null;
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error:
+            'Não foi possível abrir o caixa: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      this.lastUncertainOpenShiftId = shiftId;
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        shift: null,
+        error: isTimeout
+          ? 'Tempo esgotado ao abrir caixa no servidor e o resultado permanece desconhecido. Nenhum turno local falso foi criado.'
+          : 'Falha de conexão ao abrir caixa no servidor e o resultado permanece desconhecido. Nenhum turno local falso foi criado.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   public closeCashRegister(countedCash: number, closedBy: string, notes?: string): CashRegisterShift | null {
     if (!this.canUserManageCash()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para fechar o caixa.');
+      return null;
+    }
+
+    if (this.shouldUseServerAtomicPayment()) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente closeCashRegisterAsync().');
       return null;
     }
 
@@ -3181,43 +5913,281 @@ class StoreService {
       closedShift.notes = notes.trim();
     }
 
+    const cleanClosed = this.cleanForFirestore(closedShift);
     const history = this.getCashShiftHistory();
-    history.unshift(closedShift);
+    history.unshift(cleanClosed);
     localStorage.setItem('gf_cash_shifts_history', JSON.stringify(history));
 
-    if (db) {
-      const cleanClosed = this.cleanForFirestore(closedShift);
-      setDoc(doc(db, 'cash_shifts', closedShift.id), cleanClosed).catch(async (err) => {
-        console.warn('[Firestore Cash Shift Close] Direct write notice:', err);
-        if (typeof window !== 'undefined' && typeof fetch === 'function') {
-          try {
-            let authHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-            if (auth?.currentUser) {
-              try {
-                const idToken = await auth.currentUser.getIdToken();
-                if (idToken) authHeaders['Authorization'] = `Bearer ${idToken}`;
-              } catch {}
-            }
-            const res = await fetch('/api/cash-shifts', {
-              method: 'POST',
-              headers: authHeaders,
-              body: JSON.stringify({ shift: cleanClosed }),
-            });
-            if (res.ok) return;
-            if (res.status === 409) {
-              console.warn('[Cash Shift Close] Modificação bloqueada: turno já se encontra FECHADO.');
-              return;
-            }
-          } catch {
-            // Fallback error
-          }
-        }
-        handleFirestoreError(err, OperationType.WRITE, `cash_shifts/${closedShift.id}`);
-      });
+    this.saveCurrentCashShift(null);
+    return cleanClosed;
+  }
+
+  public async closeCashRegisterAsync(
+    countedCash: number,
+    closedBy: string,
+    notes?: string,
+    options?: { shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    shift: CashRegisterShift | null;
+    error?: string;
+  }> {
+    if (!this.canUserManageCash()) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        shift: null,
+        error: 'Permissão insuficiente: apenas Caixa, Gerente ou Administrador podem fechar o caixa.',
+      };
     }
 
-    this.saveCurrentCashShift(null);
-    return closedShift;
+    if (!this.shouldUseServerAtomicPayment()) {
+      const closed = this.closeCashRegister(countedCash, closedBy, notes);
+      return closed
+        ? { success: true, synced: false, shift: closed }
+        : { success: false, synced: false, rejected: true, shift: null, error: 'Nenhum turno de caixa aberto para fechar.' };
+    }
+
+    const shift = this.getCurrentCashShift();
+    const targetShiftId = options?.shiftId || shift?.id;
+    if (!targetShiftId) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        shift: null,
+        error: 'Nenhum turno de caixa aberto encontrado para fechamento.',
+      };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: 'Sessão Firebase não autenticada. Faça login novamente antes de fechar o caixa.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        shift: null,
+        error: 'Cliente HTTP indisponível para fechamento de caixa no servidor.',
+      };
+    }
+
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = `close:${targetShiftId}:${shift?.openedAt || ''}`;
+
+    // Before sending a new close request after an uncertain outcome, consult authoritative server state first.
+    if (this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultCashShiftState(targetShiftId, authHeaders);
+      if (preState.verified && preState.exists && preState.shift?.status === 'FECHADO') {
+        this.uncertainServerOps.delete(opKey);
+        this.commitClosedShiftHistoryLocally(preState.shift);
+        return {
+          success: true,
+          synced: true,
+          recoveredFromTimeout: true,
+          shift: preState.shift,
+        };
+      }
+      if (preState.verified && preState.exists && preState.shift?.status === 'ABERTO') {
+        this.uncertainServerOps.delete(opKey);
+      } else if (preState.verified && !preState.exists) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: `Turno de caixa '${targetShiftId}' não encontrado no servidor (HTTP 404).`,
+        };
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            synced: false,
+            rejected: true,
+            shift: null,
+            error:
+              'Não foi possível confirmar o fechamento do caixa: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          success: false,
+          synced: false,
+          uncertain: true,
+          shift: null,
+          error:
+            'Não foi possível confirmar o estado atual do turno no servidor após falha anterior. O fechamento não foi repetido automaticamente; verifique o estado do servidor antes de tentar novamente.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverCloseState = async () => {
+      const state = await this.consultCashShiftState(targetShiftId, authHeaders);
+      if (state.verified && state.exists && state.shift?.status === 'FECHADO') {
+        this.uncertainServerOps.delete(opKey);
+        this.commitClosedShiftHistoryLocally(state.shift);
+        return {
+          status: 'recovered' as const,
+          result: { success: true, synced: true, recoveredFromTimeout: true, shift: state.shift },
+        };
+      }
+      if (state.verified && state.exists && state.shift?.status === 'ABERTO') {
+        this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      if (state.verified && !state.exists) {
+        this.uncertainServerOps.delete(opKey);
+        return { status: 'not_found' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(`/api/cash-shifts/${encodeURIComponent(targetShiftId)}/close`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          countedCash: Math.max(0, roundCurrency(countedCash)),
+          closedBy: closedBy.trim() || 'Operador',
+          notes: notes?.trim() || undefined,
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.shift &&
+        data.shift.id === targetShiftId &&
+        data.shift.status === 'FECHADO'
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const committed = data.shift as CashRegisterShift;
+        this.commitClosedShiftHistoryLocally(committed);
+        return { success: true, synced: true, shift: committed };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'o fechamento do caixa');
+      if (resolution.kind === 'rejected') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverCloseState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          shift: null,
+          error: resolution.nonCommittedError,
+        };
+      }
+      if (rec.status === 'not_found') {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: `Turno de caixa '${targetShiftId}' não encontrado no servidor.`,
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        shift: null,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverCloseState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          shift: null,
+          error: isTimeout
+            ? 'Tempo esgotado ao fechar o caixa; consulta ao servidor confirmou que o turno permanece ABERTO.'
+            : 'Falha de conexão ao fechar o caixa; consulta ao servidor confirmou que o turno permanece ABERTO.',
+        };
+      }
+      if (rec.status === 'not_found') {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error: `Turno de caixa '${targetShiftId}' não encontrado no servidor.`,
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          error:
+            'Não foi possível confirmar o fechamento do caixa: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        shift: null,
+        error: isTimeout
+          ? 'Tempo esgotado ao fechar caixa no servidor e não foi possível confirmar o resultado. O caixa local permanece intacto; o sistema consultará o estado antes de reenviar.'
+          : 'Falha de conexão ao fechar caixa no servidor e não foi possível confirmar o resultado. O caixa local permanece intacto; o sistema consultará o estado antes de reenviar.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   public addCashMovement(
@@ -3232,6 +6202,11 @@ class StoreService {
   ): CashMovement | null {
     if (!this.canUserManageCash()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para movimentações de caixa.');
+      return null;
+    }
+
+    if (this.shouldUseServerAtomicPayment()) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente addCashMovementAsync().');
       return null;
     }
 
@@ -3263,9 +6238,286 @@ class StoreService {
     return movement;
   }
 
+  public async addCashMovementAsync(
+    type: 'SANGRIA' | 'SUPRIMENTO' | 'VALE',
+    amount: number,
+    description: string,
+    author: string,
+    paymentMethod: PaymentMethod = 'DINHEIRO',
+    employeeName?: string,
+    options?: { movementId?: string; shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    movement: CashMovement | null;
+    shift?: CashRegisterShift | null;
+    error?: string;
+  }> {
+    if (!this.canUserManageCash()) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        movement: null,
+        error: 'Permissão insuficiente: perfil não autorizado a lançar movimentações de caixa.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const mov = this.addCashMovement(type, amount, description, author, paymentMethod, employeeName);
+      return mov
+        ? { success: true, synced: false, movement: mov, shift: this.getCurrentCashShift() }
+        : { success: false, synced: false, rejected: true, movement: null, error: 'Nenhum turno de caixa aberto.' };
+    }
+
+    const targetShiftId = options?.shiftId || this.getCurrentCashShift()?.id;
+    if (!targetShiftId) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        movement: null,
+        error: 'Nenhum turno de caixa aberto encontrado no momento.',
+      };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error: 'Sessão Firebase não autenticada. Faça login novamente.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        movement: null,
+        error: 'Cliente HTTP indisponível para movimentação de caixa.',
+      };
+    }
+
+    const movementId = options?.movementId || `cash-mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = options?.movementId ? `mov:${targetShiftId}:${movementId}` : null;
+
+    if (opKey && this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultCashShiftState(targetShiftId, authHeaders);
+      const remoteShift = preState.shift || undefined;
+      const foundMov = remoteShift?.movements?.find((m) => m.id === movementId);
+      if (preState.verified && remoteShift && foundMov) {
+        this.uncertainServerOps.delete(opKey);
+        if (remoteShift.status === 'ABERTO') this.commitOpenShiftLocally(remoteShift);
+        return {
+          success: true,
+          synced: true,
+          recoveredFromTimeout: true,
+          movement: foundMov,
+          shift: remoteShift,
+        };
+      }
+      if (preState.verified && preState.exists && remoteShift?.status === 'FECHADO') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error: `Operação recusada: O turno de caixa '${targetShiftId}' já está FECHADO (HTTP 409).`,
+        };
+      }
+      if (preState.verified && preState.exists && remoteShift?.status === 'ABERTO' && !foundMov) {
+        this.uncertainServerOps.delete(opKey);
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            synced: false,
+            rejected: true,
+            movement: null,
+            error:
+              'Não foi possível gravar a movimentação: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          success: false,
+          synced: false,
+          uncertain: true,
+          movement: null,
+          error:
+            'Não foi possível verificar o lançamento anterior no servidor. A requisição não foi repetida para evitar duplicidade.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverMovementState = async () => {
+      const state = await this.consultCashShiftState(targetShiftId, authHeaders);
+      const remoteShift = state.shift || undefined;
+      const foundMov = remoteShift?.movements?.find((m) => m.id === movementId);
+      if (state.verified && remoteShift && foundMov) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        if (remoteShift.status === 'ABERTO') this.commitOpenShiftLocally(remoteShift);
+        return {
+          status: 'recovered' as const,
+          result: {
+            success: true,
+            synced: true,
+            recoveredFromTimeout: true,
+            movement: foundMov,
+            shift: remoteShift,
+          },
+        };
+      }
+      if (state.verified && (!state.exists || (remoteShift && !foundMov))) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(`/api/cash-shifts/${encodeURIComponent(targetShiftId)}/movements`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          movement: {
+            id: movementId,
+            type,
+            amount: roundCurrency(Math.abs(amount)),
+            paymentMethod,
+            description: description.trim(),
+            author: author.trim() || 'admin',
+            ...(employeeName?.trim() ? { employeeName: employeeName.trim() } : {}),
+          },
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.shift &&
+        data.shift.id &&
+        data?.movement &&
+        data.movement.id
+      ) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        this.commitOpenShiftLocally(data.shift as CashRegisterShift);
+        return {
+          success: true,
+          synced: true,
+          movement: data.movement as CashMovement,
+          shift: data.shift as CashRegisterShift,
+        };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'a movimentação de caixa');
+      if (resolution.kind === 'rejected') {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverMovementState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          movement: null,
+          error: resolution.nonCommittedError,
+        };
+      }
+
+      if (opKey) this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        movement: null,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverMovementState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          movement: null,
+          error: isTimeout
+            ? 'Tempo esgotado ao gravar lançamento; consulta ao servidor confirmou que não foi registrado.'
+            : 'Falha de conexão ao gravar lançamento; consulta ao servidor confirmou que não foi registrado.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error:
+            'Não foi possível gravar a movimentação: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      if (opKey) this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        movement: null,
+        error: isTimeout
+          ? 'Tempo esgotado ao gravar lançamento no servidor e o resultado permanece desconhecido.'
+          : 'Falha de comunicação ao gravar lançamento no servidor e não foi possível confirmar o resultado.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   public adjustDrawerBalance(newBalance: number, reason: string, author: string): CashMovement | null {
     if (!this.canUserManageCash()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para ajustar saldo do caixa.');
+      return null;
+    }
+
+    if (this.shouldUseServerAtomicPayment()) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente adjustDrawerBalanceAsync().');
       return null;
     }
 
@@ -3280,6 +6532,8 @@ class StoreService {
         currentDrawer -= m.amount;
       } else if (m.type === 'VENDA' && m.paymentMethod === 'DINHEIRO') {
         currentDrawer += m.amount;
+      } else if (m.type === 'ESTORNO' && m.paymentMethod === 'DINHEIRO') {
+        currentDrawer -= m.amount;
       } else if (m.type === 'AJUSTE') {
         currentDrawer += m.amount;
       }
@@ -3306,9 +6560,278 @@ class StoreService {
     return movement;
   }
 
+  public async adjustDrawerBalanceAsync(
+    newBalance: number,
+    reason: string,
+    author: string,
+    options?: { movementId?: string; shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    movement: CashMovement | null;
+    shift?: CashRegisterShift | null;
+    error?: string;
+  }> {
+    if (!this.canUserManageCash()) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        movement: null,
+        error: 'Permissão insuficiente: perfil não autorizado a ajustar saldo do caixa.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const mov = this.adjustDrawerBalance(newBalance, reason, author);
+      return mov
+        ? { success: true, synced: false, movement: mov, shift: this.getCurrentCashShift() }
+        : { success: false, synced: false, rejected: true, movement: null, error: 'Nenhum ajuste necessário ou turno fechado.' };
+    }
+
+    const targetShiftId = options?.shiftId || this.getCurrentCashShift()?.id;
+    if (!targetShiftId) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        movement: null,
+        error: 'Nenhum turno de caixa aberto encontrado.',
+      };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error: 'Sessão Firebase não autenticada. Faça login novamente.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        movement: null,
+        error: 'Cliente HTTP indisponível.',
+      };
+    }
+
+    const movementId = options?.movementId || `cash-adj-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = options?.movementId ? `adj:${targetShiftId}:${movementId}` : null;
+
+    if (opKey && this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultCashShiftState(targetShiftId, authHeaders);
+      const remoteShift = preState.shift || undefined;
+      const foundMov = remoteShift?.movements?.find((m) => m.id === movementId);
+      if (preState.verified && remoteShift && foundMov) {
+        this.uncertainServerOps.delete(opKey);
+        if (remoteShift.status === 'ABERTO') this.commitOpenShiftLocally(remoteShift);
+        return {
+          success: true,
+          synced: true,
+          recoveredFromTimeout: true,
+          movement: foundMov,
+          shift: remoteShift,
+        };
+      }
+      if (preState.verified && preState.exists && remoteShift?.status === 'FECHADO') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error: `Operação recusada: O turno de caixa '${targetShiftId}' já está FECHADO (HTTP 409).`,
+        };
+      }
+      if (preState.verified && preState.exists && remoteShift?.status === 'ABERTO' && !foundMov) {
+        this.uncertainServerOps.delete(opKey);
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            synced: false,
+            rejected: true,
+            movement: null,
+            error:
+              'Não foi possível ajustar o saldo da gaveta: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          success: false,
+          synced: false,
+          uncertain: true,
+          movement: null,
+          error:
+            'Não foi possível verificar o ajuste anterior no servidor. A requisição não foi repetida automaticamente.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverAdjustState = async () => {
+      const state = await this.consultCashShiftState(targetShiftId, authHeaders);
+      const remoteShift = state.shift || undefined;
+      const foundMov = remoteShift?.movements?.find((m) => m.id === movementId);
+      if (state.verified && remoteShift && foundMov) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        if (remoteShift.status === 'ABERTO') this.commitOpenShiftLocally(remoteShift);
+        return {
+          status: 'recovered' as const,
+          result: {
+            success: true,
+            synced: true,
+            recoveredFromTimeout: true,
+            movement: foundMov,
+            shift: remoteShift,
+          },
+        };
+      }
+      if (state.verified && (!state.exists || (remoteShift && !foundMov))) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(`/api/cash-shifts/${encodeURIComponent(targetShiftId)}/adjust`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          movementId,
+          newBalance: roundCurrency(newBalance),
+          reason: reason?.trim() || '',
+          author: author?.trim() || 'admin',
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.shift &&
+        data.shift.id &&
+        data?.movement &&
+        data.movement.id
+      ) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        this.commitOpenShiftLocally(data.shift as CashRegisterShift);
+        return {
+          success: true,
+          synced: true,
+          movement: data.movement as CashMovement,
+          shift: data.shift as CashRegisterShift,
+        };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'o ajuste de saldo da gaveta');
+      if (resolution.kind === 'rejected') {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverAdjustState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          movement: null,
+          error: resolution.nonCommittedError,
+        };
+      }
+
+      if (opKey) this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        movement: null,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverAdjustState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          movement: null,
+          error: isTimeout
+            ? 'Tempo esgotado ao ajustar saldo; consulta ao servidor confirmou que o ajuste não foi gravado.'
+            : 'Falha de conexão ao ajustar saldo; consulta ao servidor confirmou que o ajuste não foi gravado.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        if (opKey) this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          movement: null,
+          error:
+            'Não foi possível ajustar o saldo da gaveta: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      if (opKey) this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        movement: null,
+        error: isTimeout
+          ? 'Tempo esgotado ao ajustar saldo no servidor e não foi possível confirmar o resultado.'
+          : 'Falha de comunicação ao ajustar saldo no servidor e não foi possível confirmar o resultado.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   public deleteCashMovement(movementId: string): boolean {
     if (!this.canUserManageCash()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para excluir movimentações do caixa.');
+      return false;
+    }
+
+    if (this.shouldUseServerAtomicPayment()) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente deleteCashMovementAsync().');
       return false;
     }
 
@@ -3325,6 +6848,247 @@ class StoreService {
     return false;
   }
 
+  public async deleteCashMovementAsync(
+    movementId: string,
+    options?: { shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    shift?: CashRegisterShift | null;
+    error?: string;
+  }> {
+    if (!this.canUserManageCash()) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        error: 'Permissão insuficiente: perfil não autorizado a excluir lançamentos do caixa.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const ok = this.deleteCashMovement(movementId);
+      return ok
+        ? { success: true, synced: false, shift: this.getCurrentCashShift() }
+        : { success: false, synced: false, rejected: true, error: 'Não foi possível excluir o lançamento.' };
+    }
+
+    const targetShiftId = options?.shiftId || this.getCurrentCashShift()?.id;
+    if (!targetShiftId) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        error: 'Nenhum turno de caixa aberto encontrado.',
+      };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          error: 'Sessão Firebase não autenticada. Faça login novamente.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        error: 'Cliente HTTP indisponível.',
+      };
+    }
+
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = `del:${targetShiftId}:${movementId}`;
+
+    if (this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultCashShiftState(targetShiftId, authHeaders);
+      const remoteShift = preState.shift || undefined;
+      if (preState.verified && remoteShift && remoteShift.status === 'ABERTO') {
+        const stillExists = remoteShift.movements?.some((m) => m.id === movementId);
+        this.uncertainServerOps.delete(opKey);
+        if (!stillExists) {
+          this.commitOpenShiftLocally(remoteShift);
+          return {
+            success: true,
+            synced: true,
+            recoveredFromTimeout: true,
+            shift: remoteShift,
+          };
+        }
+      } else if (preState.verified && remoteShift && remoteShift.status === 'FECHADO') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          error: `Operação recusada: O turno de caixa '${targetShiftId}' já está FECHADO (HTTP 409).`,
+        };
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            synced: false,
+            rejected: true,
+            error:
+              'Não foi possível excluir o lançamento: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          success: false,
+          synced: false,
+          uncertain: true,
+          error:
+            'Não foi possível verificar o estado atual do lançamento no servidor. A exclusão não foi repetida automaticamente.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    const recoverDeleteState = async () => {
+      const state = await this.consultCashShiftState(targetShiftId, authHeaders);
+      const remoteShift = state.shift || undefined;
+      if (state.verified && remoteShift && remoteShift.status === 'ABERTO') {
+        const stillExists = remoteShift.movements?.some((m) => m.id === movementId);
+        this.uncertainServerOps.delete(opKey);
+        if (!stillExists) {
+          this.commitOpenShiftLocally(remoteShift);
+          return {
+            status: 'recovered' as const,
+            result: {
+              success: true,
+              synced: true,
+              recoveredFromTimeout: true,
+              shift: remoteShift,
+            },
+          };
+        }
+        return { status: 'not_committed' as const };
+      }
+      if (state.verified && (!state.exists || remoteShift?.status === 'FECHADO')) {
+        this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(
+        `/api/cash-shifts/${encodeURIComponent(targetShiftId)}/movements/${encodeURIComponent(movementId)}`,
+        {
+          method: 'DELETE',
+          headers: authHeaders,
+          ...(controller ? { signal: controller.signal } : {}),
+        }
+      );
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.shift &&
+        data.shift.id &&
+        data.shift.status === 'ABERTO'
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        this.commitOpenShiftLocally(data.shift as CashRegisterShift);
+        return {
+          success: true,
+          synced: true,
+          shift: data.shift as CashRegisterShift,
+        };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'a exclusão do lançamento no caixa');
+      if (resolution.kind === 'rejected') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          error: resolution.error,
+        };
+      }
+
+      const rec = await recoverDeleteState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          error: resolution.nonCommittedError,
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        error: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverDeleteState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          error: isTimeout
+            ? 'Tempo esgotado ao excluir lançamento; consulta ao servidor confirmou que o lançamento permanece ativo.'
+            : 'Falha de conexão ao excluir lançamento; consulta ao servidor confirmou que o lançamento permanece ativo.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          error:
+            'Não foi possível excluir o lançamento: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        error: isTimeout
+          ? 'Tempo esgotado ao excluir lançamento no servidor e o resultado permanece desconhecido.'
+          : 'Falha de comunicação ao excluir lançamento no servidor e não foi possível confirmar o resultado.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   // ==========================================
   // DAILY DELIVERY SHIFTS API (SUPERVISÃO DE ENTREGAS)
   // ==========================================
@@ -3333,8 +7097,8 @@ class StoreService {
       const data = localStorage.getItem('gf_current_delivery_shift');
       if (data) return JSON.parse(data);
 
-      // Default active open delivery shift for today
-      const today = new Date().toISOString().slice(0, 10);
+      // Default active open delivery shift for today (Fortaleza TZ)
+      const today = getFortalezaDateKey();
       const defaultShift: DeliveryShift = {
         id: `del-shift-${today}`,
         date: today,
@@ -3410,7 +7174,7 @@ class StoreService {
       return { success: false, shift: current, message: 'Já existe um movimento diário de entregas aberto.' };
     }
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getFortalezaDateKey();
     const newShift: DeliveryShift = {
       id: `del-shift-${today}-${Date.now()}`,
       date: today,
@@ -3473,8 +7237,8 @@ class StoreService {
       closedBy: undefined,
       notes: `${shift.notes || ''} (Reaberto por ${reopenedBy.userName})`.trim(),
     } : {
-      id: `del-shift-${new Date().toISOString().slice(0, 10)}-${Date.now()}`,
-      date: new Date().toISOString().slice(0, 10),
+      id: `del-shift-${getFortalezaDateKey()}-${Date.now()}`,
+      date: getFortalezaDateKey(),
       status: 'ABERTO',
       openedAt: new Date().toISOString(),
       openedBy: reopenedBy,
@@ -3573,44 +7337,563 @@ class StoreService {
   }
 
   // ==========================================
-  // RESTAURANT CONFIG API
+  // RESTAURANT CONFIG & PUBLIC AVAILABILITY API
   // ==========================================
   public getRestaurantConfig(): RestaurantConfig {
     try {
       const data = localStorage.getItem('gf_restaurant_config');
-      return data ? JSON.parse(data) : INITIAL_CONFIG;
+      const parsed = data ? (JSON.parse(data) as RestaurantConfig) : INITIAL_CONFIG;
+      const closedNormalized = normalizeClosedSettings(parsed);
+      return {
+        ...INITIAL_CONFIG,
+        ...parsed,
+        operatingHours: closedNormalized.operatingHours,
+        closedPrimaryMessage: closedNormalized.closedPrimaryMessage,
+        closedSecondaryMessage: closedNormalized.closedSecondaryMessage,
+      };
     } catch {
       return INITIAL_CONFIG;
     }
   }
 
-  public updateRestaurantConfig(config: RestaurantConfig): void {
-    localStorage.setItem('gf_restaurant_config', JSON.stringify(config));
-    this.notify('CONFIG_UPDATED', config);
+  public getLastPublicStoreAvailability(): PublicStoreAvailability | null {
+    return this.lastPublicAvailability;
+  }
 
-    if (db) {
-      const publicPayload = {
-        name: config.name,
-        phone: config.phone,
-        whatsapp: config.whatsapp,
-        address: config.address,
-        city: config.city,
-        pixKey: config.pixKey,
-        pixKeyType: config.pixKeyType || 'EMAIL',
-        pixReceiverName: config.pixReceiverName || config.name,
-        pixReceiverCity: config.pixReceiverCity || 'CAMPINA GRANDE',
-        deliveryFeeBase: config.deliveryFeeBase ?? 5.0,
-        avgPrepTimeMinutes: config.avgPrepTimeMinutes ?? 15,
-        avgDeliveryTimeMinutes: config.avgDeliveryTimeMinutes ?? 25,
-        isOpen: Boolean(config.isOpen),
-        ...(config.customPublicUrl ? { customPublicUrl: config.customPublicUrl } : {}),
-        updatedAt: new Date().toISOString()
+  private markLastPublicAvailabilityClosed(
+    reason: PublicStoreAvailability['reason'] = 'CASH_CLOSED',
+    message?: string
+  ): void {
+    const cfg = this.getRestaurantConfig();
+    const closedSettings = normalizeClosedSettings(cfg);
+    const closedAvailability: PublicStoreAvailability = {
+      verified: reason !== 'UNABLE_TO_VERIFY_CASH',
+      isOpen: false,
+      reason,
+      message,
+      activeShiftId: null,
+      closedSettings: this.lastPublicAvailability?.closedSettings || closedSettings,
+      restaurantPublicInfo: this.lastPublicAvailability?.restaurantPublicInfo || {
+        name: cfg.name || 'Amandita Sabores',
+        whatsapp: cfg.whatsapp || '',
+        phone: cfg.phone || '',
+        address: cfg.address || '',
+        city: cfg.city || '',
+      },
+      checkedAt: new Date().toISOString(),
+    };
+    this.lastPublicAvailability = closedAvailability;
+    try {
+      localStorage.setItem('gf_restaurant_config', JSON.stringify({ ...cfg, isOpen: false }));
+    } catch {}
+    this.notify('STORE_AVAILABILITY_UPDATED', closedAvailability);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'STORE_AVAILABILITY_UPDATED', payload: closedAvailability } }));
+    }
+  }
+
+  public async fetchPublicStoreAvailability(options?: { timeoutMs?: number }): Promise<PublicStoreAvailability> {
+    const cfg = this.getRestaurantConfig();
+    const fallbackClosedSettings = normalizeClosedSettings(cfg);
+    const failClosed = (message?: string): PublicStoreAvailability => {
+      const result: PublicStoreAvailability = {
+        verified: false,
+        isOpen: false,
+        reason: 'UNABLE_TO_VERIFY_CASH',
+        message: message || 'Não foi possível verificar no servidor se o estabelecimento está aberto no momento.',
+        activeShiftId: null,
+        closedSettings: this.lastPublicAvailability?.closedSettings || fallbackClosedSettings,
+        restaurantPublicInfo: this.lastPublicAvailability?.restaurantPublicInfo || {
+          name: cfg.name || 'Amandita Sabores',
+          whatsapp: cfg.whatsapp || '',
+          phone: cfg.phone || '',
+          address: cfg.address || '',
+          city: cfg.city || '',
+        },
+        checkedAt: new Date().toISOString(),
+      };
+      this.lastPublicAvailability = result;
+      this.notify('STORE_AVAILABILITY_UPDATED', result);
+      return result;
+    };
+
+    if (typeof fetch !== 'function') {
+      return failClosed('Cliente HTTP indisponível para verificar abertura do caixa.');
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 8000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    try {
+      const res = await fetch('/api/store/availability', {
+        method: 'GET',
+        headers: { 'Cache-Control': 'no-cache' },
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || typeof data !== 'object' || data.success === false) {
+        return failClosed(data?.message || `Servidor retornou erro HTTP ${res.status} ao verificar disponibilidade.`);
+      }
+
+      const closedSettings = normalizeClosedSettings(data.closedSettings || cfg);
+      const serverInfo = (data.restaurantPublicInfo || {}) as Partial<PublicStoreAvailability['restaurantPublicInfo']>;
+      const hasServerInfo = Boolean(data.hasServerRestaurantInfo);
+
+      const mergedRestaurantInfo = {
+        name: (hasServerInfo && serverInfo.name) ? serverInfo.name : (cfg.name || 'Amandita Sabores'),
+        whatsapp: (hasServerInfo && serverInfo.whatsapp) ? serverInfo.whatsapp : (cfg.whatsapp || ''),
+        phone: (hasServerInfo && serverInfo.phone) ? serverInfo.phone : (cfg.phone || ''),
+        address: (hasServerInfo && serverInfo.address) ? serverInfo.address : (cfg.address || ''),
+        city: (hasServerInfo && serverInfo.city) ? serverInfo.city : (cfg.city || ''),
       };
 
-      setDoc(doc(db, 'configs', 'restaurant'), publicPayload).catch((err) => {
-        handleFirestoreError(err, OperationType.WRITE, 'configs/restaurant');
-      });
+      const availability: PublicStoreAvailability = {
+        verified: Boolean(data.verified),
+        isOpen: Boolean(data.verified && data.isOpen),
+        reason: data.reason || (data.verified && data.isOpen ? 'CASH_OPEN' : 'CASH_CLOSED'),
+        message: typeof data.message === 'string' ? data.message : undefined,
+        activeShiftId: typeof data.activeShiftId === 'string' ? data.activeShiftId : null,
+        closedSettings,
+        restaurantPublicInfo: mergedRestaurantInfo,
+        hasServerRestaurantInfo: hasServerInfo,
+        checkedAt: typeof data.checkedAt === 'string' ? data.checkedAt : new Date().toISOString(),
+      };
+
+      this.lastPublicAvailability = availability;
+
+      const nextCfg: RestaurantConfig = {
+        ...cfg,
+        isOpen: availability.isOpen,
+        operatingHours: closedSettings.operatingHours,
+        closedPrimaryMessage: closedSettings.closedPrimaryMessage,
+        closedSecondaryMessage: closedSettings.closedSecondaryMessage,
+        ...(hasServerInfo && serverInfo.name ? { name: serverInfo.name } : {}),
+        ...(hasServerInfo && serverInfo.whatsapp ? { whatsapp: serverInfo.whatsapp } : {}),
+        ...(hasServerInfo && serverInfo.phone ? { phone: serverInfo.phone } : {}),
+        ...(hasServerInfo && serverInfo.address ? { address: serverInfo.address } : {}),
+        ...(hasServerInfo && serverInfo.city ? { city: serverInfo.city } : {}),
+      };
+
+      try {
+        localStorage.setItem('gf_restaurant_config', JSON.stringify(nextCfg));
+      } catch {}
+
+      this.notify('STORE_AVAILABILITY_UPDATED', availability);
+      return availability;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return failClosed(msg);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
+  }
+
+  public async loadStoreSettingsFromCloud(): Promise<{
+    success: boolean;
+    localOnly?: boolean;
+    config?: RestaurantConfig;
+    hasScheduleDoc?: boolean;
+    hasRestaurantDoc?: boolean;
+    error?: string;
+  }> {
+    const actor = this.getCurrentUser();
+    if (!this.canUserManageConfig(actor)) {
+      return {
+        success: false,
+        error: 'Permissão insuficiente: apenas Administrador ou Gerente podem carregar configurações administrativas.',
+      };
+    }
+
+    const currentLocal = this.getRestaurantConfig();
+
+    if (isFirebaseReady() && db) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          error: 'Sessão Firebase não autenticada. Faça login novamente para carregar as configurações da nuvem.',
+        };
+      }
+
+      const confirmedRole = await this.verifyStaffRole(auth.currentUser);
+      if (!confirmedRole || !['ADMINISTRADOR', 'GERENTE'].includes(confirmedRole.toUpperCase())) {
+        return {
+          success: false,
+          error: 'Perfil ativo sem permissão no Firebase para ler configurações administrativas.',
+        };
+      }
+
+      try {
+        const [restSnap, schedSnap] = await Promise.all([
+          getDocFromServer(doc(db, 'configs', 'restaurant')),
+          getDocFromServer(doc(db, 'configs', 'store_schedule')),
+        ]);
+
+        let internalData: Partial<RestaurantConfig> = {};
+        if (confirmedRole.toUpperCase() === 'ADMINISTRADOR') {
+          try {
+            const internalSnap = await getDocFromServer(doc(db, 'configs', 'internal'));
+            if (internalSnap.exists()) {
+              internalData = internalSnap.data() as Partial<RestaurantConfig>;
+            }
+          } catch {}
+        }
+
+        const remoteRestaurant = restSnap.exists() ? (restSnap.data() as Partial<RestaurantConfig>) : {};
+        const remoteSchedule = schedSnap.exists()
+          ? normalizeClosedSettings(schedSnap.data() as Partial<StoreClosedSettings>)
+          : {
+              operatingHours: currentLocal.operatingHours || DEFAULT_OPERATING_HOURS,
+              closedPrimaryMessage: currentLocal.closedPrimaryMessage || DEFAULT_CLOSED_PRIMARY_MESSAGE,
+              closedSecondaryMessage: currentLocal.closedSecondaryMessage ?? DEFAULT_CLOSED_SECONDARY_MESSAGE,
+            };
+
+        const mergedConfig: RestaurantConfig = {
+          ...currentLocal,
+          ...internalData,
+          ...remoteRestaurant,
+          operatingHours: remoteSchedule.operatingHours,
+          closedPrimaryMessage: remoteSchedule.closedPrimaryMessage,
+          closedSecondaryMessage: remoteSchedule.closedSecondaryMessage,
+        };
+
+        localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+        this.notify('CONFIG_UPDATED', mergedConfig);
+        return {
+          success: true,
+          config: mergedConfig,
+          hasRestaurantDoc: restSnap.exists(),
+          hasScheduleDoc: schedSnap.exists(),
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          success: false,
+          error: `Falha ao carregar configurações persistidas no Cloud Firestore: ${msg}`,
+        };
+      }
+    }
+
+    if (typeof fetch === 'function') {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 8000) : null;
+      try {
+        const authHeaders = await this.getFirebaseAuthHeaders();
+        const res = await fetch('/api/store/schedule', {
+          method: 'GET',
+          headers: authHeaders,
+          ...(controller ? { signal: controller.signal } : {}),
+        });
+        const data = await res.json().catch(() => null);
+
+        if (res.ok && data?.success && data.scheduleLoadOk && data.restaurantLoadOk) {
+          const remoteRestaurant = (data.restaurantConfig && typeof data.restaurantConfig === 'object')
+            ? (data.restaurantConfig as Partial<RestaurantConfig>)
+            : {};
+          const closedSettings = normalizeClosedSettings(data.closedSettings);
+
+          const mergedConfig: RestaurantConfig = {
+            ...currentLocal,
+            ...remoteRestaurant,
+            operatingHours: closedSettings.operatingHours,
+            closedPrimaryMessage: closedSettings.closedPrimaryMessage,
+            closedSecondaryMessage: closedSettings.closedSecondaryMessage,
+          };
+
+          localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+          this.notify('CONFIG_UPDATED', mergedConfig);
+          return {
+            success: true,
+            config: mergedConfig,
+            hasRestaurantDoc: Boolean(data.hasRestaurantDoc),
+            hasScheduleDoc: Boolean(data.hasScheduleDoc),
+          };
+        }
+
+        if (!this.serverAtomicPaymentTestOverride && res.status === 503 && data?.code === 'ADMIN_SDK_UNAVAILABLE') {
+          return {
+            success: true,
+            localOnly: true,
+            config: currentLocal,
+          };
+        }
+
+        return {
+          success: false,
+          error: data?.message || `Erro HTTP ${res.status} ao carregar configurações do servidor.`,
+        };
+      } catch (err: unknown) {
+        if (!this.serverAtomicPaymentTestOverride) {
+          return {
+            success: true,
+            localOnly: true,
+            config: currentLocal,
+          };
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          success: false,
+          error: `Falha de rede ao carregar configurações persistidas: ${msg}`,
+        };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    if (!this.serverAtomicPaymentTestOverride) {
+      return { success: true, localOnly: true, config: currentLocal };
+    }
+    return { success: false, error: 'Cliente HTTP indisponível para carregar configurações.' };
+  }
+
+  public async updateRestaurantConfigAsync(
+    config: RestaurantConfig
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    localOnly?: boolean;
+    message: string;
+    error?: string;
+    config?: RestaurantConfig;
+  }> {
+    const actor = this.getCurrentUser();
+    if (!this.canUserManageConfig(actor)) {
+      const errMsg = 'Permissão insuficiente: somente Administrador ou Gerente ativos podem alterar o cadastro PIX e as configurações da loja.';
+      return { success: false, synced: false, message: errMsg, error: errMsg };
+    }
+
+    const keyType = config.pixKeyType || 'EMAIL';
+    const rawPixKey = (config.pixKey || '').trim();
+    const pixValidation = validatePixKey(rawPixKey, keyType);
+    if (!pixValidation.valid) {
+      const errMsg = pixValidation.error || 'Chave PIX inválida para o tipo selecionado.';
+      return { success: false, synced: false, message: errMsg, error: errMsg };
+    }
+
+    const receiverCheck = validatePixReceiver(config.pixReceiverName, config.pixReceiverCity);
+    if (!receiverCheck.valid) {
+      const errMsg = receiverCheck.error || 'Informe o Nome e a Cidade do Titular da conta PIX.';
+      return { success: false, synced: false, message: errMsg, error: errMsg };
+    }
+    const receiverName = receiverCheck.receiverName;
+    const receiverCity = receiverCheck.receiverCity;
+
+    const waCheck = validateWhatsAppNumber(config.whatsapp);
+    if (!waCheck.valid) {
+      const errMsg = waCheck.error || 'Número de WhatsApp inválido.';
+      return { success: false, synced: false, message: errMsg, error: errMsg };
+    }
+
+    let validatedHours: DayOperatingHours[] = DEFAULT_OPERATING_HOURS;
+    if (config.operatingHours !== undefined) {
+      const hoursCheck = validateOperatingHours(config.operatingHours);
+      if (!hoursCheck.valid) {
+        const errMsg = hoursCheck.error || 'Horários de funcionamento inválidos.';
+        return { success: false, synced: false, message: errMsg, error: errMsg };
+      }
+      validatedHours = hoursCheck.hours;
+    } else {
+      const existingCfg = this.getRestaurantConfig();
+      validatedHours = existingCfg.operatingHours || DEFAULT_OPERATING_HOURS;
+    }
+
+    let closedPrimaryMessage = DEFAULT_CLOSED_PRIMARY_MESSAGE;
+    if (config.closedPrimaryMessage !== undefined) {
+      if (!config.closedPrimaryMessage.trim()) {
+        const errMsg = 'Informe a mensagem principal da página de estabelecimento fechado.';
+        return { success: false, synced: false, message: errMsg, error: errMsg };
+      }
+      closedPrimaryMessage = config.closedPrimaryMessage.trim().slice(0, 200);
+    } else {
+      closedPrimaryMessage = this.getRestaurantConfig().closedPrimaryMessage || DEFAULT_CLOSED_PRIMARY_MESSAGE;
+    }
+
+    const closedSecondaryMessage =
+      config.closedSecondaryMessage !== undefined
+        ? config.closedSecondaryMessage.trim().slice(0, 500)
+        : (this.getRestaurantConfig().closedSecondaryMessage ?? DEFAULT_CLOSED_SECONDARY_MESSAGE);
+
+    const normalizedConfig: RestaurantConfig = {
+      ...config,
+      name: (config.name || 'Amandita Sabores').trim(),
+      phone: (config.phone || '').trim(),
+      whatsapp: waCheck.normalized,
+      address: (config.address || '').trim(),
+      city: (config.city || '').trim(),
+      pixKeyType: keyType,
+      pixKey: pixValidation.normalized,
+      pixReceiverName: receiverName,
+      pixReceiverCity: receiverCity,
+      deliveryFeeBase: Number.isFinite(Number(config.deliveryFeeBase)) ? Math.max(0, Number(config.deliveryFeeBase)) : 0,
+      avgPrepTimeMinutes: Number.isFinite(Number(config.avgPrepTimeMinutes)) ? Math.max(1, Math.round(Number(config.avgPrepTimeMinutes))) : 15,
+      avgDeliveryTimeMinutes: Number.isFinite(Number(config.avgDeliveryTimeMinutes)) ? Math.max(1, Math.round(Number(config.avgDeliveryTimeMinutes))) : 25,
+      isOpen: Boolean(config.isOpen),
+      customPublicUrl: config.customPublicUrl?.trim() || undefined,
+      receiptFooterText: config.receiptFooterText ?? '',
+      defaultDeliveryPersonId: config.defaultDeliveryPersonId ?? '',
+      operatingHours: validatedHours,
+      closedPrimaryMessage,
+      closedSecondaryMessage,
+    };
+
+    const buildPublicRestaurantPayload = (updatedAt: string): Record<string, unknown> => {
+      const payload: Record<string, unknown> = {
+        name: normalizedConfig.name,
+        phone: normalizedConfig.phone,
+        whatsapp: normalizedConfig.whatsapp,
+        address: normalizedConfig.address,
+        city: normalizedConfig.city,
+        pixKey: normalizedConfig.pixKey,
+        pixKeyType: normalizedConfig.pixKeyType,
+        pixReceiverName: normalizedConfig.pixReceiverName,
+        pixReceiverCity: normalizedConfig.pixReceiverCity,
+        deliveryFeeBase: normalizedConfig.deliveryFeeBase,
+        avgPrepTimeMinutes: normalizedConfig.avgPrepTimeMinutes,
+        avgDeliveryTimeMinutes: normalizedConfig.avgDeliveryTimeMinutes,
+        isOpen: normalizedConfig.isOpen,
+        updatedAt,
+      };
+      if (normalizedConfig.customPublicUrl) {
+        payload.customPublicUrl = normalizedConfig.customPublicUrl;
+      }
+      return payload;
+    };
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser || !db) {
+        const errMsg = 'Sessão Firebase não autenticada. Faça login novamente antes de salvar configurações na nuvem.';
+        return { success: false, synced: false, message: errMsg, error: errMsg };
+      }
+
+      const confirmedRole = await this.verifyStaffRole(auth.currentUser);
+      if (!confirmedRole || !['ADMINISTRADOR', 'GERENTE'].includes(confirmedRole.toUpperCase())) {
+        const errMsg = 'Permissão negada no Firebase (403): apenas Administrador ou Gerente com perfil ativo em /users/{uid} podem gravar configurações PIX.';
+        return { success: false, synced: false, message: errMsg, error: errMsg };
+      }
+
+      if (typeof fetch !== 'function') {
+        const errMsg = 'Cliente HTTP indisponível para confirmar gravação atômica das configurações no servidor.';
+        return { success: false, synced: false, message: errMsg, error: errMsg };
+      }
+
+      const updatedAt = new Date().toISOString();
+      const publicPayload = buildPublicRestaurantPayload(updatedAt);
+
+      try {
+        const authHeaders = await this.getFirebaseAuthHeaders();
+        const schedRes = await fetch('/api/store/schedule', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            operatingHours: normalizedConfig.operatingHours,
+            closedPrimaryMessage: normalizedConfig.closedPrimaryMessage,
+            closedSecondaryMessage: normalizedConfig.closedSecondaryMessage,
+            whatsapp: normalizedConfig.whatsapp,
+            restaurantConfig: publicPayload,
+          }),
+        });
+        const schedData = await schedRes.json().catch(() => null);
+        if (!schedRes.ok || !schedData?.success || schedData?.persistedToFirestore !== true) {
+          const msg =
+            schedData?.message ||
+            `Não foi possível confirmar a gravação no Cloud Firestore (HTTP ${schedRes.status}).`;
+          return { success: false, synced: false, message: msg, error: msg };
+        }
+      } catch (schedFetchErr: unknown) {
+        const msg = schedFetchErr instanceof Error ? schedFetchErr.message : String(schedFetchErr);
+        return {
+          success: false,
+          synced: false,
+          message: `Falha de comunicação ao gravar configurações no Cloud Firestore: ${msg}`,
+          error: msg,
+        };
+      }
+
+      // Persist internal/private fields in configs/internal when Administrator (best-effort; never blocks save for Gerente)
+      if (confirmedRole.toUpperCase() === 'ADMINISTRADOR') {
+        const internalPayload = {
+          receiptFooterText: normalizedConfig.receiptFooterText || '',
+          defaultDeliveryPersonId: normalizedConfig.defaultDeliveryPersonId || '',
+          notifyNewOrders: normalizedConfig.notifyNewOrders !== false,
+          notifyDeliveryConfirmed: normalizedConfig.notifyDeliveryConfirmed !== false,
+          notifyReadyForDelivery: normalizedConfig.notifyReadyForDelivery !== false,
+          updatedAt,
+        };
+        await setDoc(doc(db, 'configs', 'internal'), this.cleanForFirestore(internalPayload), { merge: true }).catch((intErr) => {
+          console.warn('[Firestore Internal Config] Aviso ao gravar configs/internal:', intErr);
+        });
+      }
+
+      localStorage.setItem('gf_restaurant_config', JSON.stringify(normalizedConfig));
+      this.notify('CONFIG_UPDATED', normalizedConfig);
+      return {
+        success: true,
+        synced: true,
+        message: 'Configurações, chave PIX e horários salvos atomicamente no Cloud Firestore!',
+        config: normalizedConfig,
+      };
+    }
+
+    // In atomic test/server mode, persist BOTH configs/restaurant and configs/store_schedule atomically via backend (NEVER false local success)
+    if (this.serverAtomicPaymentTestOverride) {
+      if (typeof fetch !== 'function') {
+        const errMsg = 'Cliente HTTP indisponível para persistir configurações no servidor.';
+        return { success: false, synced: false, message: errMsg, error: errMsg };
+      }
+      try {
+        const updatedAt = new Date().toISOString();
+        const publicPayload = buildPublicRestaurantPayload(updatedAt);
+        const authHeaders = await this.getFirebaseAuthHeaders();
+        const schedRes = await fetch('/api/store/schedule', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            operatingHours: normalizedConfig.operatingHours,
+            closedPrimaryMessage: normalizedConfig.closedPrimaryMessage,
+            closedSecondaryMessage: normalizedConfig.closedSecondaryMessage,
+            whatsapp: normalizedConfig.whatsapp,
+            restaurantConfig: publicPayload,
+          }),
+        });
+        const schedData = await schedRes.json().catch(() => null);
+        if (!schedRes.ok || !schedData?.success || schedData?.persistedToFirestore !== true) {
+          const errMsg =
+            schedData?.message ||
+            `Erro HTTP ${schedRes.status} ao confirmar gravação das configurações no Cloud Firestore.`;
+          return { success: false, synced: false, message: errMsg, error: errMsg };
+        }
+        localStorage.setItem('gf_restaurant_config', JSON.stringify(normalizedConfig));
+        this.notify('CONFIG_UPDATED', normalizedConfig);
+        return {
+          success: true,
+          synced: true,
+          message: 'Configurações, chave PIX e horários salvos atomicamente no Cloud Firestore!',
+          config: normalizedConfig,
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { success: false, synced: false, message: msg, error: msg };
+      }
+    }
+
+    // Local contingency mode (Firebase not configured)
+    localStorage.setItem('gf_restaurant_config', JSON.stringify(normalizedConfig));
+    this.notify('CONFIG_UPDATED', normalizedConfig);
+    return {
+      success: true,
+      synced: false,
+      localOnly: true,
+      message: 'Configurações salvas em modo de contingência local (este dispositivo apenas — Firebase não configurado).',
+      config: normalizedConfig,
+    };
+  }
+
+  public updateRestaurantConfig(config: RestaurantConfig): void {
+    this.updateRestaurantConfigAsync(config).catch((err) => {
+      console.warn('[Store] Erro ao atualizar configuração do restaurante:', err);
+    });
   }
 
   // ==========================================
@@ -4012,6 +8295,14 @@ class StoreService {
     cancelledBy: string,
     refundPaymentMethodOverride?: PaymentMethod
   ): { success: boolean; message: string; order?: Order; refundInfo?: OrderRefundInfo } {
+    if (this.shouldUseServerAtomicPayment()) {
+      console.warn('[Security Guard] Em modo nuvem/atômico, use exclusivamente cancelOrderAsync().');
+      return {
+        success: false,
+        message: 'Operação bloqueada: utilize cancelOrderAsync() para cancelamento atômico no servidor.',
+      };
+    }
+
     const orders = this.getOrders();
     const order = orders.find((o) => o.id === orderId);
     if (!order) {
@@ -4060,10 +8351,6 @@ class StoreService {
       soundService.playSuccessTone();
       this.notify('ORDER_UPDATED', order);
 
-      // Persist to Cloud Firestore
-      this.queueOrderForSync(order);
-      this.persistOrderToFirestore(order).catch(() => {});
-
       return {
         success: true,
         message: `Pedido ${order.orderNumber} cancelado com sucesso. Como não havia pagamento registrado, nenhuma movimentação financeira foi gerada.`,
@@ -4083,13 +8370,11 @@ class StoreService {
     let targetShiftId: string | undefined = undefined;
     let isPendingCashRecord = false;
 
-    // Verificar se existe turno de caixa aberto no momento
     const currentShift = this.getCurrentCashShift();
     if (currentShift && currentShift.status === 'ABERTO') {
       targetShiftId = currentShift.id;
-      // Trava de idempotência: verificar se este estorno já foi lançado neste turno
       const alreadyRefunded = currentShift.movements.some(
-        (m) => m.type === 'ESTORNO' && m.orderId === order.id
+        (m) => m.type === 'ESTORNO' && (m.orderId === order.id || m.id === movementId)
       );
 
       if (!alreadyRefunded) {
@@ -4114,12 +8399,9 @@ class StoreService {
         cashMovementId = movementId;
       }
     } else {
-      // Turno original fechado ou sem caixa aberto: NÃO violar a imutabilidade do fechamento!
-      // Registra a devolução como pendente de conciliação no próximo turno de caixa.
       isPendingCashRecord = true;
     }
 
-    // Estruturar dados de auditoria da devolução vinculados ao pedido
     const refundInfo: OrderRefundInfo = {
       id: refundId,
       orderId: order.id,
@@ -4157,10 +8439,6 @@ class StoreService {
     soundService.playSuccessTone();
     this.notify('ORDER_UPDATED', order);
 
-    // Persist to Cloud Firestore (both orders and public_tracking)
-    this.queueOrderForSync(order);
-    this.persistOrderToFirestore(order).catch(() => {});
-
     const warningMsg = isPendingCashRecord
       ? ' ATENÇÃO: Nenhum turno de caixa aberto no momento. O estorno foi registrado no pedido e aguarda conferência de caixa.'
       : refundPaymentMethod === 'DINHEIRO'
@@ -4175,250 +8453,733 @@ class StoreService {
     };
   }
 
+  public async cancelOrderAsync(
+    orderId: string,
+    reason: string,
+    cancelledBy: string,
+    refundPaymentMethodOverride?: PaymentMethod,
+    options?: { shiftId?: string; timeoutMs?: number }
+  ): Promise<{
+    success: boolean;
+    synced: boolean;
+    rejected?: boolean;
+    uncertain?: boolean;
+    recoveredFromTimeout?: boolean;
+    message: string;
+    order?: Order;
+    refundInfo?: OrderRefundInfo;
+  }> {
+    const currentUser = this.getCurrentUser();
+    if (currentUser && !this.canUserDeleteOrder(currentUser)) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        message: 'Permissão insuficiente: apenas Administrador ou Gerente podem cancelar pedidos e autorizar estornos.',
+      };
+    }
+
+    const cleanReason = reason.trim();
+    if (!cleanReason || cleanReason.length < 3) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        message: 'O motivo do cancelamento é obrigatório e deve ter pelo menos 3 caracteres.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const localRes = this.cancelOrder(orderId, cleanReason, cancelledBy, refundPaymentMethodOverride);
+      return { ...localRes, synced: false };
+    }
+
+    // Cloud / Server Atomic Mode: NEVER mutate local gf_orders or gf_current_cash_shift before server commit!
+    await this.waitForFirebaseAuthReady();
+    if (isFirebaseReady() && !auth?.currentUser) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        message: 'Sessão Firebase não autenticada. Faça login novamente antes de cancelar pedidos.',
+      };
+    }
+
+    const localOrder = this.getOrderById(orderId);
+    if (localOrder && localOrder.status === 'CANCELADO') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        order: localOrder,
+        message: 'Este pedido já se encontra cancelado.',
+      };
+    }
+
+    if (localOrder && localOrder.refundInfo) {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        order: localOrder,
+        message: 'Este pedido já possui uma devolução/estorno registrada anteriormente.',
+      };
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        synced: false,
+        rejected: true,
+        message: 'Cliente HTTP indisponível para cancelamento atômico no servidor.',
+      };
+    }
+
+    const authHeaders = await this.getFirebaseAuthHeaders();
+    const opKey = `cancel:${orderId}`;
+
+    if (this.uncertainServerOps.has(opKey)) {
+      const preState = await this.consultOrderCancelState(orderId, authHeaders);
+      const stateData = preState.data;
+      if (
+        preState.verified &&
+        stateData?.exists &&
+        stateData?.cancelled &&
+        stateData?.order &&
+        (stateData?.paymentStatus !== 'PAGO' || stateData?.refundRecorded)
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const recovered = this.commitConfirmedServerOrderAndShift(
+          stateData.order as Order,
+          (stateData.shift as CashRegisterShift) || null
+        );
+        soundService.playSuccessTone();
+        this.notify('ORDER_UPDATED', recovered);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_UPDATED', payload: recovered } }));
+        }
+        return {
+          success: true,
+          synced: true,
+          recoveredFromTimeout: true,
+          message: `Cancelamento do pedido ${recovered.orderNumber} confirmado após reconciliação com o servidor.`,
+          order: recovered,
+          refundInfo: (stateData.refundInfo as OrderRefundInfo) || recovered.refundInfo,
+        };
+      }
+      if (preState.verified && (!stateData?.exists || !stateData?.cancelled)) {
+        this.uncertainServerOps.delete(opKey);
+      } else {
+        const health = await this.checkServerAdminSdkHealth();
+        if (health.reachable && health.hasAdminSdk === false) {
+          this.uncertainServerOps.delete(opKey);
+          return {
+            success: false,
+            synced: false,
+            rejected: true,
+            message:
+              'Não foi possível cancelar o pedido: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+          };
+        }
+        return {
+          success: false,
+          synced: false,
+          uncertain: true,
+          message:
+            'Não foi possível verificar o estado anterior do cancelamento no servidor. A requisição não foi repetida para evitar estorno duplicado.',
+        };
+      }
+    }
+
+    const timeoutMs = options?.timeoutMs ?? 15000;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    const currentShift = this.getCurrentCashShift();
+    const shiftIdToSend = options?.shiftId || (currentShift?.status === 'ABERTO' ? currentShift.id : undefined);
+
+    const recoverCancelState = async () => {
+      const state = await this.consultOrderCancelState(orderId, authHeaders);
+      const stateData = state.data;
+      if (
+        state.verified &&
+        stateData?.exists &&
+        stateData?.cancelled &&
+        stateData?.order &&
+        (stateData?.paymentStatus !== 'PAGO' || stateData?.refundRecorded)
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const recovered = this.commitConfirmedServerOrderAndShift(
+          stateData.order as Order,
+          (stateData.shift as CashRegisterShift) || null
+        );
+        soundService.playSuccessTone();
+        this.notify('ORDER_UPDATED', recovered);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_UPDATED', payload: recovered } }));
+        }
+        return {
+          status: 'recovered' as const,
+          result: {
+            success: true,
+            synced: true,
+            recoveredFromTimeout: true,
+            message: `Cancelamento do pedido ${recovered.orderNumber} confirmado após reconciliação com o servidor.`,
+            order: recovered,
+            refundInfo: (stateData.refundInfo as OrderRefundInfo) || recovered.refundInfo,
+          },
+        };
+      }
+      if (state.verified && (!stateData?.exists || !stateData?.cancelled)) {
+        this.uncertainServerOps.delete(opKey);
+        return { status: 'not_committed' as const };
+      }
+      return { status: 'unknown' as const };
+    };
+
+    try {
+      const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/cancel`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          reason: cleanReason,
+          cancelledBy: cancelledBy.trim() || 'Operador',
+          ...(refundPaymentMethodOverride ? { refundPaymentMethodOverride } : {}),
+          ...(shiftIdToSend ? { shiftId: shiftIdToSend } : {}),
+        }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+
+      if (
+        parsed.ok &&
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        data?.success === true &&
+        data?.order &&
+        data.order.id &&
+        data.order.status === 'CANCELADO'
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        const committed = this.commitConfirmedServerOrderAndShift(
+          data.order as Order,
+          (data.shift as CashRegisterShift) || null
+        );
+        soundService.playSuccessTone();
+        this.notify('ORDER_UPDATED', committed);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'ORDER_UPDATED', payload: committed } }));
+        }
+        return {
+          success: true,
+          synced: true,
+          message: data.message || `Pedido ${committed.orderNumber} cancelado atomicamente.`,
+          order: committed,
+          refundInfo: (data.refundInfo as OrderRefundInfo) || committed.refundInfo,
+        };
+      }
+
+      const resolution = await this.resolveFinancialHttpFailure(parsed, 'o cancelamento do pedido');
+      if (resolution.kind === 'rejected') {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          message: resolution.error,
+        };
+      }
+
+      const rec = await recoverCancelState();
+      if (rec.status === 'recovered') return rec.result;
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          message: resolution.nonCommittedError,
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        message: resolution.uncertainError,
+      };
+    } catch (fetchErr: unknown) {
+      const rec = await recoverCancelState();
+      if (rec.status === 'recovered') return rec.result;
+      const isTimeout = this.isTimeoutFetchError(fetchErr);
+
+      if (rec.status === 'not_committed') {
+        return {
+          success: false,
+          synced: false,
+          rejected: false,
+          uncertain: false,
+          message: isTimeout
+            ? 'Tempo esgotado ao cancelar o pedido; consulta ao servidor confirmou que o pedido não foi cancelado.'
+            : 'Falha de conexão ao cancelar o pedido; consulta ao servidor confirmou que o pedido não foi cancelado.',
+        };
+      }
+
+      const health = await this.checkServerAdminSdkHealth();
+      if (health.reachable && health.hasAdminSdk === false) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          message:
+            'Não foi possível cancelar o pedido: Firebase Admin SDK indisponível no servidor (hasAdminSdk: false). Nenhuma alteração foi gravada.',
+        };
+      }
+
+      this.uncertainServerOps.set(opKey, Date.now());
+      return {
+        success: false,
+        synced: false,
+        uncertain: true,
+        message: isTimeout
+          ? 'Tempo esgotado ao cancelar o pedido no servidor e o resultado permanece desconhecido. Nenhum dado local foi alterado.'
+          : 'Falha de comunicação com o servidor ao cancelar o pedido. Nenhum dado local foi alterado.',
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   // ---- Login & Authentication ----
+  private upsertLocalUserCleanly(profile: User, legacyId?: string): void {
+    const users = this.getUsers();
+    const cleanEmail = (profile.email || '').trim().toLowerCase();
+    const cleanUsername = (profile.username || '').trim().toLowerCase();
+    const filtered = users.filter((u) => {
+      if (u.id === profile.id) return false;
+      if (legacyId && u.id === legacyId) return false;
+      const uEmail = (u.email || '').trim().toLowerCase();
+      if (cleanEmail && uEmail && uEmail === cleanEmail) return false;
+      const uUsername = (u.username || '').trim().toLowerCase();
+      if (cleanUsername && uUsername && uUsername === cleanUsername) return false;
+      return true;
+    });
+    filtered.push(profile);
+    localStorage.setItem('gf_users', JSON.stringify(filtered));
+  }
+
   public async loginWithGoogle(): Promise<{ success: boolean; message: string; user?: User; isCloudAuth?: boolean }> {
+    if (!isFirebaseReady() || !auth) {
+      return {
+        success: false,
+        isCloudAuth: false,
+        message: 'Firebase Authentication não está configurado neste dispositivo.',
+      };
+    }
+
     try {
       const fbUser = await signInWithGoogle();
       if (!fbUser) {
-        return { success: false, message: 'Operação de login com Google cancelada.' };
+        return { success: false, isCloudAuth: false, message: 'Operação de login com Google cancelada.' };
       }
 
-      const users = this.getUsers();
-      const adminEmail = this.getInitialAdminEmail();
       const fbEmail = (fbUser.email || '').trim().toLowerCase();
-      const isAdminEmail = fbEmail === adminEmail;
+      const isBootstrapAdmin = this.isBootstrappedAdminEmail(fbEmail);
+      const users = this.getUsers();
+      const localMatch = users.find((u) => u.id === fbUser.uid || (fbEmail && (u.email || '').trim().toLowerCase() === fbEmail));
+      const legacyId = localMatch && localMatch.id !== fbUser.uid ? localMatch.id : undefined;
 
-      let matched = users.find((u) => u.id === fbUser.uid || (fbEmail && u.email.trim().toLowerCase() === fbEmail));
-
-      if (matched) {
-        // Link existing employee to Firebase UID
-        matched.id = fbUser.uid;
-        matched.email = fbUser.email || matched.email;
-        matched.isEmailVerified = fbUser.emailVerified;
-        matched.authProvider = 'firebase_google';
-        matched.firebaseUid = fbUser.uid;
-        matched.lastLoginAt = new Date().toISOString();
-        if (isAdminEmail) {
-          matched.role = 'ADMINISTRADOR';
+      let remoteProfile: User | null = null;
+      if (db) {
+        try {
+          const snap = await getDoc(doc(db, 'users', fbUser.uid));
+          if (snap.exists()) {
+            remoteProfile = snap.data() as User;
+          }
+        } catch (readErr) {
+          console.warn('[Auth Google] Falha ao ler /users/{uid}:', readErr);
         }
-        this.updateUser(matched.id, matched);
-      } else if (isAdminEmail) {
-        // Bootstrap authorized administrator
-        matched = {
+      }
+
+      const now = new Date().toISOString();
+      let resolvedProfile: User | null = null;
+
+      if (remoteProfile) {
+        if (remoteProfile.status === 'BLOQUEADO') {
+          await signOutFirebase().catch(() => {});
+          return { success: false, isCloudAuth: false, message: 'Esta conta está bloqueada pelo administrador.' };
+        }
+        if (remoteProfile.status === 'DESATIVADO') {
+          await signOutFirebase().catch(() => {});
+          return { success: false, isCloudAuth: false, message: 'Esta conta foi desativada.' };
+        }
+        resolvedProfile = {
+          ...remoteProfile,
+          id: fbUser.uid,
+          email: fbUser.email || remoteProfile.email,
+          isEmailVerified: fbUser.emailVerified,
+          authProvider: 'firebase_google',
+          firebaseUid: fbUser.uid,
+          lastLoginAt: now,
+        };
+      } else if (localMatch) {
+        if (localMatch.status === 'BLOQUEADO' || localMatch.status === 'DESATIVADO') {
+          await signOutFirebase().catch(() => {});
+          return { success: false, isCloudAuth: false, message: 'Esta conta de colaborador está bloqueada ou desativada.' };
+        }
+        resolvedProfile = {
+          ...localMatch,
+          id: fbUser.uid,
+          email: fbUser.email || localMatch.email,
+          isEmailVerified: fbUser.emailVerified,
+          authProvider: 'firebase_google',
+          firebaseUid: fbUser.uid,
+          lastLoginAt: now,
+          ...(isBootstrapAdmin ? { role: 'ADMINISTRADOR' as UserRole } : {}),
+        };
+      } else if (isBootstrapAdmin) {
+        resolvedProfile = {
           id: fbUser.uid,
           name: fbUser.displayName || 'Amanda Silveira (Admin)',
           username: fbEmail.split('@')[0] || 'admin',
-          email: fbUser.email || adminEmail,
+          email: fbUser.email || fbEmail,
           isEmailVerified: fbUser.emailVerified,
           role: 'ADMINISTRADOR',
           status: 'ATIVO',
           allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
           authProvider: 'firebase_google',
           firebaseUid: fbUser.uid,
-          createdAt: new Date().toISOString(),
-          lastLoginAt: new Date().toISOString()
+          createdAt: now,
+          lastLoginAt: now,
         };
-        users.push(matched);
-        localStorage.setItem('gf_users', JSON.stringify(users));
-
-        if (db) {
-          setDoc(doc(db, 'users', matched.id), matched).catch(() => {});
-        }
       } else {
-        // Security rule: Do NOT grant staff roles to unapproved/unknown Google accounts!
-        await signOutFirebase();
+        await signOutFirebase().catch(() => {});
         return {
           success: false,
-          message: 'Esta conta Google não está vinculada a nenhum colaborador da equipe Amandita Sabores. Solicite seu cadastro ao administrador.'
+          isCloudAuth: false,
+          message: 'Esta conta Google não está vinculada a nenhum colaborador ativo em /users/{uid}. Solicite seu cadastro ao administrador.',
         };
       }
 
-      this.setCurrentUser(matched);
+      let finalProfile: User = resolvedProfile;
+
+      // Confirm /users/{uid} existence/sync in Firestore before declaring cloud login successful
+      if (db) {
+        try {
+          if (remoteProfile) {
+            await updateDoc(doc(db, 'users', fbUser.uid), { lastLoginAt: now });
+          } else {
+            await setDoc(doc(db, 'users', fbUser.uid), this.cleanForFirestore(finalProfile));
+          }
+        } catch (fsErr: any) {
+          // Try backend /api/auth/sync-profile if client self-create was blocked (e.g. non-bootstrap email linking)
+          let syncedViaBackend = false;
+          if (typeof window !== 'undefined') {
+            try {
+              const idToken = await fbUser.getIdToken();
+              const syncRes = await fetch('/api/auth/sync-profile', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${idToken}`,
+                },
+                body: JSON.stringify({
+                  name: finalProfile.name,
+                  username: finalProfile.username,
+                  allowedModules: finalProfile.allowedModules,
+                }),
+              });
+              const syncData = await syncRes.json().catch(() => ({}));
+              if (syncRes.ok && syncData.success && syncData.profile) {
+                finalProfile = { ...finalProfile, ...syncData.profile, id: fbUser.uid, firebaseUid: fbUser.uid, authProvider: 'firebase_google' };
+                syncedViaBackend = true;
+              }
+            } catch {}
+          }
+          if (!syncedViaBackend) {
+            await signOutFirebase().catch(() => {});
+            return {
+              success: false,
+              isCloudAuth: false,
+              message: `Conta Google autenticada, mas não foi possível confirmar seu perfil ativo no Firestore (/users/${fbUser.uid}): ${fsErr?.message || 'Erro de permissão'}`,
+            };
+          }
+        }
+      }
+
+      this.upsertLocalUserCleanly(finalProfile, legacyId);
+      this.setCurrentUser(finalProfile);
+      await this.initStaffFirestoreSync(fbUser);
+
       this.logAccess({
-        userId: matched.id,
-        username: matched.username,
-        role: matched.role,
+        userId: finalProfile.id,
+        username: finalProfile.username,
+        role: finalProfile.role,
         action: 'LOGIN_SUCESSO',
-        details: `Login via Firebase Google Auth (${matched.email})`,
+        details: `Login via Firebase Google Auth (${finalProfile.email})`,
       });
 
-      return { success: true, message: 'Autenticado com sucesso via Firebase Google Auth!', user: matched, isCloudAuth: true };
+      return {
+        success: true,
+        message: 'Autenticado com sucesso via Firebase Google Auth!',
+        user: finalProfile,
+        isCloudAuth: true,
+      };
     } catch (err: unknown) {
       const msg = formatFirebaseAuthError(err);
-      return { success: false, message: `Falha na autenticação Google: ${msg}` };
+      return { success: false, isCloudAuth: false, message: `Falha na autenticação Google: ${msg}` };
     }
   }
 
   public async login(
-    loginOrEmail: string, 
+    loginOrEmail: string,
     password: string
-  ): Promise<{ success: boolean; message: string; user?: User; isCloudAuth?: boolean }> {
+  ): Promise<{ success: boolean; message: string; user?: User; isCloudAuth?: boolean; isLocalContingency?: boolean }> {
     const rawInput = loginOrEmail.trim();
     if (!rawInput || !password.trim()) {
-      return { success: false, message: 'Por favor, informe seu nome de usuário e senha.' };
+      return { success: false, isCloudAuth: false, message: 'Por favor, informe seu nome de usuário e senha.' };
     }
 
     const users = this.getUsers();
     const term = rawInput.toLowerCase();
 
-    // 1. Identify employee candidate to resolve username
-    let localCandidate = users.find(
+    // 1. Identify local employee candidate to resolve username -> email
+    const localCandidate = users.find(
       (u) => (u.username || '').toLowerCase() === term || (u.email || '').toLowerCase() === term
     );
-
-    // If candidate not cached locally, query Firestore
-    if (!localCandidate && db) {
-      try {
-        const userQuery = query(collection(db, 'users'), where('username', '==', term));
-        const querySnap = await getDocs(userQuery);
-        if (!querySnap.empty) {
-          localCandidate = querySnap.docs[0].data() as User;
-          users.push(localCandidate);
-          localStorage.setItem('gf_users', JSON.stringify(users));
-        }
-      } catch {
-        // Query error ignored
-      }
-    }
 
     // Resolve target email for Firebase Auth
     let targetEmail = term;
     if (!targetEmail.includes('@')) {
-      if (localCandidate && localCandidate.email.includes('@')) {
-        targetEmail = localCandidate.email.toLowerCase();
+      if (localCandidate && localCandidate.email && localCandidate.email.includes('@')) {
+        targetEmail = localCandidate.email.trim().toLowerCase();
+      } else if (term === 'admin') {
+        targetEmail = this.getInitialAdminEmail();
       } else {
         targetEmail = `${term}@staff.amanditasabores.com.br`;
       }
     }
 
-    const adminEmail = this.getInitialAdminEmail();
-    const isDesignatedAdmin = targetEmail === adminEmail;
+    const isBootstrapAdmin = this.isBootstrappedAdminEmail(targetEmail);
 
-    // 2. If Firebase Authentication is active and initialized, attempt background cloud login
+    // 2. CLOUD AUTHENTICATION PATH (STRICT when Firebase is configured — NEVER silently falls back to local auth)
     if (isFirebaseReady() && auth) {
+      const currentFbEmail = (auth.currentUser?.email || '').trim().toLowerCase();
+      if (auth.currentUser && currentFbEmail && currentFbEmail !== targetEmail) {
+        await signOutFirebase().catch(() => {});
+      }
+
       let fbUser: any = null;
+      let firebaseAuthErr: unknown = null;
+
       try {
         fbUser = await signInWithEmail(targetEmail, password);
       } catch (fbErr: unknown) {
-        // If signIn fails (e.g. user does not exist in Firebase Auth yet), check if credentials match local staff
-        const passwords = this.getUserPasswords();
-        const storedPass = localCandidate ? (passwords[localCandidate.id] || '123456') : null;
-        if (localCandidate && storedPass && password.trim() === storedPass.trim()) {
-          try {
-            fbUser = await createUserWithEmail(targetEmail, password);
-          } catch (createErr: unknown) {
-            console.warn('[Firebase Auth Auto-Provision]:', createErr);
-          }
-        }
-      }
-
-      if (fbUser) {
-        try {
-          let profile: User | null = null;
-
-          if (db) {
+        firebaseAuthErr = fbErr;
+        // Only allow initial Firebase Auth user creation if a matching local staff account exists with the exact stored initial password
+        const errCode = String((fbErr as any)?.code || '');
+        if (errCode !== 'auth/wrong-password' && errCode !== 'auth/user-disabled' && errCode !== 'auth/too-many-requests') {
+          const passwords = this.getUserPasswords();
+          const storedPass = localCandidate ? (passwords[localCandidate.id] || '123456') : null;
+          if (localCandidate && storedPass && password.trim() === storedPass.trim()) {
             try {
-              const snap = await getDoc(doc(db, 'users', fbUser.uid));
-              if (snap.exists()) {
-                profile = snap.data() as User;
+              fbUser = await createUserWithEmail(targetEmail, password);
+              firebaseAuthErr = null;
+            } catch (createErr: unknown) {
+              // Keep original sign-in error if email is already registered (meaning wrong password)
+              const createCode = String((createErr as any)?.code || '');
+              if (createCode !== 'auth/email-already-in-use') {
+                firebaseAuthErr = createErr;
               }
-            } catch (err) {
-              console.warn('[Firestore User Fetch]:', err);
             }
           }
-
-          if (!profile) {
-            if (localCandidate) {
-              profile = {
-                ...localCandidate,
-                id: fbUser.uid,
-                email: fbUser.email || targetEmail,
-                isEmailVerified: fbUser.emailVerified ?? true,
-                authProvider: 'firebase_email',
-                firebaseUid: fbUser.uid,
-                lastLoginAt: new Date().toISOString(),
-              };
-              if (isDesignatedAdmin) {
-                profile.role = 'ADMINISTRADOR';
-              }
-              this.updateUser(fbUser.uid, profile);
-            } else if (isDesignatedAdmin) {
-              profile = {
-                id: fbUser.uid,
-                name: fbUser.displayName || 'Amanda Silveira (Admin)',
-                username: fbUser.email?.split('@')[0] || 'admin',
-                email: fbUser.email || targetEmail,
-                isEmailVerified: fbUser.emailVerified ?? true,
-                role: 'ADMINISTRADOR',
-                status: 'ATIVO',
-                allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
-                authProvider: 'firebase_email',
-                firebaseUid: fbUser.uid,
-                createdAt: new Date().toISOString(),
-                lastLoginAt: new Date().toISOString()
-              };
-              users.push(profile);
-              localStorage.setItem('gf_users', JSON.stringify(users));
-            }
-
-            if (db && profile) {
-              setDoc(doc(db, 'users', fbUser.uid), profile).catch(() => {});
-            }
-          }
-
-          if (profile) {
-            if (profile.status === 'BLOQUEADO') {
-              await signOutFirebase();
-              return { success: false, message: 'Esta conta está bloqueada pelo administrador.' };
-            }
-            if (profile.status === 'DESATIVADO') {
-              await signOutFirebase();
-              return { success: false, message: 'Esta conta foi desativada.' };
-            }
-
-            profile.lastLoginAt = new Date().toISOString();
-            profile.authProvider = 'firebase_email';
-            profile.firebaseUid = fbUser.uid;
-            this.setCurrentUser(profile);
-
-            // Atualiza estritamente lastLoginAt no Firestore respeitando a regra de autoatualização
-            if (db && fbUser) {
-              updateDoc(doc(db, 'users', fbUser.uid), {
-                lastLoginAt: profile.lastLoginAt
-              }).catch(() => {});
-            }
-
-            this.logAccess({
-              userId: profile.id,
-              username: profile.username,
-              role: profile.role,
-              action: 'LOGIN_SUCESSO',
-              details: `Login efetuado com sucesso via Firebase Cloud para @${profile.username} (${profile.role})`,
-            });
-
-            await this.initStaffFirestoreSync(fbUser);
-
-            return {
-              success: true,
-              message: 'Login realizado com sucesso e sincronizado com o Firebase!',
-              user: profile,
-              isCloudAuth: true,
-            };
-          }
-        } catch (err: unknown) {
-          console.warn('[Firebase Auth Login Flow Notice]:', err);
         }
       }
+
+      if (!fbUser) {
+        this.setCurrentUser(null);
+        this.stopStaffFirestoreSync();
+        const friendlyMsg = formatFirebaseAuthError(firebaseAuthErr);
+        this.logAccess({
+          username: rawInput,
+          action: 'LOGIN_FALHA',
+          details: `Falha no Firebase Auth para ${targetEmail}: ${friendlyMsg}`,
+        });
+        return {
+          success: false,
+          isCloudAuth: false,
+          message: friendlyMsg,
+        };
+      }
+
+      // Firebase Auth succeeded: now resolve and verify active profile in Firestore /users/{uid}
+      const now = new Date().toISOString();
+      let profile: User | null = null;
+      let existsInFirestore = false;
+
+      if (db) {
+        try {
+          const snap = await getDoc(doc(db, 'users', fbUser.uid));
+          if (snap.exists()) {
+            profile = snap.data() as User;
+            existsInFirestore = true;
+          }
+        } catch (err) {
+          console.warn('[Firestore User Fetch]:', err);
+        }
+      }
+
+      if (!profile && typeof window !== 'undefined') {
+        try {
+          const idToken = await fbUser.getIdToken();
+          if (idToken) {
+            const syncRes = await fetch('/api/auth/sync-profile', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`,
+              },
+              body: JSON.stringify({
+                name: localCandidate?.name,
+                username: localCandidate?.username,
+                allowedModules: localCandidate?.allowedModules,
+              }),
+            });
+            const syncData = await syncRes.json().catch(() => ({}));
+            if (syncRes.ok && syncData.success && syncData.profile) {
+              profile = syncData.profile as User;
+              existsInFirestore = true;
+            }
+          }
+        } catch {
+          // Non-fatal; proceed to self-create check below
+        }
+      }
+
+      if (!profile) {
+        if (localCandidate) {
+          profile = {
+            ...localCandidate,
+            id: fbUser.uid,
+            email: fbUser.email || targetEmail,
+            isEmailVerified: fbUser.emailVerified ?? true,
+            authProvider: 'firebase_email',
+            firebaseUid: fbUser.uid,
+            lastLoginAt: now,
+            ...(isBootstrapAdmin ? { role: 'ADMINISTRADOR' as UserRole } : {}),
+          };
+        } else if (isBootstrapAdmin) {
+          profile = {
+            id: fbUser.uid,
+            name: fbUser.displayName || 'Amanda Silveira (Admin)',
+            username: fbUser.email?.split('@')[0] || 'admin',
+            email: fbUser.email || targetEmail,
+            isEmailVerified: fbUser.emailVerified ?? true,
+            role: 'ADMINISTRADOR',
+            status: 'ATIVO',
+            allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
+            authProvider: 'firebase_email',
+            firebaseUid: fbUser.uid,
+            createdAt: now,
+            lastLoginAt: now,
+          };
+        } else if (targetEmail === 'gerente@amanditasabores.com.br') {
+          profile = {
+            id: fbUser.uid,
+            name: fbUser.displayName || 'Gerência Amandita',
+            username: 'gerente',
+            email: fbUser.email || targetEmail,
+            isEmailVerified: fbUser.emailVerified ?? true,
+            role: 'GERENTE',
+            status: 'ATIVO',
+            allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'configuracoes', 'qrcodes'],
+            authProvider: 'firebase_email',
+            firebaseUid: fbUser.uid,
+            createdAt: now,
+            lastLoginAt: now,
+          };
+        }
+      }
+
+      if (!profile) {
+        await signOutFirebase().catch(() => {});
+        this.setCurrentUser(null);
+        return {
+          success: false,
+          isCloudAuth: false,
+          message: 'Conta autenticada no Firebase, porém sem perfil de colaborador vinculado em /users/{uid}. Solicite cadastro ao administrador.',
+        };
+      }
+
+      if (profile.status === 'BLOQUEADO') {
+        await signOutFirebase().catch(() => {});
+        this.setCurrentUser(null);
+        return { success: false, isCloudAuth: false, message: 'Esta conta está bloqueada pelo administrador.' };
+      }
+      if (profile.status === 'DESATIVADO') {
+        await signOutFirebase().catch(() => {});
+        this.setCurrentUser(null);
+        return { success: false, isCloudAuth: false, message: 'Esta conta foi desativada.' };
+      }
+
+      profile = {
+        ...profile,
+        id: fbUser.uid,
+        firebaseUid: fbUser.uid,
+        authProvider: 'firebase_email',
+        lastLoginAt: now,
+      };
+
+      // Persist or update /users/{uid} in Firestore cleanly and fail if profile creation is rejected
+      if (db) {
+        try {
+          if (existsInFirestore) {
+            await updateDoc(doc(db, 'users', fbUser.uid), { lastLoginAt: now }).catch(() => {});
+          } else {
+            await setDoc(doc(db, 'users', fbUser.uid), this.cleanForFirestore(profile));
+          }
+        } catch (fsProfileErr: any) {
+          await signOutFirebase().catch(() => {});
+          this.setCurrentUser(null);
+          return {
+            success: false,
+            isCloudAuth: false,
+            message: `Sessão Firebase iniciada, mas o perfil /users/${fbUser.uid} não pôde ser confirmado no Firestore (${fsProfileErr?.code || fsProfileErr?.message || 'permission-denied'}). Solicite ao administrador para vincular seu usuário.`,
+          };
+        }
+      }
+
+      const legacyId = localCandidate && localCandidate.id !== fbUser.uid ? localCandidate.id : undefined;
+      this.upsertLocalUserCleanly(profile, legacyId);
+      this.setCurrentUser(profile);
+      await this.initStaffFirestoreSync(fbUser);
+
+      this.logAccess({
+        userId: profile.id,
+        username: profile.username,
+        role: profile.role,
+        action: 'LOGIN_SUCESSO',
+        details: `Login efetuado com sucesso via Firebase Cloud para @${profile.username} (${profile.role})`,
+      });
+
+      return {
+        success: true,
+        message: 'Login realizado com sucesso e sincronizado com o Firebase!',
+        user: profile,
+        isCloudAuth: true,
+      };
     }
 
-    // 3. Direct, Reliable Internal Validation (No manual Firebase Console required)
+    // 3. LOCAL CONTINGENCY MODE (ONLY executed when Firebase is NOT configured on this device)
     if (!localCandidate) {
       this.logAccess({
         username: rawInput,
         action: 'LOGIN_FALHA',
-        details: 'Tentativa de login com usuário inexistente',
+        details: 'Tentativa de login com usuário inexistente (modo contingência local)',
       });
-      return { success: false, message: 'Usuário não encontrado.' };
+      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Usuário não encontrado.' };
     }
 
     if (localCandidate.status === 'BLOQUEADO') {
@@ -4429,11 +9190,11 @@ class StoreService {
         action: 'CONTA_BLOQUEADA',
         details: 'Tentativa de acesso em conta bloqueada',
       });
-      return { success: false, message: 'Esta conta está bloqueada pelo administrador. Contate a gerência.' };
+      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Esta conta está bloqueada pelo administrador. Contate a gerência.' };
     }
 
     if (localCandidate.status === 'DESATIVADO') {
-      return { success: false, message: 'Esta conta foi desativada no sistema.' };
+      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Esta conta foi desativada no sistema.' };
     }
 
     const passwords = this.getUserPasswords();
@@ -4445,35 +9206,36 @@ class StoreService {
         username: localCandidate.username,
         role: localCandidate.role,
         action: 'LOGIN_FALHA',
-        details: 'Senha incorreta digitada',
+        details: 'Senha incorreta digitada (modo contingência local)',
       });
-      return { success: false, message: 'Senha incorreta.' };
+      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Senha incorreta.' };
     }
 
-    // Login accepted directly
-    localCandidate.lastLoginAt = new Date().toISOString();
-    this.updateUser(localCandidate.id, { lastLoginAt: localCandidate.lastLoginAt });
-
-    this.setCurrentUser(localCandidate);
-
-    // Trigger background staff Firebase Auth and real-time Firestore sync
-    this.ensureFirebaseAuthForStaff().then(() => {
-      this.initStaffFirestoreSync();
-    }).catch(() => {});
+    const contingencyUser: User = {
+      ...localCandidate,
+      authProvider: 'local_contingency',
+      lastLoginAt: new Date().toISOString(),
+    };
+    const updatedUsersList = users.map((u) =>
+      u.id === contingencyUser.id ? contingencyUser : u
+    );
+    localStorage.setItem('gf_users', JSON.stringify(updatedUsersList));
+    this.setCurrentUser(contingencyUser);
 
     this.logAccess({
-      userId: localCandidate.id,
-      username: localCandidate.username,
-      role: localCandidate.role,
-      action: 'LOGIN_SUCESSO',
-      details: `Acesso realizado para @${localCandidate.username} (Perfil ${localCandidate.role})`,
+      userId: contingencyUser.id,
+      username: contingencyUser.username,
+      role: contingencyUser.role,
+      action: 'LOGIN_CONTINGENCIA_LOCAL',
+      details: `Acesso em modo de contingência local (Firebase não configurado) para @${contingencyUser.username} (${contingencyUser.role})`,
     });
 
-    return { 
-      success: true, 
-      message: 'Login realizado com sucesso!', 
-      user: localCandidate,
-      isCloudAuth: true
+    return {
+      success: true,
+      message: 'Autenticado em modo de contingência local (sem sincronização com a nuvem).',
+      user: contingencyUser,
+      isCloudAuth: false,
+      isLocalContingency: true,
     };
   }
 
@@ -4488,6 +9250,7 @@ class StoreService {
         details: 'Logout efetuado da sessão',
       });
     }
+    this.stopStaffFirestoreSync();
     signOutFirebase().catch(() => {});
     this.setCurrentUser(null);
   }
@@ -4505,21 +9268,40 @@ class StoreService {
     if (!trimmedPw) {
       return { success: false, message: 'A senha é obrigatória.' };
     }
-    
-    // Check against standard password storage or authenticate via login flow
-    const identifier = current.email || current.username || 'admin';
-    const loginRes = await this.login(identifier, trimmedPw);
-    if (loginRes.success) {
-      return { success: true, message: 'Senha confirmada com sucesso.' };
+
+    if (isFirebaseReady() && auth) {
+      if (current.authProvider === 'firebase_google') {
+        try {
+          const pwMapRaw = localStorage.getItem('gf_user_passwords');
+          if (pwMapRaw) {
+            const pwMap = JSON.parse(pwMapRaw);
+            if (pwMap[current.id] === trimmedPw || pwMap['user-admin'] === trimmedPw) {
+              return { success: true, message: 'PIN/Senha administrativa confirmada.' };
+            }
+          }
+        } catch {}
+        return { success: false, message: 'Senha administrativa incorreta.' };
+      }
+
+      const targetEmail = (auth.currentUser?.email || current.email || '').trim().toLowerCase();
+      if (!targetEmail) {
+        return { success: false, message: 'E-mail administrativo não localizado para revalidação no Firebase.' };
+      }
+      try {
+        await signInWithEmail(targetEmail, trimmedPw);
+        return { success: true, message: 'Senha confirmada no Firebase Authentication.' };
+      } catch (err) {
+        return { success: false, message: formatFirebaseAuthError(err) };
+      }
     }
-    
-    // Fallback: check stored passwords map for this user id
+
+    // Local contingency fallback ONLY when Firebase is not configured
     try {
       const pwMapRaw = localStorage.getItem('gf_user_passwords');
       if (pwMapRaw) {
         const pwMap = JSON.parse(pwMapRaw);
         if (pwMap[current.id] === trimmedPw || pwMap['user-admin'] === trimmedPw) {
-          return { success: true, message: 'Senha confirmada com sucesso.' };
+          return { success: true, message: 'Senha confirmada em modo contingência local.' };
         }
       }
     } catch {

@@ -31,6 +31,7 @@ export const UnifiedLoginScreen: React.FC<UnifiedLoginScreenProps> = ({
   const [showPassword, setShowPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(initialNotice || null);
   const [isLoading, setIsLoading] = useState(false);
+  const firebaseStatus = store.getFirebaseStatus();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,6 +66,26 @@ export const UnifiedLoginScreen: React.FC<UnifiedLoginScreenProps> = ({
     } catch {
       setIsLoading(false);
       setErrorMessage('Erro de comunicação com o servidor. Tente novamente.');
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    setErrorMessage(null);
+    setIsLoading(true);
+    try {
+      const res = await store.loginWithGoogle();
+      setIsLoading(false);
+      if (res.success && res.user) {
+        try {
+          localStorage.removeItem('gf_delivery_user');
+        } catch {}
+        onLoginSuccess(res.user);
+      } else {
+        setErrorMessage(res.message || 'Não foi possível autenticar com a conta Google.');
+      }
+    } catch {
+      setIsLoading(false);
+      setErrorMessage('Falha na comunicação durante login com Google.');
     }
   };
 
@@ -107,6 +128,16 @@ export const UnifiedLoginScreen: React.FC<UnifiedLoginScreenProps> = ({
               Login único para administradores, gerentes, atendentes, operadores de caixa, cozinha e entregadores.
             </p>
           </div>
+
+          {/* Mode Notice */}
+          {!firebaseStatus.isConfigured && (
+            <div className="mb-4 p-3 bg-amber-50 border border-amber-200 text-amber-900 rounded-xl text-[11px] flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 mt-0.5" />
+              <div className="flex-1 leading-relaxed">
+                <strong>Modo Contingência Local:</strong> Firebase não configurado neste dispositivo. O acesso funcionará apenas offline/localmente sem sincronização na nuvem.
+              </div>
+            </div>
+          )}
 
           {/* Error Notice */}
           {errorMessage && (
@@ -189,6 +220,18 @@ export const UnifiedLoginScreen: React.FC<UnifiedLoginScreenProps> = ({
                 </>
               )}
             </button>
+
+            {firebaseStatus.isConfigured && (
+              <button
+                type="button"
+                onClick={handleGoogleLogin}
+                disabled={isLoading}
+                className="w-full py-2.5 px-4 bg-white hover:bg-slate-50 text-[#2C1810] border border-[#E8DFD5] font-bold rounded-xl shadow-xs transition flex items-center justify-center gap-2 text-xs disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+              >
+                <Sparkles className="w-4 h-4 text-[#C86D3B]" />
+                <span>Entrar com Google (Firebase Auth)</span>
+              </button>
+            )}
           </form>
 
           {/* Quick Helper / Role Routing Notice */}

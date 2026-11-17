@@ -123,6 +123,11 @@ export const PrinterSettings: React.FC = () => {
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               <span>Conectada: {status.deviceName || 'Impressora 58mm'}</span>
             </div>
+          ) : status.reconnecting ? (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-full text-xs font-bold">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-600" />
+              <span>Reconectando: {status.deviceName || 'Impressora 58mm'}...</span>
+            </div>
           ) : !status.bluetoothSupported && config.connectionMode === 'bluetooth_ble' ? (
             <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 text-slate-600 border border-slate-200 rounded-full text-xs font-semibold">
               <AlertCircle className="w-3.5 h-3.5 text-slate-400" />
@@ -477,6 +482,8 @@ export const PrinterSettings: React.FC = () => {
           <strong>2. Se a impressora for Bluetooth BLE:</strong> Use o modo <strong>Web Bluetooth Direto</strong> diretamente no Chrome.
           <br />
           <strong>3. Se a impressora for Bluetooth Clássico (SPP):</strong> O navegador Chrome não permite conexão serial direta. Basta instalar o aplicativo gratuito <strong>RawBT Print Service</strong> na Google Play Store e selecionar o modo <strong>Android RawBT</strong> acima.
+          <br />
+          <strong>4. Comportamento ao atualizar a página (F5):</strong> Por segurança do protocolo Web Bluetooth no navegador, recarregar a página encerra a sessão GATT ativa. Ao abrir, o sistema tenta restaurar automaticamente dispositivos já autorizados; se o dispositivo não responder silenciosamente, clique em <strong>Reconectar Impressora</strong> (sem precisar parear novamente).
         </p>
       </div>
     </div>

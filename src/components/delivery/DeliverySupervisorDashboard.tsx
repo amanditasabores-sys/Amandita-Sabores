@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { Order, User, DeliveryShift, DeliveryShiftSummary } from '../../types';
-import { formatCurrency, formatTime, formatDateTime } from '../../utils/formatters';
+import { formatCurrency, formatTime, formatDateTime, formatAddressDetails, getFortalezaDateKey, formatFortalezaDateLabel } from '../../utils/formatters';
 import { AmanditaLogo } from '../common/AmanditaLogo';
 import {
   Bike,
@@ -73,6 +73,8 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
   });
   const [selectedNewDriverId, setSelectedNewDriverId] = useState<string>('');
   const [reassignReason, setReassignReason] = useState<string>('');
+  const [isAssigning, setIsAssigning] = useState(false);
+  const [assignError, setAssignError] = useState<string | null>(null);
 
   const [occurrenceModalOrder, setOccurrenceModalOrder] = useState<Order | null>(null);
   const [occurrenceNote, setOccurrenceNote] = useState<string>('');
@@ -99,22 +101,22 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
     return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
   }, []);
 
-  // Today reference date in local format
-  const todayStr = new Date().toISOString().slice(0, 10);
+  // Today reference date in America/Fortaleza (UTC-3)
+  const todayStr = getFortalezaDateKey();
 
   // Filter deliveries (DELIVERY fulfillment only)
   const deliveryOrders = orders.filter((o) => o.fulfillmentType === 'DELIVERY');
 
   // Today's deliveries
   const todayDeliveryOrders = deliveryOrders.filter((o) => {
-    const orderDate = (o.createdAt || '').slice(0, 10);
+    const orderDate = getFortalezaDateKey(o.createdAt);
     return orderDate === todayStr;
   });
 
   // Prior pending deliveries (created before today and not finalized)
   const priorPendingDeliveries = deliveryOrders.filter((o) => {
-    const orderDate = (o.createdAt || '').slice(0, 10);
-    return orderDate < todayStr && o.status !== 'ENTREGUE' && o.status !== 'CANCELADO';
+    const orderDate = getFortalezaDateKey(o.createdAt);
+    return Boolean(orderDate) && orderDate < todayStr && o.status !== 'ENTREGUE' && o.status !== 'CANCELADO';
   });
 
   // KPIs - Strictly consider only users with role ENTREGADOR
@@ -195,8 +197,8 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
     } else if (deliveryFilter === 'concluidas') {
       if (o.status !== 'ENTREGUE') return false;
     } else if (deliveryFilter === 'pendencias_anteriores') {
-      const orderDate = (o.createdAt || '').slice(0, 10);
-      if (!(orderDate < todayStr && o.status !== 'ENTREGUE' && o.status !== 'CANCELADO')) return false;
+      const orderDate = getFortalezaDateKey(o.createdAt);
+      if (!(Boolean(orderDate) && orderDate < todayStr && o.status !== 'ENTREGUE' && o.status !== 'CANCELADO')) return false;
     }
 
     // Text search
@@ -213,37 +215,52 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
   });
 
   // Handler: Assign or Reassign Delivery
-  const handleConfirmAssignment = (e: React.FormEvent) => {
+  const handleConfirmAssignment = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!assignModalOrder) return;
+    if (!assignModalOrder || isAssigning) return;
 
     const targetDriver = activeDrivers.find((d) => d.id === selectedNewDriverId);
     if (!targetDriver && selectedNewDriverId !== '__UNASSIGN__') {
-      alert('Por favor, selecione um entregador ativo.');
+      setAssignError('Por favor, selecione um entregador ativo.');
       return;
     }
 
-    const supervisorName = supervisorUser?.name || supervisorUser?.username || 'Supervisão';
+    setIsAssigning(true);
+    setAssignError(null);
+    try {
+      const supervisorName = supervisorUser?.name || supervisorUser?.username || 'Supervisão';
+      const res = selectedNewDriverId === '__UNASSIGN__'
+        ? await store.assignDeliveryPersonAsync(
+            assignModalOrder.id,
+            null,
+            supervisorName,
+            reassignReason || 'Desvinculado pela supervisão'
+          )
+        : await store.assignDeliveryPersonAsync(
+            assignModalOrder.id,
+            {
+              id: targetDriver!.id,
+              name: targetDriver!.name || targetDriver!.username,
+              phone: targetDriver!.phone || ''
+            },
+            supervisorName,
+            reassignReason || undefined
+          );
 
-    if (selectedNewDriverId === '__UNASSIGN__') {
-      store.assignDeliveryPerson(assignModalOrder.id, null, supervisorName, reassignReason || 'Desvinculado pela supervisão');
-    } else if (targetDriver) {
-      store.assignDeliveryPerson(
-        assignModalOrder.id,
-        {
-          id: targetDriver.id,
-          name: targetDriver.name || targetDriver.username,
-          phone: targetDriver.phone || ''
-        },
-        supervisorName,
-        reassignReason || undefined
-      );
+      if (!res.synced && res.rejected) {
+        setAssignError(res.error || 'Atribuição recusada pelo servidor. Verifique suas permissões.');
+        loadData();
+        return;
+      }
+
+      setAssignModalOrder(null);
+      setSelectedNewDriverId('');
+      setReassignReason('');
+      setAssignError(null);
+      loadData();
+    } finally {
+      setIsAssigning(false);
     }
-
-    setAssignModalOrder(null);
-    setSelectedNewDriverId('');
-    setReassignReason('');
-    loadData();
   };
 
   // Handler: Add Occurrence Note
@@ -742,11 +759,12 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
                 {filteredDeliveries.map((order) => {
                   const isAssigned = Boolean(order.deliveryPerson || order.deliveryPersonId);
                   const isLate = Math.floor((Date.now() - new Date(order.createdAt).getTime()) / 60000) > (order.estimatedDeliveryMinutes || 45);
-                  const isPriorDay = (order.createdAt || '').slice(0, 10) < todayStr;
+                  const orderDateKey = getFortalezaDateKey(order.createdAt);
+                  const isPriorDay = Boolean(orderDateKey) && orderDateKey < todayStr;
                   const hasOccurrence = order.movements.some((m) => m.notes?.includes('[OCORRÊNCIA]'));
                   const address = order.customer.address;
                   const addressText = address
-                    ? `${address.street || ''}, ${address.number || 'S/N'}${address.neighborhood ? ` - ${address.neighborhood}` : ''}${address.city ? ` (${address.city})` : ''}`
+                    ? formatAddressDetails(address).fullSingleLine
                     : 'Endereço não informado';
 
                   return (
@@ -789,7 +807,7 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
                               </span>
                               {isPriorDay && order.status !== 'ENTREGUE' && (
                                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                                  Dia Anterior ({order.createdAt.slice(0, 10)})
+                                  Dia Anterior ({formatFortalezaDateLabel(order.createdAt)})
                                 </span>
                               )}
                               {isLate && order.status !== 'ENTREGUE' && (
@@ -1328,24 +1346,34 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
                 </div>
               )}
 
+              {assignError && (
+                <div className="p-2.5 bg-rose-500/15 border border-rose-500/40 rounded-xl text-xs text-rose-200 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{assignError}</span>
+                </div>
+              )}
+
               {/* Buttons */}
               <div className="pt-3 border-t border-slate-800 flex items-center justify-end gap-2">
                 <button
                   type="button"
+                  disabled={isAssigning}
                   onClick={() => {
                     setAssignModalOrder(null);
                     setSelectedNewDriverId('');
                     setReassignReason('');
+                    setAssignError(null);
                   }}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition cursor-pointer"
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 rounded-xl text-xs font-bold transition cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-xl text-xs font-black transition cursor-pointer shadow"
+                  disabled={isAssigning}
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-slate-950 rounded-xl text-xs font-black transition cursor-pointer shadow"
                 >
-                  Salvar Atribuição
+                  {isAssigning ? 'Salvando...' : 'Salvar Atribuição'}
                 </button>
               </div>
             </form>

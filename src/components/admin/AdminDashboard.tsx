@@ -73,12 +73,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
     { id: 'settings', moduleKey: 'configuracoes', label: 'Configurações Loja', icon: Settings },
   ];
 
-  // Filter tabs by current user's authorized modules
+  // Filter tabs by current user's authorized modules and strict cash authority
   const allowedTabs = useMemo(() => {
     if (!currentUser) return allTabs;
-    if (currentUser.username === 'admin' || currentUser.role === 'ADMINISTRADOR') return allTabs;
+    const canManageCash = store.canUserManageCash();
+    const cashSafeTabs = canManageCash ? allTabs : allTabs.filter((tab) => tab.id !== 'caixa');
+    if (currentUser.username === 'admin' || currentUser.role === 'ADMINISTRADOR') return cashSafeTabs;
     const modules = currentUser.allowedModules || ['pdv', 'kanban'];
-    return allTabs.filter((tab) => modules.includes(tab.moduleKey));
+    return cashSafeTabs.filter((tab) => modules.includes(tab.moduleKey));
   }, [currentUser, allTabs]);
 
   const [activeTab, setActiveTab] = useState<TabKey>(() => {
@@ -158,6 +160,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
                 <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-[#C86D3B]/25 text-[#E89255] border border-[#C86D3B]/40 uppercase tracking-wider shrink-0">
                   PAINEL DE GESTÃO
                 </span>
+                {store.getAuthSessionMode() === 'local_contingency' && (
+                  <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/40 uppercase tracking-wider shrink-0" title="Firebase não configurado neste dispositivo">
+                    CONTINGÊNCIA LOCAL
+                  </span>
+                )}
               </div>
               <p className="text-xs text-[#D9C7B8] flex items-center gap-2 flex-wrap mt-0.5">
                 <span className="font-mono text-amber-300 font-bold shrink-0">{currentTime}</span>

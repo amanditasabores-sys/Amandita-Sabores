@@ -30,6 +30,8 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
+    const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
+    const staffToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : undefined;
     const data = await readJsonBody(req);
     const { order, event = 'NEW_ORDER' } = data;
 
@@ -43,7 +45,7 @@ export default async function handler(req: any, res: any) {
 
     // CRITICAL for Vercel Serverless: Await push dispatch before sending HTTP response
     // Otherwise Vercel terminates the Lambda container immediately, killing pending HTTP push requests.
-    const result = await sendOrderPushNotification(order, eventType);
+    const result = await sendOrderPushNotification(order, eventType, staffToken);
 
     const eventLabel = eventType === 'DELIVERY_CONFIRMED' 
       ? 'entrega concluída' 

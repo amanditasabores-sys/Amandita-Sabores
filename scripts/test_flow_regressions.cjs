@@ -80,17 +80,21 @@ test('store.ts não auto-imprime na criação de pedidos se for contexto de PDV/
   assert(storeContent.includes('!isPdvOrStaffContext && printerCfg.enabled'), 'Deve ignorar auto-impressão para vendas originadas no PDV');
 });
 
-test('PointOfSale executa ordem segura: grava pedido -> grava caixa -> limpa carrinho -> imprime cupom', () => {
+test('PointOfSale executa ordem segura: grava pedido/caixa atômico -> limpa carrinho -> imprime cupom', () => {
   const finalizeIdx = posContent.indexOf('const handleFinalizeSale = async () => {');
-  const createOrderIdx = posContent.indexOf('store.createOrderAsync(', finalizeIdx);
-  const addCashIdx = posContent.indexOf('store.addCashMovement(', createOrderIdx);
-  const clearCartIdx = posContent.indexOf('handleClearCart()', addCashIdx);
+  const atomicPaidIdx = posContent.indexOf('store.createAndConfirmPaidOrderAsync(', finalizeIdx);
+  const createPendingIdx = posContent.indexOf('store.createOrderAsync(', atomicPaidIdx);
+  const clearCartIdx = posContent.indexOf('handleClearCart()', createPendingIdx);
   const printIdx = posContent.indexOf('thermalPrinterService.printOrder(', clearCartIdx);
 
-  assert(createOrderIdx > finalizeIdx, 'Criação de pedido deve ocorrer primeiro');
-  assert(addCashIdx > createOrderIdx, 'Movimento de caixa deve ser registrado após criação do pedido');
-  assert(clearCartIdx > addCashIdx, 'Carrinho deve ser esvaziado antes da impressão para evitar reenvio');
+  assert(atomicPaidIdx > finalizeIdx, 'Venda paga PDV deve usar store.createAndConfirmPaidOrderAsync() atômico');
+  assert(createPendingIdx > atomicPaidIdx, 'Pedido PIX pendente deve usar store.createOrderAsync() após ramo pago');
+  assert(clearCartIdx > createPendingIdx, 'Carrinho deve ser esvaziado somente após confirmação no servidor/caixa');
   assert(printIdx > clearCartIdx, 'Impressão térmica deve ocorrer após venda e caixa estarem confirmados');
+
+  const kanbanContent = fs.readFileSync(path.join(__dirname, '../src/components/admin/LiveOrdersKanban.tsx'), 'utf8');
+  assert(kanbanContent.includes('store.cancelOrderAsync('), 'LiveOrdersKanban deve cancelar pedidos via store.cancelOrderAsync');
+  assert(posContent.includes('store.cancelOrderAsync('), 'PointOfSale deve cancelar pedidos via store.cancelOrderAsync');
 });
 
 test('PointOfSale trata falhas de impressora com resiliência sem abortar a venda', () => {

@@ -68,6 +68,11 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
                 <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 uppercase tracking-wider">
                   OPERADOR DE CAIXA
                 </span>
+                {store.getAuthSessionMode() === 'local_contingency' && (
+                  <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/40 uppercase tracking-wider" title="Firebase não configurado neste dispositivo">
+                    CONTINGÊNCIA LOCAL
+                  </span>
+                )}
               </div>
               <p className="text-xs text-[#D9C7B8] flex items-center gap-2">
                 <span className="font-mono text-amber-300 font-bold flex items-center gap-1">

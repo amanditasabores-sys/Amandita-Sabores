@@ -27,7 +27,13 @@ class FirestoreRuleEngine {
 
   isBootstrappedAdmin(auth) {
     if (!auth || !auth.token || !auth.token.email) return false;
-    return auth.token.email === 'dvrmercadinho@gmail.com' || auth.token.email === 'admin@amanditasabores.com.br';
+    const email = auth.token.email.toLowerCase();
+    return (
+      email === 'dvrmercadinho@gmail.com' ||
+      email === 'admin@amanditasabores.com.br' ||
+      email === 'amanditasabore@gmail.com' ||
+      email === 'amanditasabores@gmail.com'
+    );
   }
 
   isAdmin(auth) {
@@ -63,6 +69,10 @@ class FirestoreRuleEngine {
     return this.isGerente(auth) || (this.hasActiveProfile(auth) && ['CAIXA', 'caixa', 'ATENDENTE', 'atendente'].includes(this.userRole(auth)));
   }
 
+  isCashManager(auth) {
+    return this.isGerente(auth) || (this.hasActiveProfile(auth) && ['CAIXA', 'caixa'].includes(this.userRole(auth)));
+  }
+
   // Collection: menu_items
   evalMenuItemGet(auth, itemId) {
     return this.isValidId(itemId);
@@ -81,13 +91,47 @@ class FirestoreRuleEngine {
     return this.isValidId(itemId) && this.isGerente(auth);
   }
 
+  isValidOperatingDay(day) {
+    if (!day || typeof day !== 'object' || Array.isArray(day)) return false;
+    const keys = Object.keys(day);
+    const reqKeys = ['dayKey', 'label', 'isOpen', 'openTime', 'closeTime'];
+    if (keys.length !== reqKeys.length || !reqKeys.every((k) => keys.includes(k))) return false;
+    if (!['seg', 'ter', 'qua', 'qui', 'sex', 'sab', 'dom'].includes(day.dayKey)) return false;
+    if (typeof day.label !== 'string' || day.label.length < 1 || day.label.length > 40) return false;
+    if (typeof day.isOpen !== 'boolean') return false;
+    const timeRegex = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
+    if (typeof day.openTime !== 'string' || !timeRegex.test(day.openTime)) return false;
+    if (typeof day.closeTime !== 'string' || !timeRegex.test(day.closeTime)) return false;
+    if (day.isOpen && !(day.openTime < day.closeTime)) return false;
+    return true;
+  }
+
+  isValidStoreSchedule(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+    const keys = Object.keys(data);
+    const reqKeys = ['operatingHours', 'closedPrimaryMessage', 'closedSecondaryMessage', 'updatedAt', 'updatedBy'];
+    if (keys.length !== reqKeys.length || !reqKeys.every((k) => keys.includes(k))) return false;
+    if (!Array.isArray(data.operatingHours) || data.operatingHours.length !== 7) return false;
+    for (let i = 0; i < 7; i++) {
+      if (!this.isValidOperatingDay(data.operatingHours[i])) return false;
+    }
+    if (typeof data.closedPrimaryMessage !== 'string' || data.closedPrimaryMessage.length < 1 || data.closedPrimaryMessage.length > 200) return false;
+    if (typeof data.closedSecondaryMessage !== 'string' || data.closedSecondaryMessage.length > 500) return false;
+    if (typeof data.updatedAt !== 'string' || data.updatedAt.length < 10 || data.updatedAt.length > 64) return false;
+    if (typeof data.updatedBy !== 'string' || data.updatedBy.length < 1 || data.updatedBy.length > 128) return false;
+    return true;
+  }
+
   // Collection: configs
   evalConfigGet(auth, configId) {
-    if (configId === 'restaurant') return true;
+    if (configId === 'restaurant' || configId === 'daily_menu') return true;
+    if (configId === 'store_schedule') return this.isGerente(auth);
     return this.isAdmin(auth);
   }
-  evalConfigList(auth) {
-    return this.isStaff(auth);
+  evalConfigList(auth, configId) {
+    if (configId === 'restaurant' || configId === 'daily_menu') return this.isStaff(auth);
+    if (configId === 'store_schedule') return this.isGerente(auth);
+    return this.isAdmin(auth);
   }
   evalConfigWrite(auth, configId, incoming) {
     if (configId === 'restaurant') {
@@ -105,6 +149,15 @@ class FirestoreRuleEngine {
       }
       return true;
     }
+    if (configId === 'store_schedule') {
+      return this.isGerente(auth) && this.isValidStoreSchedule(incoming);
+    }
+    if (configId === 'daily_menu') {
+      return this.isGerente(auth);
+    }
+    return this.isAdmin(auth);
+  }
+  evalConfigDelete(auth, configId) {
     return this.isAdmin(auth);
   }
 
@@ -128,21 +181,29 @@ class FirestoreRuleEngine {
     return addon.price === 3.00 || addon.price === 0.00;
   }
 
-  isItemSubtotalExact(item) {
-    const base = item.unitPrice;
-    const q = item.quantity;
+  areAddonsValid(item) {
     const addons = item.addons || [];
-    if (!Array.isArray(addons) || addons.length === 0) {
-      return Math.abs(item.subtotal - (base * q)) <= 0.01;
-    }
+    if (!Array.isArray(addons)) return false;
+    if (addons.length === 0) return true;
     if (addons.length > 4) return false;
-    let addonsTotal = 0;
     for (const a of addons) {
       if (!this.isValidAddon(a)) return false;
-      addonsTotal += a.price;
     }
-    const expected = (base + addonsTotal) * q;
-    return Math.abs(item.subtotal - expected) <= 0.01;
+    return true;
+  }
+
+  getAddonsSum(item) {
+    const addons = item.addons || [];
+    return addons.reduce((acc, a) => acc + a.price, 0);
+  }
+
+  isItemPriceAndSubtotalMatchesCatalog(item, officialPrice) {
+    const q = item.quantity;
+    const addonsTotal = this.getAddonsSum(item);
+    const expectedSub = (officialPrice + addonsTotal) * q;
+    const matchesCombinedUnit = Math.abs(item.unitPrice - (officialPrice + addonsTotal)) <= 0.001;
+    const matchesBaseUnit = Math.abs(item.unitPrice - officialPrice) <= 0.001;
+    return (matchesCombinedUnit || matchesBaseUnit) && Math.abs(item.subtotal - expectedSub) <= 0.01;
   }
 
   isValidOrderItemStructure(item) {
@@ -162,11 +223,11 @@ class FirestoreRuleEngine {
 
   isItemCatalogConsistent(item) {
     if (!this.isValidOrderItemStructure(item)) return false;
+    if (!this.areAddonsValid(item)) return false;
     const catalogItem = this.db.menu_items?.[item.menuItemId];
-    if (!catalogItem) return false; // Rejects nonexistent products
-    if (catalogItem.available !== true) return false; // Rejects unavailable products
-    if (!this.isPriceExact(item.unitPrice, catalogItem.price)) return false; // Rejects undercharging and overcharging
-    if (!this.isItemSubtotalExact(item)) return false; // Rejects addon price forgery and free addon theft
+    if (!catalogItem) return false;
+    if (catalogItem.available !== true) return false;
+    if (!this.isItemPriceAndSubtotalMatchesCatalog(item, catalogItem.price)) return false;
     return true;
   }
 
@@ -186,11 +247,14 @@ class FirestoreRuleEngine {
     const checkCount = Math.min(items.length, 8);
     for (let i = 0; i < checkCount; i++) {
       if (!this.isValidOrderItemStructure(items[i])) return false;
+      if (!this.areAddonsValid(items[i])) return false;
     }
     return true;
   }
 
   evalOrderCreate(auth, orderId, incoming) {
+    const staff = this.isStaff(auth);
+    if (!staff) return false;
     if (!this.isValidId(orderId)) return false;
     if (incoming.id !== orderId) return false;
     const requiredKeys = [
@@ -202,9 +266,8 @@ class FirestoreRuleEngine {
     for (const k of requiredKeys) {
       if (!(k in incoming)) return false;
     }
-    const staff = this.isStaff(auth);
     if (!(incoming.status === 'NOVO' || (incoming.status === 'EM_PREPARO' && staff))) return false;
-    if (!(staff || incoming.paymentStatus === 'PENDENTE')) return false;
+    if (incoming.paymentStatus !== 'PENDENTE') return false;
     if (typeof incoming.orderNumber !== 'string' || incoming.orderNumber.length < 2 || incoming.orderNumber.length > 32) return false;
     if (!['DELIVERY', 'RETIRADA'].includes(incoming.fulfillmentType)) return false;
     if (!['PIX', 'CARTAO_CREDITO', 'CARTAO_DEBITO', 'DINHEIRO'].includes(incoming.paymentMethod)) return false;
@@ -242,11 +305,22 @@ class FirestoreRuleEngine {
     if (!this.isValidId(orderId)) return false;
     if (!this.isStaff(auth)) return false;
     
-    // Primary identity immutable
+    // Primary identity & financial integrity immutable on direct Client SDK updates
+    if (existing.status === 'CANCELADO') return false;
     if (incoming.id !== existing.id) return false;
     if (incoming.orderNumber !== existing.orderNumber) return false;
     if (incoming.createdAt !== existing.createdAt) return false;
     if (incoming.fulfillmentType !== existing.fulfillmentType) return false;
+    if (incoming.subtotal !== existing.subtotal) return false;
+    if (incoming.deliveryFee !== existing.deliveryFee) return false;
+    if (incoming.discount !== existing.discount) return false;
+    if (incoming.totalAmount !== existing.totalAmount) return false;
+    if (incoming.paymentMethod !== existing.paymentMethod) return false;
+    if (incoming.paymentStatus !== existing.paymentStatus) return false;
+    if (JSON.stringify(incoming.items) !== JSON.stringify(existing.items)) return false;
+
+    if (incoming.status === 'CANCELADO') return false;
+    if (!['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'].includes(incoming.status)) return false;
 
     const isGerente = this.isGerente(auth);
     const isKitchen = this.isKitchenStaff(auth) && ['EM_PREPARO', 'PRONTO'].includes(incoming.status);
@@ -257,59 +331,34 @@ class FirestoreRuleEngine {
 
     // Kitchen specific immutable field restrictions
     if (this.isKitchenStaff(auth) && !isGerente) {
-      if (incoming.subtotal !== existing.subtotal) return false;
-      if (incoming.deliveryFee !== existing.deliveryFee) return false;
-      if (incoming.discount !== existing.discount) return false;
-      if (incoming.totalAmount !== existing.totalAmount) return false;
-      if (incoming.paymentMethod !== existing.paymentMethod) return false;
-      if (incoming.paymentStatus !== existing.paymentStatus) return false;
-      if (JSON.stringify(incoming.items) !== JSON.stringify(existing.items)) return false;
       if (JSON.stringify(incoming.customer) !== JSON.stringify(existing.customer)) return false;
     }
 
     // Delivery specific immutable field restrictions
     if (this.isDeliveryStaff(auth) && !isGerente) {
-      if (incoming.subtotal !== existing.subtotal) return false;
-      if (incoming.deliveryFee !== existing.deliveryFee) return false;
-      if (incoming.discount !== existing.discount) return false;
-      if (incoming.totalAmount !== existing.totalAmount) return false;
-      if (incoming.paymentMethod !== existing.paymentMethod) return false;
-      if (JSON.stringify(incoming.items) !== JSON.stringify(existing.items)) return false;
       if (incoming.customer?.name !== existing.customer?.name) return false;
     }
 
-    // Cashier specific immutable field restrictions
-    if (this.isCashierStaff(auth) && !isGerente) {
-      if (JSON.stringify(incoming.items) !== JSON.stringify(existing.items)) return false;
-      if (incoming.subtotal !== existing.subtotal) return false;
-      if (incoming.deliveryFee !== existing.deliveryFee) return false;
-    }
-
-    if (incoming.status === 'CANCELADO') {
-      if (existing.status === 'CANCELADO') return false;
-      if (!('cancellationReason' in incoming) || typeof incoming.cancellationReason !== 'string' || incoming.cancellationReason.length < 3) return false;
-      if (!isGerente) return false;
-    }
     return true;
   }
 
   evalOrderDelete(auth, orderId) {
-    return this.isValidId(orderId) && this.isAdmin(auth);
+    return this.isValidId(orderId) && this.isGerente(auth);
   }
 
   // Collection: cash_shifts
   evalCashShiftGet(auth, shiftId) {
-    return this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth)));
+    return this.isAdmin(auth) || this.isCashManager(auth) || (this.isStaff(auth) && this.db.cash_shifts?.[shiftId]?.status === 'ABERTO');
   }
   evalCashShiftList(auth) {
-    return this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth)));
+    return this.isAdmin(auth) || this.isCashManager(auth);
   }
   evalCashShiftCreate(auth, shiftId) {
-    return this.isValidId(shiftId) && (this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth))));
+    return this.isValidId(shiftId) && (this.isAdmin(auth) || this.isCashManager(auth));
   }
   evalCashShiftUpdate(auth, shiftId, incoming, existing) {
-    return this.isValidId(shiftId) && 
-      (this.isAdmin(auth) || (this.isStaff(auth) && (this.isCashierStaff(auth) || this.isGerente(auth)))) &&
+    return this.isValidId(shiftId) &&
+      (this.isAdmin(auth) || this.isCashManager(auth)) &&
       existing?.status !== 'FECHADO';
   }
   evalCashShiftDelete(auth, shiftId) {
@@ -361,9 +410,10 @@ class FirestoreRuleEngine {
     if (incoming.email !== auth.token.email) return false;
     if (incoming.status !== 'ATIVO') return false;
 
-    const email = auth.token.email;
+    const email = auth.token.email.toLowerCase();
     const isBoot = this.isBootstrappedAdmin(auth);
     if (isBoot && (incoming.role === 'ADMINISTRADOR' || incoming.role === 'admin')) return true;
+    if (email === 'gerente@amanditasabores.com.br' && (incoming.role === 'GERENTE' || incoming.role === 'gerente')) return true;
 
     const isStaffEmail = email.endsWith('@staff.amanditasabores.com.br') || email.endsWith('@amanditasabores.com.br');
     if (isStaffEmail && ['CAIXA', 'COZINHA', 'ENTREGADOR', 'ATENDENTE', 'caixa', 'cozinha', 'entregador', 'atendente'].includes(incoming.role)) {
@@ -390,10 +440,12 @@ class FirestoreRuleEngine {
     return false; // Complete enumeration forbidden
   }
   evalPublicTrackingCreate(auth, code, incoming) {
+    if (!this.isStaff(auth)) return false;
     if (!this.isValidId(code) || code.length < 20) return false;
     if (incoming.trackingCode !== code) return false;
     if (typeof incoming.id !== 'string' || typeof incoming.orderNumber !== 'string') return false;
     if (!['NOVO', 'EM_PREPARO'].includes(incoming.status)) return false;
+    if (incoming.paymentStatus !== 'PENDENTE') return false;
     if (typeof incoming.totalAmount !== 'number' || incoming.totalAmount < 0) return false;
     
     // Strict PII protection
@@ -414,7 +466,10 @@ class FirestoreRuleEngine {
   evalPublicTrackingUpdate(auth, code, existing, incoming) {
     if (!this.isValidId(code) || code.length < 20) return false;
     if (!this.isStaff(auth)) return false;
+    if (existing.status === 'CANCELADO' || incoming.status === 'CANCELADO') return false;
+    if (!['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'].includes(incoming.status)) return false;
     if (incoming.id !== existing.id || incoming.trackingCode !== existing.trackingCode) return false;
+    if (incoming.paymentStatus !== existing.paymentStatus) return false;
     if ('customer' in incoming || 'phone' in incoming || 'address' in incoming) return false;
     const allowed = new Set([
       'id', 'orderNumber', 'createdAt', 'estimatedDeliveryMinutes',
@@ -428,7 +483,21 @@ class FirestoreRuleEngine {
     return true;
   }
   evalPublicTrackingDelete(auth, code) {
-    return this.isValidId(code) && this.isAdmin(auth);
+    return this.isValidId(code) && this.isGerente(auth);
+  }
+
+  // Collection: order_tombstones
+  evalOrderTombstoneGet(auth, orderId) {
+    return this.isValidId(orderId) && this.isStaff(auth);
+  }
+  evalOrderTombstoneList(auth) {
+    return this.isStaff(auth);
+  }
+  evalOrderTombstoneWrite(auth, orderId) {
+    return this.isValidId(orderId) && this.isGerente(auth);
+  }
+  evalOrderTombstoneDelete(auth, orderId) {
+    return this.isValidId(orderId) && this.isAdmin(auth);
   }
 }
 
@@ -450,6 +519,7 @@ const mockDb = {
     'cozinha-1': { id: 'cozinha-1', email: 'cozinha@staff.amanditasabores.com.br', role: 'COZINHA', status: 'ATIVO' },
     'entregador-1': { id: 'entregador-1', email: 'entregador@staff.amanditasabores.com.br', role: 'ENTREGADOR', status: 'ATIVO' },
     'caixa-1': { id: 'caixa-1', email: 'caixa@staff.amanditasabores.com.br', role: 'CAIXA', status: 'ATIVO' },
+    'atendente-1': { id: 'atendente-1', email: 'atendente@staff.amanditasabores.com.br', role: 'ATENDENTE', status: 'ATIVO' },
     'blocked-1': { id: 'blocked-1', email: 'ex@staff.amanditasabores.com.br', role: 'GERENTE', status: 'BLOQUEADO' }
   }
 };
@@ -464,6 +534,7 @@ const gerenteAuth = { uid: 'gerente-1', token: { email: 'gerente@staff.amanditas
 const cozinhaAuth = { uid: 'cozinha-1', token: { email: 'cozinha@staff.amanditasabores.com.br' } };
 const entregadorAuth = { uid: 'entregador-1', token: { email: 'entregador@staff.amanditasabores.com.br' } };
 const caixaAuth = { uid: 'caixa-1', token: { email: 'caixa@staff.amanditasabores.com.br' } };
+const atendenteAuth = { uid: 'atendente-1', token: { email: 'atendente@staff.amanditasabores.com.br' } };
 const blockedAuth = { uid: 'blocked-1', token: { email: 'ex@staff.amanditasabores.com.br' } };
 
 let testCount = 0;
@@ -528,8 +599,9 @@ const validOrderPayload = {
   movements: [{ id: 'mov-1', timestamp: '2026-10-23T12:00:00.000Z', toStatus: 'NOVO', author: 'Cliente' }]
 };
 
-runTest('4. Pedido Público: Criação válida com cálculos matemáticos corretos', () => {
-  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', validOrderPayload), true);
+runTest('4. Criação direta de pedido via Client SDK: bloqueada para anônimo e permitida para equipe autenticada (PDV)', () => {
+  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', validOrderPayload), false, 'Cliente anônimo NÃO pode gravar diretamente em /orders via Client SDK');
+  assert.strictEqual(engine.evalOrderCreate(atendenteAuth, 'ord-1001', validOrderPayload), true, 'Equipe autenticada pode gravar pedido PDV válido');
 });
 
 runTest('5. Preço Oficial: Rejeitar manipulação de preço unitário abaixo do oficial (R$ 0,01)', () => {
@@ -570,7 +642,7 @@ runTest('5d. Produto Indisponível: Rejeitar item com available: false', () => {
   assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', unavailableItem), false);
 });
 
-runTest('5e. Múltiplos Produtos: Validar pedido com 2 produtos reais e soma consistente de subtotais', () => {
+runTest('5e. Múltiplos Produtos: Anônimo bloqueado no Client SDK; equipe valida soma consistente de subtotais', () => {
   const multiItemOrder = {
     ...validOrderPayload,
     items: [
@@ -580,7 +652,8 @@ runTest('5e. Múltiplos Produtos: Validar pedido com 2 produtos reais e soma con
     subtotal: 26.00, // 14 + 12
     totalAmount: 31.00 // 26 + 5
   };
-  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', multiItemOrder), true);
+  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', multiItemOrder), false);
+  assert.strictEqual(engine.evalOrderCreate(caixaAuth, 'ord-1001', multiItemOrder), true);
 });
 
 runTest('5f. Múltiplos Produtos: Rejeitar quando o subtotal do pedido não bate com a soma dos itens', () => {
@@ -596,7 +669,7 @@ runTest('5f. Múltiplos Produtos: Rejeitar quando o subtotal do pedido não bate
   assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', inconsistentSum), false);
 });
 
-runTest('5g. Múltiplos Produtos: Validar pedido com 8 itens (limite máximo para regras diretas do cliente)', () => {
+runTest('5g. Múltiplos Produtos: Equipe autenticada cria pedido com 8 itens e anônimo segue bloqueado', () => {
   const eightItemsOrder = {
     ...validOrderPayload,
     items: [
@@ -612,7 +685,8 @@ runTest('5g. Múltiplos Produtos: Validar pedido com 8 itens (limite máximo par
     subtotal: 73.00,
     totalAmount: 78.00
   };
-  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', eightItemsOrder), true);
+  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', eightItemsOrder), false);
+  assert.strictEqual(engine.evalOrderCreate(caixaAuth, 'ord-1001', eightItemsOrder), true);
 });
 
 runTest('5h. Limite do Cliente: Rejeitar pedido público com 9 itens diretamente no Firestore (requer backend)', () => {
@@ -635,7 +709,7 @@ runTest('5h. Limite do Cliente: Rejeitar pedido público com 9 itens diretamente
   assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', nineItemsOrder), false);
 });
 
-runTest('5i. Adicionais Legítimos: Validar item com adicional oficial de R$ 3,00 e soma exata do subtotal', () => {
+runTest('5i. Adicionais Legítimos: Equipe autenticada valida item com adicional oficial de R$ 3,00', () => {
   const addonOrder = {
     ...validOrderPayload,
     items: [
@@ -652,7 +726,8 @@ runTest('5i. Adicionais Legítimos: Validar item com adicional oficial de R$ 3,0
     subtotal: 17.00,
     totalAmount: 22.00 // 17 + 5
   };
-  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', addonOrder), true);
+  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-1001', addonOrder), false);
+  assert.strictEqual(engine.evalOrderCreate(caixaAuth, 'ord-1001', addonOrder), true);
 });
 
 runTest('5j. Adicional Adulterado: Rejeitar tentativa de adulterar preço do adicional (R$ 0,01 vs oficial R$ 3,00)', () => {
@@ -729,15 +804,16 @@ const validTrackingDoc = {
   destinationSummary: 'Bela Vista · Campina Grande'
 };
 
-runTest('9. Rastreio: Criação permitida com campos estritamente higienizados', () => {
-  assert.strictEqual(engine.evalPublicTrackingCreate(anonymousAuth, 'tk_9876543210abcdef12345678', validTrackingDoc), true);
+runTest('9. Rastreio: Criação direta bloqueada para anônimo e permitida para staff com campos estritamente higienizados', () => {
+  assert.strictEqual(engine.evalPublicTrackingCreate(anonymousAuth, 'tk_9876543210abcdef12345678', validTrackingDoc), false);
+  assert.strictEqual(engine.evalPublicTrackingCreate(atendenteAuth, 'tk_9876543210abcdef12345678', validTrackingDoc), true);
 });
 
 runTest('10. Rastreio: REJEITAR injeção de telefone ou endereço residencial (PII Shield)', () => {
   const leakPhone = { ...validTrackingDoc, phone: '83988234190' };
-  assert.strictEqual(engine.evalPublicTrackingCreate(anonymousAuth, 'tk_9876543210abcdef12345678', leakPhone), false);
+  assert.strictEqual(engine.evalPublicTrackingCreate(atendenteAuth, 'tk_9876543210abcdef12345678', leakPhone), false);
   const leakAddr = { ...validTrackingDoc, address: { street: 'Rua das Flores 140' } };
-  assert.strictEqual(engine.evalPublicTrackingCreate(anonymousAuth, 'tk_9876543210abcdef12345678', leakAddr), false);
+  assert.strictEqual(engine.evalPublicTrackingCreate(atendenteAuth, 'tk_9876543210abcdef12345678', leakAddr), false);
 });
 
 runTest('11. Rastreio: Enumeração/listagem da coleção totalmente proibida (anti-scraping)', () => {
@@ -796,13 +872,16 @@ runTest('16. Entregador: REJEITAR tentativa de alterar preços ou itens', () => 
   assert.strictEqual(engine.evalOrderUpdate(entregadorAuth, 'ord-1001', baseOrder, forgedItems), false);
 });
 
-runTest('17. Cancelamento: Apenas Gerente/Admin com motivo válido (>= 3 chars)', () => {
+runTest('17. Cancelamento Direto via Client SDK: Bloqueado para TODOS os perfis (inclusive Gerente/Admin), exigindo Admin SDK (/api/orders/:id/cancel)', () => {
   const cancelCozinha = { ...baseOrder, status: 'CANCELADO', cancellationReason: 'Sem gás' };
   assert.strictEqual(engine.evalOrderUpdate(cozinhaAuth, 'ord-1001', baseOrder, cancelCozinha), false);
   const cancelGerente = { ...baseOrder, status: 'CANCELADO', cancellationReason: 'Cliente desistiu' };
-  assert.strictEqual(engine.evalOrderUpdate(gerenteAuth, 'ord-1001', baseOrder, cancelGerente), true);
-  const cancelSemMotivo = { ...baseOrder, status: 'CANCELADO' };
-  assert.strictEqual(engine.evalOrderUpdate(gerenteAuth, 'ord-1001', baseOrder, cancelSemMotivo), false);
+  assert.strictEqual(engine.evalOrderUpdate(gerenteAuth, 'ord-1001', baseOrder, cancelGerente), false, 'Gerente não pode cancelar via Client SDK');
+  assert.strictEqual(engine.evalOrderUpdate(adminAuth, 'ord-1001', baseOrder, cancelGerente), false, 'Admin não pode cancelar via Client SDK');
+  const paidBaseOrder = { ...baseOrder, paymentStatus: 'PAGO' };
+  const cancelPaid = { ...paidBaseOrder, status: 'CANCELADO', cancellationReason: 'Estorno indevido direto' };
+  assert.strictEqual(engine.evalOrderUpdate(adminAuth, 'ord-1001', paidBaseOrder, cancelPaid), false, 'Pedido PAGO não pode ser cancelado via Client SDK');
+  assert.strictEqual(engine.evalOrderUpdate(gerenteAuth, 'ord-1001', baseOrder, { ...baseOrder, status: 'EM_PREPARO' }), true, 'Gerente mantém updates operacionais');
 });
 
 // 6. User Management & Escalation Guards
@@ -918,6 +997,163 @@ runTest('26. Imutabilidade do Caixa: Proibir alteração de turno FECHADO e perm
 
   // 5. Criar outro turno novo com ID diferente: permitido
   assert.strictEqual(engine.evalCashShiftCreate(caixaAuth, 'shift-200'), true, 'Novo turno com outro ID permitido');
+});
+
+runTest('27. Exclusão de Pedidos: Apenas Admin e Gerente; bloqueado para Caixa, Cozinha, Entregador, Atendente, Bloqueado e Público', () => {
+  assert.strictEqual(engine.evalOrderDelete(adminAuth, 'ord-1001'), true, 'Administrador pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(bootstrapAuth, 'ord-1001'), true, 'Admin bootstrap pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(gerenteAuth, 'ord-1001'), true, 'Gerente pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(caixaAuth, 'ord-1001'), false, 'Caixa NÃO pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(cozinhaAuth, 'ord-1001'), false, 'Cozinha NÃO pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(entregadorAuth, 'ord-1001'), false, 'Entregador NÃO pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(atendenteAuth, 'ord-1001'), false, 'Atendente NÃO pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(blockedAuth, 'ord-1001'), false, 'Usuário bloqueado NÃO pode excluir pedido');
+  assert.strictEqual(engine.evalOrderDelete(anonymousAuth, 'ord-1001'), false, 'Cliente/Anônimo NÃO pode excluir pedido');
+
+  assert.strictEqual(engine.evalPublicTrackingDelete(gerenteAuth, 'tk_9876543210abcdef12345678'), true, 'Gerente pode limpar tracking ao excluir pedido');
+  assert.strictEqual(engine.evalPublicTrackingDelete(caixaAuth, 'tk_9876543210abcdef12345678'), false, 'Caixa NÃO pode excluir tracking');
+});
+
+runTest('28. Tombstones Compartilhados: Leitura apenas staff; gravação apenas Gerente/Admin; exclusão apenas Admin', () => {
+  assert.strictEqual(engine.evalOrderTombstoneList(cozinhaAuth), true, 'Staff pode listar tombstones');
+  assert.strictEqual(engine.evalOrderTombstoneList(anonymousAuth), false, 'Público NÃO pode listar tombstones');
+  assert.strictEqual(engine.evalOrderTombstoneWrite(gerenteAuth, 'ord-1001'), true, 'Gerente pode gravar tombstone');
+  assert.strictEqual(engine.evalOrderTombstoneWrite(adminAuth, 'ord-1001'), true, 'Admin pode gravar tombstone');
+  assert.strictEqual(engine.evalOrderTombstoneWrite(caixaAuth, 'ord-1001'), false, 'Caixa NÃO pode gravar tombstone');
+  assert.strictEqual(engine.evalOrderTombstoneWrite(cozinhaAuth, 'ord-1001'), false, 'Cozinha NÃO pode gravar tombstone');
+  assert.strictEqual(engine.evalOrderTombstoneDelete(gerenteAuth, 'ord-1001'), false, 'Gerente NÃO pode apagar tombstone');
+  assert.strictEqual(engine.evalOrderTombstoneDelete(adminAuth, 'ord-1001'), true, 'Admin pode apagar tombstone');
+});
+
+runTest('29. Bootstrap Gerente Padrão: Permitir auto-criação apenas para gerente@amanditasabores.com.br e bloquear auto-elevação de outros', () => {
+  const seedGerenteAuth = { uid: 'uid-gerente-seed', token: { email: 'gerente@amanditasabores.com.br' } };
+  const seedGerenteDoc = { id: 'uid-gerente-seed', email: 'gerente@amanditasabores.com.br', role: 'GERENTE', status: 'ATIVO' };
+  assert.strictEqual(engine.evalUsersCreate(seedGerenteAuth, 'uid-gerente-seed', seedGerenteDoc), true, 'Gerente padrão pode criar seu próprio perfil inicial');
+
+  const commonStaffAuth = { uid: 'uid-outro', token: { email: 'outro@staff.amanditasabores.com.br' } };
+  const forgedGerenteDoc = { id: 'uid-outro', email: 'outro@staff.amanditasabores.com.br', role: 'GERENTE', status: 'ATIVO' };
+  assert.strictEqual(engine.evalUsersCreate(commonStaffAuth, 'uid-outro', forgedGerenteDoc), false, 'Colaborador comum NÃO pode auto-criar perfil GERENTE');
+});
+
+runTest('30. Integridade Financeira Rules: ATENDENTE bloqueado em cash_shifts, Client SDK bloqueado de alterar paymentStatus/CANCELADO e adicionais pagos aceitos', () => {
+  const shiftAberto = { id: 'shift-300', status: 'ABERTO', openedAt: '2026-11-11T08:00:00Z', openedBy: 'caixa', initialBalance: 100, movements: [] };
+  assert.strictEqual(engine.evalCashShiftCreate(atendenteAuth, 'shift-301'), false, 'ATENDENTE não pode criar turno em cash_shifts');
+  assert.strictEqual(engine.evalCashShiftUpdate(atendenteAuth, 'shift-300', shiftAberto, shiftAberto), false, 'ATENDENTE não pode escrever diretamente em cash_shifts');
+
+  // Client SDK create sempre exige paymentStatus == PENDENTE
+  const staffPaidCreate = {
+    ...baseOrder,
+    id: 'ord-paid-create',
+    trackingCode: 'tk_staff_paid_create_1234567890123456',
+    paymentStatus: 'PAGO',
+    status: 'EM_PREPARO',
+    movements: [{ id: 'm1', timestamp: '2026-11-11T08:00:00Z', toStatus: 'EM_PREPARO', author: 'PDV' }],
+  };
+  assert.strictEqual(engine.evalOrderCreate(caixaAuth, 'ord-paid-create', staffPaidCreate), false, 'Client SDK create não pode gravar paymentStatus=PAGO diretamente');
+
+  // Client SDK update não pode alterar paymentStatus nem modificar pedido CANCELADO
+  const markPaid = { ...baseOrder, paymentStatus: 'PAGO' };
+  assert.strictEqual(engine.evalOrderUpdate(adminAuth, 'ord-1001', baseOrder, markPaid), false, 'Client SDK update não pode mudar paymentStatus (somente Admin SDK /confirm-payment)');
+  const cancelledOrder = { ...baseOrder, status: 'CANCELADO' };
+  assert.strictEqual(engine.evalOrderUpdate(adminAuth, 'ord-1001', cancelledOrder, { ...cancelledOrder, status: 'EM_PREPARO' }), false, 'Pedido CANCELADO é imutável no Client SDK');
+
+  // Pedido com adicional pago (unitPrice = 14 + 3 = 17) aceito nas rules para equipe autenticada e bloqueado para criação direta anônima
+  const orderWithPaidAddon = {
+    id: 'ord-addon-ok',
+    orderNumber: '#1009',
+    createdAt: '2026-11-11T12:00:00Z',
+    updatedAt: '2026-11-11T12:00:00Z',
+    fulfillmentType: 'RETIRADA',
+    customer: { name: 'Ana Adicional', phone: '83999990000' },
+    items: [{
+      id: 'it-1',
+      menuItemId: 'item-cuscuz-carne',
+      name: 'Cuscuz',
+      quantity: 2,
+      unitPrice: 17.00,
+      addons: [{ id: 'ad-1', name: 'Queijo Extra', price: 3.00 }],
+      subtotal: 34.00
+    }],
+    subtotal: 34.00,
+    deliveryFee: 0,
+    discount: 0,
+    totalAmount: 34.00,
+    paymentMethod: 'PIX',
+    paymentStatus: 'PENDENTE',
+    status: 'NOVO',
+    trackingCode: 'tk_addon_ok_123456789012345678',
+    movements: [{ id: 'm1', timestamp: '2026-11-11T12:00:00Z', toStatus: 'NOVO', author: 'Cliente' }]
+  };
+  assert.strictEqual(engine.evalOrderCreate(customerAuth, 'ord-addon-ok', orderWithPaidAddon), false, 'Anônimo não cria pedido direto sem passar pelo servidor');
+  assert.strictEqual(engine.evalOrderCreate(caixaAuth, 'ord-addon-ok', orderWithPaidAddon), true, 'PDV/equipe com adicional pago (unitPrice = base + 3.00) deve ser aceito');
+});
+
+runTest('31. Regra Específica /configs/store_schedule: Admin/Gerente vs perfis menores/anônimo + validação estrita de schema', () => {
+  const validSchedule = {
+    operatingHours: [
+      { dayKey: 'seg', label: 'Segunda-feira', isOpen: true, openTime: '07:00', closeTime: '21:00' },
+      { dayKey: 'ter', label: 'Terça-feira', isOpen: true, openTime: '07:00', closeTime: '21:00' },
+      { dayKey: 'qua', label: 'Quarta-feira', isOpen: true, openTime: '07:00', closeTime: '21:00' },
+      { dayKey: 'qui', label: 'Quinta-feira', isOpen: true, openTime: '07:00', closeTime: '21:00' },
+      { dayKey: 'sex', label: 'Sexta-feira', isOpen: true, openTime: '07:00', closeTime: '21:00' },
+      { dayKey: 'sab', label: 'Sábado', isOpen: true, openTime: '08:00', closeTime: '20:00' },
+      { dayKey: 'dom', label: 'Domingo', isOpen: false, openTime: '08:00', closeTime: '14:00' },
+    ],
+    closedPrimaryMessage: 'Estamos fechados no momento.',
+    closedSecondaryMessage: 'Voltamos amanhã no nosso horário habitual.',
+    updatedAt: '2026-11-17T02:00:00.000Z',
+    updatedBy: 'gerente@staff.amanditasabores.com.br',
+  };
+
+  assert.strictEqual(engine.evalConfigGet(adminAuth, 'store_schedule'), true, 'ADMINISTRADOR pode ler store_schedule');
+  assert.strictEqual(engine.evalConfigGet(gerenteAuth, 'store_schedule'), true, 'GERENTE pode ler store_schedule');
+  assert.strictEqual(engine.evalConfigGet(caixaAuth, 'store_schedule'), false, 'CAIXA não lê store_schedule diretamente');
+  assert.strictEqual(engine.evalConfigGet(atendenteAuth, 'store_schedule'), false, 'ATENDENTE não lê store_schedule diretamente');
+  assert.strictEqual(engine.evalConfigGet(anonymousAuth, 'store_schedule'), false, 'Anônimo não lê store_schedule diretamente (usa endpoint sanitizado)');
+
+  assert.strictEqual(engine.evalConfigWrite(adminAuth, 'store_schedule', validSchedule), true, 'ADMINISTRADOR pode gravar store_schedule válido');
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'store_schedule', validSchedule), true, 'GERENTE pode gravar store_schedule válido');
+  assert.strictEqual(engine.evalConfigWrite(caixaAuth, 'store_schedule', validSchedule), false, 'CAIXA não pode gravar store_schedule');
+  assert.strictEqual(engine.evalConfigWrite(atendenteAuth, 'store_schedule', validSchedule), false, 'ATENDENTE não pode gravar store_schedule');
+  assert.strictEqual(engine.evalConfigWrite(entregadorAuth, 'store_schedule', validSchedule), false, 'ENTREGADOR não pode gravar store_schedule');
+  assert.strictEqual(engine.evalConfigWrite(anonymousAuth, 'store_schedule', validSchedule), false, 'Anônimo não pode gravar store_schedule');
+  assert.strictEqual(engine.evalConfigDelete(gerenteAuth, 'store_schedule'), false, 'GERENTE não pode apagar store_schedule');
+  assert.strictEqual(engine.evalConfigDelete(adminAuth, 'store_schedule'), true, 'ADMINISTRADOR pode apagar store_schedule');
+
+  // Diferenciação isAdmin vs isGerente preservada
+  assert.strictEqual(engine.evalConfigGet(gerenteAuth, 'internal'), false, 'GERENTE continua bloqueado em /configs/internal');
+
+  // Rejeição de payloads malformados
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'store_schedule', { ...validSchedule, extraSecret: 'x' }), false, 'Rejeitar chave não autorizada em store_schedule');
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'store_schedule', { ...validSchedule, closedPrimaryMessage: '' }), false, 'Rejeitar mensagem principal vazia');
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'store_schedule', {
+    ...validSchedule,
+    operatingHours: validSchedule.operatingHours.slice(0, 6),
+  }), false, 'Rejeitar semana com menos de 7 dias');
+  assert.strictEqual(engine.evalConfigWrite(gerenteAuth, 'store_schedule', {
+    ...validSchedule,
+    operatingHours: validSchedule.operatingHours.map((d, i) => i === 0 ? { ...d, openTime: '22:00', closeTime: '10:00' } : d),
+  }), false, 'Rejeitar dia aberto com abertura >= fechamento');
+});
+
+runTest('32. Bloqueio Client SDK Anônimo: /orders e /public_tracking bloqueiam criação anônima preservando leitura por trackingCode', () => {
+  assert.strictEqual(engine.evalOrderCreate(anonymousAuth, 'ord-1001', validOrderPayload), false, 'Anônimo bloqueado de criar direto em /orders');
+  assert.strictEqual(engine.evalPublicTrackingCreate(anonymousAuth, 'tk_9876543210abcdef12345678', validTrackingDoc), false, 'Anônimo bloqueado de criar direto em /public_tracking');
+  assert.strictEqual(engine.evalPublicTrackingGet(anonymousAuth, 'tk_9876543210abcdef12345678'), true, 'Leitura individual de /public_tracking preservada');
+  assert.strictEqual(engine.evalPublicTrackingList(anonymousAuth), false, 'Listagem de /public_tracking segue proibida');
+});
+
+runTest('33. Bloqueio Client SDK de CANCELADO em /public_tracking preservando andamento operacional', () => {
+  assert.strictEqual(
+    engine.evalPublicTrackingUpdate(gerenteAuth, 'tk_9876543210abcdef12345678', validTrackingDoc, { ...validTrackingDoc, status: 'CANCELADO' }),
+    false,
+    'Client SDK não pode marcar public_tracking como CANCELADO'
+  );
+  assert.strictEqual(
+    engine.evalPublicTrackingUpdate(cozinhaAuth, 'tk_9876543210abcdef12345678', validTrackingDoc, { ...validTrackingDoc, status: 'EM_PREPARO' }),
+    true,
+    'Atualização operacional normal em public_tracking preservada'
+  );
 });
 
 console.log(`\n======================================================`);

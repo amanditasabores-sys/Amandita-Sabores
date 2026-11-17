@@ -48,31 +48,39 @@ assert(
 );
 console.log('✅ [PASS] 2. Métodos deleteOrderAsync, getDeletedOrderIds e remoção da fila em store.ts');
 
-// 3. Verificar que o listener do Firestore em store.ts descarta pedidos tombstone
+// 3. Verificar que reconcileRemoteOrders e listener em store.ts descartam pedidos tombstone e propagam exclusões
 assert(
   storeContent.includes('const deletedIds = this.getDeletedOrderIds()'),
-  'initStaffFirestoreSync deve consultar a lista de pedidos excluídos'
+  'reconcileRemoteOrders deve consultar a lista de pedidos excluídos'
 );
 assert(
   storeContent.includes('if (deletedIds.has(ro.id))'),
-  'initStaffFirestoreSync deve descartar pedidos que já foram excluídos'
+  'reconcileRemoteOrders deve descartar pedidos que já foram excluídos'
 );
 assert(
-  storeContent.includes('if (!deletedIds.has(lo.id))'),
-  'initStaffFirestoreSync não deve processar pedidos locais excluídos'
+  storeContent.includes('.filter((lo) => !deletedIds.has(lo.id))'),
+  'reconcileRemoteOrders não deve processar pedidos locais excluídos'
 );
-console.log('✅ [PASS] 3. Proteção contra ressurreição de pedidos excluídos (tombstone filter no onSnapshot)');
+assert(
+  storeContent.includes('syncTombstonesFromServer'),
+  'store.ts deve sincronizar tombstones compartilhados do servidor'
+);
+assert(
+  storeContent.includes("updateErr?.code === 'not-found'") && storeContent.includes('updateDoc('),
+  'persistOrderToFirestore deve usar updateDoc em pedidos já sincronizados para não ressuscitar exclusões remotas'
+);
+console.log('✅ [PASS] 3. Proteção contra ressurreição de pedidos excluídos (tombstone filter + updateDoc + tombstones do servidor)');
 
-// 4. Verificar preservação de entregador e estabilização de sync status
+// 4. Verificar serialização de escritas e ausência de sucesso falso na exclusão no servidor
 assert(
-  storeContent.includes('const mergedDeliveryPersonId = ro.deliveryPersonId || lo.deliveryPersonId'),
-  'initStaffFirestoreSync deve preservar atribuição de entregador para evitar oscilação de dados'
+  storeContent.includes('pendingOrderRewrites') && storeContent.includes('isLocalPendingAhead'),
+  'store.ts deve serializar gravações consecutivas e proteger atualizações pendentes'
 );
 assert(
-  !storeContent.includes('localStorage.setItem(\'gf_orders\', JSON.stringify(merged));\n\n            // Apply automated assignment rule: if exactly 1 active driver exists, auto-assign\n            this.applyAutomaticDriverAssignment();'),
-  'applyAutomaticDriverAssignment não pode ser chamado repetidamente dentro do onSnapshot de pedidos'
+  !serverContent.includes('if (deletedFromFirestore || !adminDb)'),
+  'server.ts NÃO pode retornar sucesso falso quando !adminDb sem confirmação do Firestore'
 );
-console.log('✅ [PASS] 4. Estabilidade do status de sincronização (sem loop de alternância verde/laranja)');
+console.log('✅ [PASS] 4. Estabilidade do status de sincronização e confirmação real de exclusão no servidor');
 
 // 5. Verificar feedback visual e tratamento assíncrono em LiveOrdersKanban.tsx
 const kanbanContent = fs.readFileSync('./src/components/admin/LiveOrdersKanban.tsx', 'utf8');

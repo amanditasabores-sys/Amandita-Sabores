@@ -90,6 +90,14 @@ service cloud.firestore {
       return isGerente() || (hasActiveProfile() && userRole() in ['CAIXA', 'caixa', 'ATENDENTE', 'atendente']);
     }
 
+    function isCashManager() {
+      return isGerente() || (hasActiveProfile() && userRole() in ['CAIXA', 'caixa']);
+    }
+
+    function isAttendantStaff() {
+      return hasActiveProfile() && userRole() in ['ATENDENTE', 'atendente'];
+    }
+
     // =========================================================================
     // 1. MENU ITEMS (Cardápio Digital Público)
     // Public catalog read; modifications restricted to Admin / Gerente.
@@ -144,6 +152,59 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    function isValidOperatingDay(day) {
+      return day is map &&
+        day.keys().hasAll(['dayKey', 'label', 'isOpen', 'openTime', 'closeTime']) &&
+        day.keys().hasOnly(['dayKey', 'label', 'isOpen', 'openTime', 'closeTime']) &&
+        day.dayKey in ['seg', 'ter', 'qua', 'qui', 'sex', 'sab', 'dom'] &&
+        day.label is string && day.label.size() >= 1 && day.label.size() <= 40 &&
+        day.isOpen is bool &&
+        day.openTime is string && day.openTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$') &&
+        day.closeTime is string && day.closeTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$') &&
+        (!day.isOpen || day.openTime < day.closeTime);
+    }
+
+    function isValidStoreSchedule(data) {
+      return data is map &&
+        data.keys().hasAll([
+          'operatingHours', 'closedPrimaryMessage', 'closedSecondaryMessage', 'updatedAt', 'updatedBy'
+        ]) &&
+        data.keys().hasOnly([
+          'operatingHours', 'closedPrimaryMessage', 'closedSecondaryMessage', 'updatedAt', 'updatedBy'
+        ]) &&
+        data.operatingHours is list &&
+        data.operatingHours.size() == 7 &&
+        isValidOperatingDay(data.operatingHours[0]) &&
+        isValidOperatingDay(data.operatingHours[1]) &&
+        isValidOperatingDay(data.operatingHours[2]) &&
+        isValidOperatingDay(data.operatingHours[3]) &&
+        isValidOperatingDay(data.operatingHours[4]) &&
+        isValidOperatingDay(data.operatingHours[5]) &&
+        isValidOperatingDay(data.operatingHours[6]) &&
+        data.closedPrimaryMessage is string &&
+        data.closedPrimaryMessage.size() >= 1 &&
+        data.closedPrimaryMessage.size() <= 200 &&
+        data.closedSecondaryMessage is string &&
+        data.closedSecondaryMessage.size() <= 500 &&
+        data.updatedAt is string &&
+        data.updatedAt.size() >= 10 &&
+        data.updatedAt.size() <= 64 &&
+        data.updatedBy is string &&
+        data.updatedBy.size() >= 1 &&
+        data.updatedBy.size() <= 128;
+    }
+
+    // =========================================================================
+    // 2c. STORE SCHEDULE (Horários de Funcionamento & Página de Loja Fechada)
+    // Contains staff audit metadata (updatedBy): restricted to Gerente / Admin.
+    // Public clients receive sanitized fields strictly via /api/store/availability.
+    // =========================================================================
+    match /configs/store_schedule {
+      allow get, list: if isGerente();
+      allow create, update: if isGerente() && isValidStoreSchedule(incoming());
+      allow delete: if isAdmin();
+    }
+
     match /configs/{otherConfig} {
       allow get, list, create, update, delete: if isAdmin();
     }
@@ -167,12 +228,16 @@ service cloud.firestore {
       // Order status updates: Restricted to authenticated staff respecting operational roles
       allow update: if isValidId(orderId) && isValidOrderUpdate();
 
-      // Order deletion: Strictly restricted to Administrator
-      allow delete: if isValidId(orderId) && isAdmin();
+      // Order deletion: Strictly restricted to Administrator or Gerente (never Caixa/Cozinha/Entregador/Atendente)
+      allow delete: if isValidId(orderId) && isGerente();
     }
 
     function isPriceExact(submittedPrice, officialPrice) {
       return (submittedPrice - officialPrice) >= -0.001 && (submittedPrice - officialPrice) <= 0.001;
+    }
+
+    function isSubtotalExact(submittedVal, expectedVal) {
+      return (submittedVal - expectedVal) >= -0.01 && (submittedVal - expectedVal) <= 0.01;
     }
 
     function isValidOrderItemStructure(item) {
@@ -183,7 +248,7 @@ service cloud.firestore {
         item.name is string && item.name.size() >= 1 && item.name.size() <= 100 &&
         item.quantity is int && item.quantity >= 1 && item.quantity <= 50 &&
         item.unitPrice is number && item.unitPrice > 0 &&
-        item.subtotal is number && item.subtotal >= (item.unitPrice * item.quantity);
+        item.subtotal is number && item.subtotal >= (item.unitPrice * item.quantity) - 0.01;
     }
 
     // Official addon validation: verifies that each addon has valid ID, string name and official price:
@@ -197,54 +262,50 @@ service cloud.firestore {
         (addon.price == 3.00 || addon.price == 0.00);
     }
 
-    // Mathematical integrity of item subtotal with addons:
-    // Prevents forged addon prices and prevents adding addons for free.
-    function isItemSubtotalExact(item) {
-      let base = item.unitPrice;
-      let q = item.quantity;
-      return (
-        // Case 0: No addons
-        (!('addons' in item) || item.addons.size() == 0) &&
-        ((item.subtotal - (base * q)) >= -0.01 && (item.subtotal - (base * q)) <= 0.01)
-      ) || (
-        // Case 1: 1 addon
-        ('addons' in item) && item.addons.size() == 1 &&
-        isValidAddon(item.addons[0]) &&
-        ((item.subtotal - ((base + item.addons[0].price) * q)) >= -0.01 &&
-         (item.subtotal - ((base + item.addons[0].price) * q)) <= 0.01)
-      ) || (
-        // Case 2: 2 addons
-        ('addons' in item) && item.addons.size() == 2 &&
-        isValidAddon(item.addons[0]) && isValidAddon(item.addons[1]) &&
-        ((item.subtotal - ((base + item.addons[0].price + item.addons[1].price) * q)) >= -0.01 &&
-         (item.subtotal - ((base + item.addons[0].price + item.addons[1].price) * q)) <= 0.01)
-      ) || (
-        // Case 3: 3 addons
-        ('addons' in item) && item.addons.size() == 3 &&
-        isValidAddon(item.addons[0]) && isValidAddon(item.addons[1]) && isValidAddon(item.addons[2]) &&
-        ((item.subtotal - ((base + item.addons[0].price + item.addons[1].price + item.addons[2].price) * q)) >= -0.01 &&
-         (item.subtotal - ((base + item.addons[0].price + item.addons[1].price + item.addons[2].price) * q)) <= 0.01)
-      ) || (
-        // Case 4: 4 addons
-        ('addons' in item) && item.addons.size() == 4 &&
-        isValidAddon(item.addons[0]) && isValidAddon(item.addons[1]) && isValidAddon(item.addons[2]) && isValidAddon(item.addons[3]) &&
-        ((item.subtotal - ((base + item.addons[0].price + item.addons[1].price + item.addons[2].price + item.addons[3].price) * q)) >= -0.01 &&
-         (item.subtotal - ((base + item.addons[0].price + item.addons[1].price + item.addons[2].price + item.addons[3].price) * q)) <= 0.01)
+    function areAddonsValid(item) {
+      return !('addons' in item) || (
+        item.addons is list && (
+          item.addons.size() == 0 ||
+          (item.addons.size() == 1 && isValidAddon(item.addons[0])) ||
+          (item.addons.size() == 2 && isValidAddon(item.addons[0]) && isValidAddon(item.addons[1])) ||
+          (item.addons.size() == 3 && isValidAddon(item.addons[0]) && isValidAddon(item.addons[1]) && isValidAddon(item.addons[2])) ||
+          (item.addons.size() == 4 && isValidAddon(item.addons[0]) && isValidAddon(item.addons[1]) && isValidAddon(item.addons[2]) && isValidAddon(item.addons[3]))
+        )
+      );
+    }
+
+    function getAddonsSum(item) {
+      return !('addons' in item) || item.addons.size() == 0 ? 0 :
+        item.addons.size() == 1 ? item.addons[0].price :
+        item.addons.size() == 2 ? (item.addons[0].price + item.addons[1].price) :
+        item.addons.size() == 3 ? (item.addons[0].price + item.addons[1].price + item.addons[2].price) :
+        (item.addons[0].price + item.addons[1].price + item.addons[2].price + item.addons[3].price);
+    }
+
+    function isItemPriceAndSubtotalMatchesCatalog(item, officialPrice) {
+      let addonsSum = getAddonsSum(item);
+      let effectiveUnit = officialPrice + addonsSum;
+      return areAddonsValid(item) && (
+        // Standard client format (CustomerMenu / PointOfSale): unitPrice = catalog + addons, subtotal = unitPrice * q
+        (isPriceExact(item.unitPrice, effectiveUnit) &&
+         isSubtotalExact(item.subtotal, effectiveUnit * item.quantity)) ||
+        // Alternate format: unitPrice = catalog, subtotal = (catalog + addons) * q
+        (isPriceExact(item.unitPrice, officialPrice) &&
+         isSubtotalExact(item.subtotal, effectiveUnit * item.quantity))
       );
     }
 
     // Validates an item against the official catalog:
-    // 1. Structure integrity
+    // 1. Structure integrity & valid addon list
     // 2. Product must exist in /menu_items/{id} (strictly rejects nonexistent items)
     // 3. Product must be active (available == true)
-    // 4. Unit price must match official catalog price exactly (no undercharging or overcharging)
-    // 5. Addon prices and subtotal must be mathematically exact
+    // 4. Unit price and subtotal must match official catalog price + validated addons
     function isItemCatalogConsistent(item) {
       return isValidOrderItemStructure(item) &&
+        areAddonsValid(item) &&
         exists(/databases/$(database)/documents/menu_items/$(item.menuItemId)) &&
         get(/databases/$(database)/documents/menu_items/$(item.menuItemId)).data.available == true &&
-        isPriceExact(item.unitPrice, get(/databases/$(database)/documents/menu_items/$(item.menuItemId)).data.price) &&
-        isItemSubtotalExact(item);
+        isItemPriceAndSubtotalMatchesCatalog(item, get(/databases/$(database)/documents/menu_items/$(item.menuItemId)).data.price);
     }
 
     // Multi-item unrolled validation for public customer orders:
@@ -327,20 +388,24 @@ service cloud.firestore {
     // Carts with > 8 items are ingested and validated for 100% of items via the secure backend /api/orders validator.
     function areStaffItemsValid(items) {
       return items.size() >= 1 && items.size() <= 50 &&
-        isValidOrderItemStructure(items[0]) &&
-        (items.size() < 2 || isValidOrderItemStructure(items[1])) &&
-        (items.size() < 3 || isValidOrderItemStructure(items[2])) &&
-        (items.size() < 4 || isValidOrderItemStructure(items[3])) &&
-        (items.size() < 5 || isValidOrderItemStructure(items[4])) &&
-        (items.size() < 6 || isValidOrderItemStructure(items[5])) &&
-        (items.size() < 7 || isValidOrderItemStructure(items[6])) &&
-        (items.size() < 8 || isValidOrderItemStructure(items[7]));
+        (isValidOrderItemStructure(items[0]) && areAddonsValid(items[0])) &&
+        (items.size() < 2 || (isValidOrderItemStructure(items[1]) && areAddonsValid(items[1]))) &&
+        (items.size() < 3 || (isValidOrderItemStructure(items[2]) && areAddonsValid(items[2]))) &&
+        (items.size() < 4 || (isValidOrderItemStructure(items[3]) && areAddonsValid(items[3]))) &&
+        (items.size() < 5 || (isValidOrderItemStructure(items[4]) && areAddonsValid(items[4]))) &&
+        (items.size() < 6 || (isValidOrderItemStructure(items[5]) && areAddonsValid(items[5]))) &&
+        (items.size() < 7 || (isValidOrderItemStructure(items[6]) && areAddonsValid(items[6]))) &&
+        (items.size() < 8 || (isValidOrderItemStructure(items[7]) && areAddonsValid(items[7])));
     }
 
+    // Direct Client SDK order creation is strictly restricted to authenticated Staff (PDV).
+    // Public customer orders MUST go through backend POST /api/orders (Admin SDK transaction
+    // verifying open cash shift + catalog prices atomically to eliminate closed-store bypass / TOCTOU).
     function isValidNewOrder(orderId) {
       let data = incoming();
       let staff = isStaff();
-      return isValidId(orderId) &&
+      return staff &&
+        isValidId(orderId) &&
         data.id == orderId &&
         data.keys().hasAll([
           'id', 'orderNumber', 'createdAt', 'updatedAt',
@@ -350,8 +415,9 @@ service cloud.firestore {
         ]) &&
         // Status integrity: Public orders MUST be 'NOVO'; POS balcão orders by staff can be 'EM_PREPARO'
         (data.status == 'NOVO' || (data.status == 'EM_PREPARO' && staff)) &&
-        // Payment status integrity: Public orders cannot self-declare as PAGO
-        (staff || data.paymentStatus == 'PENDENTE') &&
+        // Payment status integrity: ALL direct Client SDK order creations MUST start as PENDENTE.
+        // Immediate PAGO sales are created atomically via Firebase Admin SDK together with cash_shifts.
+        data.paymentStatus == 'PENDENTE' &&
         data.orderNumber is string && data.orderNumber.size() >= 2 && data.orderNumber.size() <= 32 &&
         data.fulfillmentType in ['DELIVERY', 'RETIRADA'] &&
         data.paymentMethod in ['PIX', 'CARTAO_CREDITO', 'CARTAO_DEBITO', 'DINHEIRO'] &&
@@ -397,73 +463,66 @@ service cloud.firestore {
       let data = incoming();
       let prev = existing();
       return isStaff() &&
-        // Primary identity is immutable
+        // Cancelled orders are immutable via Client SDK
+        prev.status != 'CANCELADO' &&
+        // Primary identity and financial integrity are immutable via Client SDK.
+        // Payment confirmation (PENDENTE -> PAGO) must execute atomically via backend Admin SDK transaction.
         data.id == prev.id &&
         data.orderNumber == prev.orderNumber &&
         data.createdAt == prev.createdAt &&
         data.fulfillmentType == prev.fulfillmentType &&
-        // Kitchen role restrictions: cannot modify prices, payments, customer or items
+        data.subtotal == prev.subtotal &&
+        data.deliveryFee == prev.deliveryFee &&
+        data.discount == prev.discount &&
+        data.totalAmount == prev.totalAmount &&
+        data.paymentMethod == prev.paymentMethod &&
+        data.paymentStatus == prev.paymentStatus &&
+        data.items == prev.items &&
+        // Kitchen role restrictions: cannot modify customer or delivery metadata
         (
           !isKitchenStaff() || isGerente() || (
             data.status in ['EM_PREPARO', 'PRONTO'] &&
-            data.subtotal == prev.subtotal &&
-            data.deliveryFee == prev.deliveryFee &&
-            data.discount == prev.discount &&
-            data.totalAmount == prev.totalAmount &&
-            data.paymentMethod == prev.paymentMethod &&
-            data.paymentStatus == prev.paymentStatus &&
-            data.items == prev.items &&
             data.customer == prev.customer
           )
         ) &&
-        // Delivery role restrictions: cannot modify prices, discount, items or customer
+        // Delivery role restrictions: cannot modify customer
         (
           !isDeliveryStaff() || isGerente() || (
             data.status in ['EM_ROTA', 'ENTREGUE'] &&
-            data.subtotal == prev.subtotal &&
-            data.deliveryFee == prev.deliveryFee &&
-            data.discount == prev.discount &&
-            data.totalAmount == prev.totalAmount &&
-            data.paymentMethod == prev.paymentMethod &&
-            data.items == prev.items &&
             data.customer == prev.customer
           )
         ) &&
-        // Cashier role restrictions: cannot alter core items and subtotal
+        // Cashier/Attendant role restrictions
         (
           !isCashierStaff() || isGerente() || (
-            data.status in ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'] &&
-            data.items == prev.items &&
-            data.subtotal == prev.subtotal &&
-            data.deliveryFee == prev.deliveryFee
+            data.status in ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE']
           )
         ) &&
-        // Status transition permissions
+        // Status transition permissions (cancellations must execute strictly via backend Admin SDK /api/orders/:id/cancel)
+        data.status != 'CANCELADO' &&
+        data.status in ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'] &&
         (
           isGerente() ||
           (isKitchenStaff() && data.status in ['EM_PREPARO', 'PRONTO']) ||
           (isDeliveryStaff() && data.status in ['EM_ROTA', 'ENTREGUE']) ||
           (isCashierStaff() && data.status in ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'])
-        ) &&
-        // Cancellation requires reason and author
-        (data.status != 'CANCELADO' || (
-          prev.status != 'CANCELADO' &&
-          'cancellationReason' in data &&
-          data.cancellationReason is string &&
-          data.cancellationReason.size() >= 3 &&
-          isGerente()
-        ));
+        );
     }
 
     // =========================================================================
     // 4. CASH REGISTER SHIFTS (Fluxo de Caixa, Sangrias, Saldos)
-    // Strictly restricted to authorized staff (Cashier, Gerente, Admin)
+    // Strictly restricted to Cash Manager (CAIXA / GERENTE / ADMIN) for management.
+    // ATENDENTE has ZERO direct write access on cash_shifts; manual payment confirmation
+    // runs strictly through the atomic backend Admin SDK transaction.
     // ZERO public access.
     // =========================================================================
     match /cash_shifts/{shiftId} {
-      allow get, list: if isAdmin() || (isStaff() && (isCashierStaff() || isGerente()));
-      allow create: if isValidId(shiftId) && (isAdmin() || (isStaff() && (isCashierStaff() || isGerente())));
-      allow update: if isValidId(shiftId) && (isAdmin() || (isStaff() && (isCashierStaff() || isGerente()))) && resource.data.status != 'FECHADO';
+      allow get, list: if isAdmin() || isCashManager() || (isAttendantStaff() && resource.data.status == 'ABERTO');
+      allow create: if isValidId(shiftId) && (isAdmin() || isCashManager());
+      allow update: if isValidId(shiftId) && resource.data.status != 'FECHADO' && (
+        isAdmin() ||
+        isCashManager()
+      );
       allow delete: if isValidId(shiftId) && isAdmin();
     }
 
@@ -526,6 +585,8 @@ service cloud.firestore {
           (
             // Whitelisted emergency bootstrap accounts can initialize ADMINISTRADOR
             (isBootstrappedAdmin() && (incoming().role == 'ADMINISTRADOR' || incoming().role == 'admin')) ||
+            // Default seeded Gerente account can initialize its own GERENTE profile on first login
+            (request.auth.token.email.lower() == 'gerente@amanditasabores.com.br' && (incoming().role == 'GERENTE' || incoming().role == 'gerente')) ||
             // General staff self-registration is strictly restricted to base operational roles
             (
               (
@@ -558,11 +619,12 @@ service cloud.firestore {
     match /public_tracking/{trackingCode} {
       allow get: if isValidId(trackingCode) && trackingCode.size() >= 20;
       allow list: if false; // Complete enumeration of tracking codes is strictly denied!
-      allow create: if isValidId(trackingCode) && trackingCode.size() >= 20 &&
+      allow create: if isStaff() && isValidId(trackingCode) && trackingCode.size() >= 20 &&
         incoming().trackingCode == trackingCode &&
         incoming().id is string &&
         incoming().orderNumber is string &&
         incoming().status in ['NOVO', 'EM_PREPARO'] &&
+        incoming().paymentStatus == 'PENDENTE' &&
         incoming().totalAmount is number &&
         incoming().totalAmount >= 0 &&
         // Whitelist allowed tracking keys (Strict PII shield)
@@ -576,8 +638,12 @@ service cloud.firestore {
         !('phone' in incoming()) &&
         !('address' in incoming());
       allow update: if isValidId(trackingCode) && isStaff() &&
+        existing().status != 'CANCELADO' &&
+        incoming().status != 'CANCELADO' &&
+        incoming().status in ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'] &&
         incoming().id == existing().id &&
         incoming().trackingCode == existing().trackingCode &&
+        incoming().paymentStatus == existing().paymentStatus &&
         incoming().keys().hasOnly([
           'id', 'orderNumber', 'createdAt', 'estimatedDeliveryMinutes',
           'fulfillmentType', 'status', 'items', 'subtotal',
@@ -587,7 +653,7 @@ service cloud.firestore {
         !('customer' in incoming()) &&
         !('phone' in incoming()) &&
         !('address' in incoming());
-      allow delete: if isValidId(trackingCode) && isAdmin();
+      allow delete: if isValidId(trackingCode) && isGerente();
     }
 
     // =========================================================================
@@ -597,6 +663,17 @@ service cloud.firestore {
     // =========================================================================
     match /push_subscriptions/{subId} {
       allow read, write: if isValidId(subId) && isStaff();
+    }
+
+    // =========================================================================
+    // 9. ORDER TOMBSTONES (Registro Compartilhado de Pedidos Excluídos)
+    // Prevents deleted orders from resurrecting across devices or cold starts.
+    // Read: Staff only. Create/Update: Gerente / Admin only. Delete: Admin only.
+    // =========================================================================
+    match /order_tombstones/{orderId} {
+      allow get, list: if isStaff();
+      allow create, update: if isValidId(orderId) && isGerente();
+      allow delete: if isValidId(orderId) && isAdmin();
     }
   }
 }

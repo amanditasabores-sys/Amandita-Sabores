@@ -1,9 +1,25 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { store } from '../../services/store';
 import { RestaurantConfig, User } from '../../types';
-import { generatePixCopiaECola, sanitizePixKey, sanitizeMerchantName, sanitizeMerchantCity } from '../../utils/pix';
+import {
+  generatePurchasePixPayload,
+  sanitizePixKey,
+  cleanMerchantText,
+  validatePixKey,
+  validatePixReceiver,
+  getPixKeyHint,
+} from '../../utils/pix';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { formatCurrency } from '../../utils/formatters';
+import {
+  DEFAULT_OPERATING_HOURS,
+  DEFAULT_CLOSED_PRIMARY_MESSAGE,
+  DEFAULT_CLOSED_SECONDARY_MESSAGE,
+  normalizeOperatingHours,
+  validateOperatingHours,
+  validateWhatsAppNumber,
+  formatWhatsAppDisplay,
+} from '../../utils/storeHours';
 import { 
   QrCode, 
   Settings, 
@@ -34,12 +50,16 @@ import {
   Bell,
   Volume2,
   VolumeX,
-  Bike
+  Bike,
+  Calendar,
+  MessageSquare,
+  Info
 } from 'lucide-react';
 import { FirebaseStatusModal } from './FirebaseStatusModal';
 import { PrinterSettings } from './PrinterSettings';
 import { PWAInstallButton } from '../common/PWAInstallButton';
 import { pushNotificationService } from '../../services/pushNotification';
+import { getCurrentFirebaseUser } from '../../services/firebase';
 import { soundService } from '../../services/audio';
 
 interface StoreSettingsProps {
@@ -52,11 +72,58 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
   const [users, setUsers] = useState<User[]>(() => store.getUsers());
   const [isFirebaseModalOpen, setIsFirebaseModalOpen] = useState(false);
   const [isSaved, setIsSaved] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
+  const [pixValidationError, setPixValidationError] = useState<string | null>(null);
+  const [isLoadingCloudConfig, setIsLoadingCloudConfig] = useState<boolean>(() => store.canUserManageConfig());
+  const [cloudLoadError, setCloudLoadError] = useState<string | null>(null);
+  const hasUnsavedChangesRef = useRef(false);
+
+  const updateConfigField = (patch: Partial<RestaurantConfig>) => {
+    hasUnsavedChangesRef.current = true;
+    setIsSaved(false);
+    setSaveStatus(null);
+    setConfig((prev) => ({ ...prev, ...patch }));
+  };
+
+  const loadCloudSettings = async () => {
+    if (!store.canUserManageConfig()) {
+      setIsLoadingCloudConfig(false);
+      setCloudLoadError(null);
+      return;
+    }
+    setIsLoadingCloudConfig(true);
+    setCloudLoadError(null);
+    try {
+      const res = await store.loadStoreSettingsFromCloud();
+      if (res.success && res.config) {
+        if (!hasUnsavedChangesRef.current) {
+          setConfig(res.config);
+        }
+        setCloudLoadError(null);
+      } else {
+        setCloudLoadError(
+          res.error || 'Não foi possível carregar os horários e configurações salvos no Cloud Firestore.'
+        );
+      }
+    } catch (err: unknown) {
+      setCloudLoadError(
+        err instanceof Error ? err.message : 'Erro inesperado ao carregar configurações da nuvem.'
+      );
+    } finally {
+      setIsLoadingCloudConfig(false);
+    }
+  };
 
   useEffect(() => {
-    const handleStateChange = () => {
+    loadCloudSettings();
+    const handleStateChange = (event: Event) => {
+      const detail = (event as CustomEvent)?.detail;
       setUsers(store.getUsers());
-      setConfig(store.getRestaurantConfig());
+      const eventType = detail?.type;
+      if (!hasUnsavedChangesRef.current && (eventType === 'CONFIG_UPDATED' || eventType === 'FULL_RESET')) {
+        setConfig(store.getRestaurantConfig());
+      }
     };
     window.addEventListener('gestaofood_state_changed', handleStateChange);
     return () => window.removeEventListener('gestaofood_state_changed', handleStateChange);
@@ -176,12 +243,21 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     setIsTestingPush(true);
     setPushFeedback(null);
     try {
+      const headers: Record<string, string> = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      };
+      try {
+        const fbUser = getCurrentFirebaseUser();
+        if (fbUser) {
+          const idToken = await fbUser.getIdToken();
+          if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+        }
+      } catch {}
+
       const res = await fetch('/api/push/test', {
         method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
+        headers,
       });
 
       // Safely read response text first to eliminate "Unexpected end of JSON input" errors
@@ -291,27 +367,58 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
   const [copiedTestCode, setCopiedTestCode] = useState(false);
 
   const generateTestPix = async () => {
-    if (!config.pixKey.trim()) {
+    const rawKey = (config.pixKey || '').trim();
+    const keyType = config.pixKeyType || 'EMAIL';
+    if (!rawKey) {
+      setPixValidationError(null);
       setTestPixCode('');
       setTestQrDataUrl('');
       return;
     }
+
+    const validation = validatePixKey(rawKey, keyType);
+    if (!validation.valid) {
+      setPixValidationError(validation.error || 'Chave PIX inválida para o tipo selecionado.');
+      setTestPixCode('');
+      setTestQrDataUrl('');
+      return;
+    }
+
+    const receiverCheck = validatePixReceiver(config.pixReceiverName, config.pixReceiverCity);
+    if (!receiverCheck.valid) {
+      setPixValidationError(null);
+      setTestPixCode('');
+      setTestQrDataUrl('');
+      return;
+    }
+
     const amt = parseFloat(testAmount) || 1.00;
+    const pixRes = generatePurchasePixPayload({
+      pixKey: validation.normalized,
+      keyType,
+      receiverName: receiverCheck.receiverName,
+      receiverCity: receiverCheck.receiverCity,
+      storeName: config.name,
+      amount: amt,
+      txId: 'TESTEPIX',
+      description: 'Amandita Sabores',
+    });
+
+    if (!pixRes.success) {
+      setPixValidationError(pixRes.error);
+      setTestPixCode('');
+      setTestQrDataUrl('');
+      return;
+    }
+
+    setPixValidationError(null);
     try {
-      const payload = generatePixCopiaECola({
-        pixKey: config.pixKey.trim(),
-        keyType: config.pixKeyType,
-        receiverName: config.pixReceiverName?.trim() || config.name,
-        receiverCity: config.pixReceiverCity?.trim() || 'CAMPINA GRANDE',
-        amount: amt,
-        txId: 'TESTEPIX',
-        description: 'Amandita Sabores',
-      });
-      setTestPixCode(payload);
-      const qr = await generateQRCodeDataUrl(payload, { width: 260, margin: 1 });
+      setTestPixCode(pixRes.payload);
+      const qr = await generateQRCodeDataUrl(pixRes.payload, { width: 260, margin: 1 });
       setTestQrDataUrl(qr);
     } catch {
-      setTestPixCode(config.pixKey);
+      setTestPixCode('');
+      setTestQrDataUrl('');
     }
   };
 
@@ -319,19 +426,116 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     generateTestPix();
   }, [config.pixKey, config.pixKeyType, config.pixReceiverName, config.pixReceiverCity, config.name, testAmount]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // Normalize BACEN fields to ensure the stored configuration never corrupts
-    const normalizedConfig: RestaurantConfig = {
-      ...config,
-      pixKey: sanitizePixKey(config.pixKey, config.pixKeyType),
-      pixReceiverName: sanitizeMerchantName(config.pixReceiverName || config.name),
-      pixReceiverCity: sanitizeMerchantCity(config.pixReceiverCity || 'CAMPINA GRANDE'),
-    };
-    setConfig(normalizedConfig);
-    store.updateRestaurantConfig(normalizedConfig);
-    setIsSaved(true);
-    setTimeout(() => setIsSaved(false), 3000);
+    setSaveStatus(null);
+
+    if (!store.canUserManageConfig()) {
+      setSaveStatus({
+        type: 'error',
+        message: 'Permissão insuficiente: apenas Administrador ou Gerente podem alterar configurações e chave PIX.',
+      });
+      return;
+    }
+
+    if (isLoadingCloudConfig) {
+      setSaveStatus({
+        type: 'warning',
+        message: 'Aguarde o carregamento das configurações atuais na nuvem antes de salvar alterações.',
+      });
+      return;
+    }
+
+    if (cloudLoadError) {
+      setSaveStatus({
+        type: 'error',
+        message: 'Carregamento da nuvem falhou. Clique em "Tentar carregar novamente" antes de salvar para evitar sobrescrever dados reais.',
+      });
+      return;
+    }
+
+    const keyType = config.pixKeyType || 'EMAIL';
+    const validation = validatePixKey(config.pixKey || '', keyType);
+    if (!validation.valid) {
+      const msg = validation.error || 'Chave PIX inválida para o tipo selecionado.';
+      setPixValidationError(msg);
+      setSaveStatus({ type: 'error', message: msg });
+      return;
+    }
+
+    const receiverCheck = validatePixReceiver(config.pixReceiverName, config.pixReceiverCity);
+    if (!receiverCheck.valid) {
+      setSaveStatus({
+        type: 'error',
+        message: receiverCheck.error || 'Informe o Nome e a Cidade do Titular da conta PIX (mínimo 2 caracteres).',
+      });
+      return;
+    }
+
+    const waCheck = validateWhatsAppNumber(config.whatsapp);
+    if (!waCheck.valid) {
+      setSaveStatus({
+        type: 'error',
+        message: waCheck.error || 'Informe um número de WhatsApp válido com DDD.',
+      });
+      return;
+    }
+
+    const normalizedHours = normalizeOperatingHours(config.operatingHours);
+    const hoursCheck = validateOperatingHours(normalizedHours);
+    if (!hoursCheck.valid) {
+      setSaveStatus({
+        type: 'error',
+        message: hoursCheck.error || 'Verifique os horários de funcionamento informados.',
+      });
+      return;
+    }
+
+    const primaryMsg = (config.closedPrimaryMessage ?? DEFAULT_CLOSED_PRIMARY_MESSAGE).trim();
+    if (!primaryMsg) {
+      setSaveStatus({
+        type: 'error',
+        message: 'Informe a mensagem principal exibida na página de estabelecimento fechado.',
+      });
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const payloadToSave: RestaurantConfig = {
+        ...config,
+        whatsapp: waCheck.normalized,
+        operatingHours: hoursCheck.hours,
+        closedPrimaryMessage: primaryMsg,
+        closedSecondaryMessage: (config.closedSecondaryMessage ?? DEFAULT_CLOSED_SECONDARY_MESSAGE).trim(),
+      };
+      const res = await store.updateRestaurantConfigAsync(payloadToSave);
+      if (res.success && res.config) {
+        hasUnsavedChangesRef.current = false;
+        setConfig(res.config);
+        setIsSaved(true);
+        setPixValidationError(null);
+        setSaveStatus({
+          type: res.localOnly ? 'warning' : 'success',
+          message: res.message,
+        });
+        setTimeout(() => setIsSaved(false), 3500);
+      } else {
+        setIsSaved(false);
+        setSaveStatus({
+          type: 'error',
+          message: res.message || res.error || 'Falha ao salvar configurações no Cloud Firestore.',
+        });
+      }
+    } catch (err: unknown) {
+      setIsSaved(false);
+      setSaveStatus({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Erro inesperado ao salvar configurações.',
+      });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleCopyTestPix = () => {
@@ -342,7 +546,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-6 max-w-5xl mx-auto">
+    <form onSubmit={handleSubmit} noValidate className="space-y-6 max-w-5xl mx-auto">
       {/* Top Header */}
       <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3.5">
@@ -359,12 +563,79 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
 
         <button
           type="submit"
-          className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-2 transition shadow-xs cursor-pointer"
+          disabled={isSaving || isLoadingCloudConfig || Boolean(cloudLoadError)}
+          className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-2 transition shadow-xs cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
         >
-          {isSaved ? <CheckCircle2 className="w-4 h-4 text-slate-950" /> : <Save className="w-4 h-4" />}
-          <span>{isSaved ? 'Configurações Salvas!' : 'Salvar Alterações'}</span>
+          {isSaving || isLoadingCloudConfig ? (
+            <RefreshCw className="w-4 h-4 animate-spin" />
+          ) : isSaved ? (
+            <CheckCircle2 className="w-4 h-4 text-slate-950" />
+          ) : (
+            <Save className="w-4 h-4" />
+          )}
+          <span>
+            {isLoadingCloudConfig
+              ? 'Carregando Nuvem...'
+              : isSaving
+              ? 'Salvando na Nuvem...'
+              : isSaved
+              ? 'Configurações Salvas!'
+              : 'Salvar Alterações'}
+          </span>
         </button>
       </div>
+
+      {isLoadingCloudConfig && (
+        <div className="p-3.5 rounded-xl border bg-slate-50 border-slate-200 text-slate-700 text-xs flex items-center gap-2.5">
+          <RefreshCw className="w-4 h-4 text-amber-600 animate-spin shrink-0" />
+          <span className="font-semibold">
+            Sincronizando configurações, horários de funcionamento e mensagens salvas no Cloud Firestore...
+          </span>
+        </div>
+      )}
+
+      {!isLoadingCloudConfig && cloudLoadError && (
+        <div className="p-4 rounded-xl border bg-rose-50 border-rose-200 text-rose-900 text-xs flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 flex-1 min-w-[240px]">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <p className="font-bold">Falha ao carregar configurações persistidas na nuvem</p>
+              <p className="text-[11px] opacity-90">
+                {cloudLoadError} — O salvamento foi bloqueado para impedir que os valores padrão substituam os dados reais já cadastrados.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={loadCloudSettings}
+            className="px-3.5 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 transition cursor-pointer shrink-0"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Tentar carregar novamente</span>
+          </button>
+        </div>
+      )}
+
+      {saveStatus && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs flex items-start gap-2.5 ${
+            saveStatus.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              : saveStatus.type === 'warning'
+              ? 'bg-amber-50 border-amber-200 text-amber-900'
+              : 'bg-rose-50 border-rose-200 text-rose-900'
+          }`}
+        >
+          {saveStatus.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+          ) : saveStatus.type === 'warning' ? (
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          ) : (
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+          )}
+          <span className="font-semibold flex-1 leading-relaxed">{saveStatus.message}</span>
+        </div>
+      )}
 
       {/* FIREBASE CLOUD INTEGRATION CARD */}
       <div className="bg-gradient-to-r from-[#1F100B] via-[#331C13] to-[#4A2E1F] text-white rounded-2xl p-5 border border-[#6B4B3E]/40 shadow-xs flex flex-wrap items-center justify-between gap-4">
@@ -419,8 +690,13 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 </label>
                 <select
                   value={config.pixKeyType || 'EMAIL'}
-                  onChange={(e) => setConfig({ ...config, pixKeyType: e.target.value as any })}
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  disabled={isLoadingCloudConfig}
+                  onChange={(e) => {
+                    const nextType = e.target.value as RestaurantConfig['pixKeyType'];
+                    setPixValidationError(null);
+                    updateConfigField({ pixKeyType: nextType });
+                  }}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   <option value="CPF">CPF (11 dígitos)</option>
                   <option value="CNPJ">CNPJ (14 dígitos)</option>
@@ -428,6 +704,9 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   <option value="EMAIL">E-mail</option>
                   <option value="ALEATORIA">Chave Aleatória (EVP)</option>
                 </select>
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  {getPixKeyHint(config.pixKeyType || 'EMAIL')}
+                </span>
               </div>
 
               {/* Chave PIX */}
@@ -437,9 +716,9 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 </label>
                 <input
                   type="text"
-                  required
-                  value={config.pixKey}
-                  onChange={(e) => setConfig({ ...config, pixKey: e.target.value })}
+                  disabled={isLoadingCloudConfig}
+                  value={config.pixKey ?? ''}
+                  onChange={(e) => updateConfigField({ pixKey: e.target.value })}
                   placeholder={
                     config.pixKeyType === 'TELEFONE'
                       ? 'Ex: (83) 99123-4567'
@@ -451,11 +730,19 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                       ? 'Ex: 123e4567-e89b-12d3-a456-426614174000'
                       : 'Ex: contato@amanditasabores.com.br'
                   }
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  className={`w-full px-3.5 py-2.5 bg-slate-50 border rounded-xl text-xs font-mono font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 disabled:opacity-60 disabled:cursor-not-allowed ${
+                    pixValidationError ? 'border-rose-400 focus:ring-rose-500' : 'border-slate-200 focus:ring-amber-500'
+                  }`}
                 />
-                <span className="text-[10px] text-slate-400 mt-1 block">
-                  Formatada para BACEN: <strong className="font-mono text-emerald-700">{sanitizePixKey(config.pixKey, config.pixKeyType) || '—'}</strong>
-                </span>
+                {pixValidationError ? (
+                  <span className="text-[10px] text-rose-600 font-semibold mt-1 block">
+                    {pixValidationError}
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-slate-400 mt-1 block">
+                    Formatada para BACEN: <strong className="font-mono text-emerald-700">{sanitizePixKey(config.pixKey || '', config.pixKeyType) || '—'}</strong>
+                  </span>
+                )}
               </div>
 
               {/* Nome do Beneficiário */}
@@ -465,13 +752,14 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 </label>
                 <input
                   type="text"
-                  value={config.pixReceiverName || ''}
-                  onChange={(e) => setConfig({ ...config, pixReceiverName: e.target.value })}
+                  disabled={isLoadingCloudConfig}
+                  value={config.pixReceiverName ?? ''}
+                  onChange={(e) => updateConfigField({ pixReceiverName: e.target.value })}
                   placeholder="Ex: AMANDITA SABORES"
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 uppercase"
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 uppercase disabled:opacity-60 disabled:cursor-not-allowed"
                 />
                 <span className="text-[10px] text-slate-400 mt-1 block">
-                  BACEN (máx 25 chars): <strong className="text-slate-700">{sanitizeMerchantName(config.pixReceiverName || config.name)}</strong> ({sanitizeMerchantName(config.pixReceiverName || config.name).length}/25)
+                  BACEN (máx 25 chars): <strong className="text-slate-700">{cleanMerchantText(config.pixReceiverName, 25) || '—'}</strong> ({cleanMerchantText(config.pixReceiverName, 25).length}/25)
                 </span>
               </div>
 
@@ -482,13 +770,14 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 </label>
                 <input
                   type="text"
-                  value={config.pixReceiverCity || 'CAMPINA GRANDE'}
-                  onChange={(e) => setConfig({ ...config, pixReceiverCity: e.target.value })}
+                  disabled={isLoadingCloudConfig}
+                  value={config.pixReceiverCity ?? ''}
+                  onChange={(e) => updateConfigField({ pixReceiverCity: e.target.value })}
                   placeholder="Ex: CAMPINA GRANDE"
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 uppercase"
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 uppercase disabled:opacity-60 disabled:cursor-not-allowed"
                 />
                 <span className="text-[10px] text-slate-400 mt-1 block">
-                  BACEN (máx 15 chars): <strong className="text-slate-700">{sanitizeMerchantCity(config.pixReceiverCity || 'CAMPINA GRANDE')}</strong> ({sanitizeMerchantCity(config.pixReceiverCity || 'CAMPINA GRANDE').length}/15)
+                  BACEN (máx 15 chars): <strong className="text-slate-700">{cleanMerchantText(config.pixReceiverCity, 15) || '—'}</strong> ({cleanMerchantText(config.pixReceiverCity, 15).length}/15)
                 </span>
               </div>
             </div>
@@ -496,7 +785,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
             <div className="p-3 bg-emerald-50/80 border border-emerald-200/80 rounded-xl text-xs text-emerald-950 flex items-start gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <span>
-                <strong>Padrão Oficial BACEN BR Code (Estático com valor):</strong> O QR Code gerado segue rigorosamente o padrão do Banco Central (Ponto de Iniciação <code className="bg-emerald-100 text-emerald-900 px-1 py-0.5 rounded text-[11px] font-mono">01: 11</code>), permitindo leitura imediata e sem erros em qualquer aplicativo de banco (Nubank, Itaú, Banco do Brasil, Bradesco, Inter, Santander, Caixa e Mercado Pago).
+                <strong>Padrão Oficial BACEN BR Code (valor individualizado por compra):</strong> O QR Code e o Copia e Cola seguem rigorosamente o padrão do Banco Central (Ponto de Iniciação <code className="bg-emerald-100 text-emerald-900 px-1 py-0.5 rounded text-[11px] font-mono">01: 11</code> com valor exato e TXID do pedido). Como não há integração bancária automática via API, a conferência do recebimento deve ser feita manualmente no aplicativo do banco.
               </span>
             </div>
           </div>
@@ -515,30 +804,45 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">Nome do Restaurante</label>
                 <input
                   type="text"
-                  value={config.name}
-                  onChange={(e) => setConfig({ ...config, name: e.target.value })}
-                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800"
+                  disabled={isLoadingCloudConfig}
+                  value={config.name ?? ''}
+                  onChange={(e) => updateConfigField({ name: e.target.value })}
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1.5">WhatsApp para Receber Pedidos</label>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">WhatsApp para Receber Pedidos *</label>
                 <input
                   type="text"
-                  value={config.whatsapp}
-                  onChange={(e) => setConfig({ ...config, whatsapp: e.target.value.replace(/[^0-9]/g, '') })}
-                  placeholder="5511987654321 (com DDI e DDD)"
-                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-800"
+                  disabled={isLoadingCloudConfig}
+                  value={config.whatsapp ?? ''}
+                  onChange={(e) => updateConfigField({ whatsapp: e.target.value.replace(/[^0-9]/g, '') })}
+                  placeholder="5583991234567 (com DDI e DDD)"
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
+                {(() => {
+                  const waCheck = validateWhatsAppNumber(config.whatsapp);
+                  return waCheck.valid ? (
+                    <span className="text-[10px] text-emerald-700 font-semibold mt-1 block">
+                      Exibição ao cliente: {formatWhatsAppDisplay(waCheck.normalized)}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-rose-600 font-semibold mt-1 block">
+                      {waCheck.error}
+                    </span>
+                  );
+                })()}
               </div>
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">Endereço da Loja (Retirada no Balcão)</label>
                 <input
                   type="text"
-                  value={config.address}
-                  onChange={(e) => setConfig({ ...config, address: e.target.value })}
-                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800"
+                  disabled={isLoadingCloudConfig}
+                  value={config.address ?? ''}
+                  onChange={(e) => updateConfigField({ address: e.target.value })}
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
 
@@ -546,9 +850,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">Cidade e UF</label>
                 <input
                   type="text"
-                  value={config.city}
-                  onChange={(e) => setConfig({ ...config, city: e.target.value })}
-                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800"
+                  disabled={isLoadingCloudConfig}
+                  value={config.city ?? ''}
+                  onChange={(e) => updateConfigField({ city: e.target.value })}
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
             </div>
@@ -563,9 +868,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                     type="number"
                     step="0.50"
                     min="0"
+                    disabled={isLoadingCloudConfig}
                     value={config.deliveryFeeBase}
-                    onChange={(e) => setConfig({ ...config, deliveryFeeBase: parseFloat(e.target.value) || 0 })}
-                    className="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-800"
+                    onChange={(e) => updateConfigField({ deliveryFeeBase: parseFloat(e.target.value) || 0 })}
+                    className="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                   />
                 </div>
                 <span className="text-[10px] text-slate-400 mt-1 block">Cobrado apenas no Delivery</span>
@@ -576,9 +882,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 <input
                   type="number"
                   min="5"
+                  disabled={isLoadingCloudConfig}
                   value={config.avgPrepTimeMinutes}
-                  onChange={(e) => setConfig({ ...config, avgPrepTimeMinutes: parseInt(e.target.value, 10) || 20 })}
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-800"
+                  onChange={(e) => updateConfigField({ avgPrepTimeMinutes: parseInt(e.target.value, 10) || 20 })}
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
 
@@ -587,9 +894,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 <input
                   type="number"
                   min="5"
+                  disabled={isLoadingCloudConfig}
                   value={config.avgDeliveryTimeMinutes}
-                  onChange={(e) => setConfig({ ...config, avgDeliveryTimeMinutes: parseInt(e.target.value, 10) || 20 })}
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-800"
+                  onChange={(e) => updateConfigField({ avgDeliveryTimeMinutes: parseInt(e.target.value, 10) || 20 })}
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
             </div>
@@ -599,10 +907,11 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
               <label className="block text-xs font-bold text-slate-700 mb-1.5">Texto do rodapé do cupom</label>
               <input
                 type="text"
+                disabled={isLoadingCloudConfig}
                 placeholder="Ex: Instagram: @amanditasabores ou @nomedoperfil"
-                value={config.receiptFooterText || ''}
-                onChange={(e) => setConfig({ ...config, receiptFooterText: e.target.value })}
-                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium text-slate-800"
+                value={config.receiptFooterText ?? ''}
+                onChange={(e) => updateConfigField({ receiptFooterText: e.target.value })}
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
               />
               <span className="text-[10px] text-slate-400 mt-1 block">
                 Texto exibido no final de cada comprovante impresso (térmico e visual). Se deixado em branco, a linha do rodapé não será impressa.
@@ -616,9 +925,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 <span>Entregador responsável pelas entregas (Automático)</span>
               </label>
               <select
+                disabled={isLoadingCloudConfig}
                 value={config.defaultDeliveryPersonId || ''}
-                onChange={(e) => setConfig({ ...config, defaultDeliveryPersonId: e.target.value })}
-                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                onChange={(e) => updateConfigField({ defaultDeliveryPersonId: e.target.value })}
+                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <option value="">Nenhum (Novos pedidos ficam "Aguardando Atribuição")</option>
                 {users
@@ -632,6 +942,137 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
               <p className="text-[11px] text-slate-500 leading-relaxed">
                 Todas as novas entregas serão atribuídas automaticamente a este entregador. Apenas entregadores <strong>ATIVOS</strong> são listados. O administrador <strong>nunca</strong> é vinculado como entregador. Se desativado ou nenhum for selecionado, o pedido aguarda atribuição manual no Kanban.
               </p>
+            </div>
+          </div>
+
+          {/* SECTION 2B: HORÁRIOS DE FUNCIONAMENTO & PÁGINA DE ESTABELECIMENTO FECHADO */}
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-5">
+            <div className="flex items-center gap-2.5 pb-3 border-b border-slate-100">
+              <div className="w-8 h-8 rounded-xl bg-amber-500/10 text-amber-700 flex items-center justify-center font-bold">
+                <Calendar className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Horários de Funcionamento &amp; Página de Estabelecimento Fechado</h3>
+                <p className="text-[11px] text-slate-500">
+                  Exibidos automaticamente no cardápio público quando o caixa estiver fechado.
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3 bg-blue-50/80 border border-blue-200/80 rounded-xl text-xs text-blue-950 flex items-start gap-2">
+              <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+              <span className="leading-relaxed">
+                <strong>Controle exclusivo pelo Caixa:</strong> O cardápio público abre e fecha automaticamente conforme o estado real do caixa (<strong>Caixa ABERTO / FECHADO</strong>). Os horários abaixo são informativos para orientar os clientes e <strong>nunca</strong> abrem ou fecham o caixa automaticamente.
+              </span>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5 flex items-center gap-1.5">
+                  <MessageSquare className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Mensagem Principal (Título quando fechado) *</span>
+                </label>
+                <input
+                  type="text"
+                  maxLength={200}
+                  disabled={isLoadingCloudConfig}
+                  value={config.closedPrimaryMessage ?? DEFAULT_CLOSED_PRIMARY_MESSAGE}
+                  onChange={(e) => updateConfigField({ closedPrimaryMessage: e.target.value })}
+                  placeholder={DEFAULT_CLOSED_PRIMARY_MESSAGE}
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  Mensagem Complementar de Atendimento
+                </label>
+                <textarea
+                  rows={2}
+                  maxLength={500}
+                  disabled={isLoadingCloudConfig}
+                  value={config.closedSecondaryMessage ?? DEFAULT_CLOSED_SECONDARY_MESSAGE}
+                  onChange={(e) => updateConfigField({ closedSecondaryMessage: e.target.value })}
+                  placeholder={DEFAULT_CLOSED_SECONDARY_MESSAGE}
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 resize-none disabled:opacity-60 disabled:cursor-not-allowed"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2.5 pt-2 border-t border-slate-100">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-amber-600" />
+                  Dias e Horários da Semana (Informativo)
+                </span>
+                <span className="text-[10px] text-slate-500">
+                  WhatsApp vinculado: <strong className="font-mono text-slate-700">{formatWhatsAppDisplay(config.whatsapp) || 'Não informado'}</strong>
+                </span>
+              </div>
+
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden bg-slate-50/50">
+                {normalizeOperatingHours(config.operatingHours || DEFAULT_OPERATING_HOURS).map((day) => {
+                  const updateDay = (patch: Partial<typeof day>) => {
+                    const currentHours = normalizeOperatingHours(config.operatingHours || DEFAULT_OPERATING_HOURS);
+                    const nextHours = currentHours.map((d) =>
+                      d.dayKey === day.dayKey ? { ...d, ...patch } : d
+                    );
+                    updateConfigField({ operatingHours: nextHours });
+                  };
+
+                  return (
+                    <div
+                      key={day.dayKey}
+                      className="px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3 bg-white hover:bg-slate-50/70 transition"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-[140px]">
+                        <input
+                          type="checkbox"
+                          id={`day-open-${day.dayKey}`}
+                          disabled={isLoadingCloudConfig}
+                          checked={day.isOpen}
+                          onChange={(e) => updateDay({ isOpen: e.target.checked })}
+                          className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                        />
+                        <label
+                          htmlFor={`day-open-${day.dayKey}`}
+                          className={`text-xs font-bold cursor-pointer select-none ${
+                            day.isOpen ? 'text-slate-800' : 'text-slate-400 line-through'
+                          }`}
+                        >
+                          {day.label}
+                        </label>
+                      </div>
+
+                      {day.isOpen ? (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="time"
+                            aria-label={`Abertura ${day.label}`}
+                            disabled={isLoadingCloudConfig}
+                            value={day.openTime}
+                            onChange={(e) => updateDay({ openTime: e.target.value })}
+                            className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                          />
+                          <span className="text-[11px] text-slate-400 font-semibold">às</span>
+                          <input
+                            type="time"
+                            aria-label={`Fechamento ${day.label}`}
+                            disabled={isLoadingCloudConfig}
+                            value={day.closeTime}
+                            onChange={(e) => updateDay({ closeTime: e.target.value })}
+                            className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                          />
+                        </div>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-slate-100 text-slate-500 border border-slate-200">
+                          Fechado
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
         </div>
@@ -833,9 +1274,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
             <label className="flex items-start gap-2.5 p-3 bg-white rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition">
               <input
                 type="checkbox"
+                disabled={isLoadingCloudConfig}
                 checked={config.notifyNewOrders !== false}
-                onChange={(e) => setConfig({ ...config, notifyNewOrders: e.target.checked })}
-                className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                onChange={(e) => updateConfigField({ notifyNewOrders: e.target.checked })}
+                className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500 disabled:opacity-60 disabled:cursor-not-allowed"
               />
               <div>
                 <span className="text-xs font-bold text-slate-800 block">
@@ -850,9 +1292,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
             <label className="flex items-start gap-2.5 p-3 bg-white rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition">
               <input
                 type="checkbox"
+                disabled={isLoadingCloudConfig}
                 checked={config.notifyDeliveryConfirmed !== false}
-                onChange={(e) => setConfig({ ...config, notifyDeliveryConfirmed: e.target.checked })}
-                className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
+                onChange={(e) => updateConfigField({ notifyDeliveryConfirmed: e.target.checked })}
+                className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500 disabled:opacity-60 disabled:cursor-not-allowed"
               />
               <div>
                 <span className="text-xs font-bold text-slate-800 block">

@@ -9,7 +9,9 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    const result = await sendTestPushNotification();
+    const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
+    const staffToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : undefined;
+    const result = await sendTestPushNotification(staffToken);
     return sendJson(res, 200, {
       success: true,
       message: result.sent > 0

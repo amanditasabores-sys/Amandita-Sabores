@@ -24,6 +24,9 @@ interface FinancialReportsProps {
 export const FinancialReports: React.FC<FinancialReportsProps> = ({ orders }) => {
   const [period, setPeriod] = useState<'today' | 'yesterday' | '7days' | '30days' | 'all'>('7days');
   const [orderToDelete, setOrderToDelete] = useState<Order | null>(null);
+  const [isDeletingOrder, setIsDeletingOrder] = useState(false);
+  const [deleteErrorMessage, setDeleteErrorMessage] = useState<string | null>(null);
+  const canDeleteOrder = store.canUserDeleteOrder();
   const menuItems = store.getMenuItems();
 
   // Create menu map for cost calculation
@@ -391,14 +394,23 @@ export const FinancialReports: React.FC<FinancialReportsProps> = ({ orders }) =>
                       {formatCurrency(ord.totalAmount)}
                     </td>
                     <td className="py-3 px-2 text-center whitespace-nowrap">
-                      <button
-                        onClick={() => setOrderToDelete(ord)}
-                        className="px-2.5 py-1 text-rose-600 hover:text-rose-800 hover:bg-rose-50 rounded-lg text-xs font-semibold transition inline-flex items-center gap-1 cursor-pointer"
-                        title="Excluir este lançamento de venda"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Excluir</span>
-                      </button>
+                      {canDeleteOrder ? (
+                        <button
+                          onClick={() => {
+                            setDeleteErrorMessage(null);
+                            setOrderToDelete(ord);
+                          }}
+                          className="px-2.5 py-1 text-rose-600 hover:text-rose-800 hover:bg-rose-50 rounded-lg text-xs font-semibold transition inline-flex items-center gap-1 cursor-pointer"
+                          title="Excluir este lançamento de venda"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Excluir</span>
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-slate-400" title="Apenas Administrador ou Gerente podem excluir pedidos">
+                          Restrito
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -417,11 +429,29 @@ export const FinancialReports: React.FC<FinancialReportsProps> = ({ orders }) =>
           confirmLabel="Excluir Lançamento"
           cancelLabel="Cancelar"
           isDanger={true}
-          onConfirm={() => {
-            store.deleteOrder(orderToDelete.id);
-            setOrderToDelete(null);
+          isLoading={isDeletingOrder}
+          errorMessage={deleteErrorMessage}
+          onConfirm={async () => {
+            if (!orderToDelete || isDeletingOrder) return;
+            setIsDeletingOrder(true);
+            setDeleteErrorMessage(null);
+            try {
+              const res = await store.deleteOrderAsync(orderToDelete.id);
+              if (res.success) {
+                setOrderToDelete(null);
+              } else {
+                setDeleteErrorMessage(res.error || 'Não foi possível excluir o lançamento no servidor.');
+              }
+            } finally {
+              setIsDeletingOrder(false);
+            }
           }}
-          onCancel={() => setOrderToDelete(null)}
+          onCancel={() => {
+            if (!isDeletingOrder) {
+              setOrderToDelete(null);
+              setDeleteErrorMessage(null);
+            }
+          }}
         />
       )}
     </div>

@@ -3,7 +3,7 @@ import { store } from '../../services/store';
 import { thermalPrinterService } from '../../services/thermalPrinter';
 import { Order } from '../../types';
 import { formatTime } from '../../utils/formatters';
-import { ChefHat, Clock, Check, AlertTriangle, PackageCheck, Flame, Printer } from 'lucide-react';
+import { ChefHat, Clock, Check, AlertTriangle, AlertCircle, PackageCheck, Flame, Printer } from 'lucide-react';
 
 interface KitchenDisplaySystemProps {
   orders: Order[];
@@ -13,6 +13,8 @@ interface KitchenDisplaySystemProps {
 export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orders, onOrderUpdated }) => {
   const [checkedItems, setCheckedItems] = useState<Record<string, boolean>>({});
   const [, setTicker] = useState(0);
+  const [syncNotice, setSyncNotice] = useState<{ type: 'error' | 'warning'; message: string } | null>(null);
+  const [updatingOrderIds, setUpdatingOrderIds] = useState<Record<string, boolean>>({});
 
   // Update elapsed minutes every 30 seconds
   useEffect(() => {
@@ -31,17 +33,92 @@ export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orde
   };
 
   const handleStartPrep = async (order: Order) => {
-    await store.updateOrderStatusAsync(order.id, 'EM_PREPARO', 'Cozinha / KDS', 'Iniciado preparo na cozinha');
-    onOrderUpdated();
+    if (updatingOrderIds[order.id]) return;
+    setUpdatingOrderIds((prev) => ({ ...prev, [order.id]: true }));
+    setSyncNotice(null);
+    try {
+      const res = await store.updateOrderStatusAsync(order.id, 'EM_PREPARO', 'Cozinha / KDS', 'Iniciado preparo na cozinha');
+      if (!res.synced) {
+        if (res.rejected) {
+          setSyncNotice({
+            type: 'error',
+            message: `Pedido ${order.orderNumber} não pôde ser iniciado: ${res.error || 'Alteração recusada pelo servidor.'}`,
+          });
+        } else if (res.error || res.offlineQueued) {
+          setSyncNotice({
+            type: 'warning',
+            message: `Pedido ${order.orderNumber} salvo localmente e pendente de envio ao servidor: ${res.error || 'Sem conexão com a internet.'}`,
+          });
+        }
+        setTimeout(() => setSyncNotice(null), 7000);
+      }
+      onOrderUpdated();
+    } finally {
+      setUpdatingOrderIds((prev) => {
+        const next = { ...prev };
+        delete next[order.id];
+        return next;
+      });
+    }
   };
 
   const handleFinishPrep = async (order: Order) => {
-    await store.updateOrderStatusAsync(order.id, 'PRONTO', 'Cozinha / KDS', 'Finalizado preparo dos pratos, pronto para embalar e entregar');
-    onOrderUpdated();
+    if (updatingOrderIds[order.id]) return;
+    setUpdatingOrderIds((prev) => ({ ...prev, [order.id]: true }));
+    setSyncNotice(null);
+    try {
+      const res = await store.updateOrderStatusAsync(order.id, 'PRONTO', 'Cozinha / KDS', 'Finalizado preparo dos pratos, pronto para embalar e entregar');
+      if (!res.synced) {
+        if (res.rejected) {
+          setSyncNotice({
+            type: 'error',
+            message: `Pedido ${order.orderNumber} não pôde ser concluído: ${res.error || 'Alteração recusada pelo servidor.'}`,
+          });
+        } else if (res.error || res.offlineQueued) {
+          setSyncNotice({
+            type: 'warning',
+            message: `Pedido ${order.orderNumber} salvo localmente e pendente de envio ao servidor: ${res.error || 'Sem conexão com a internet.'}`,
+          });
+        }
+        setTimeout(() => setSyncNotice(null), 7000);
+      }
+      onOrderUpdated();
+    } finally {
+      setUpdatingOrderIds((prev) => {
+        const next = { ...prev };
+        delete next[order.id];
+        return next;
+      });
+    }
   };
 
   return (
     <div className="space-y-4">
+      {syncNotice && (
+        <div
+          className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 ${
+            syncNotice.type === 'error'
+              ? 'bg-rose-50 text-rose-900 border border-rose-300'
+              : 'bg-amber-50 text-amber-900 border border-amber-300'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {syncNotice.type === 'error' ? (
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            )}
+            <span className="font-semibold">{syncNotice.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSyncNotice(null)}
+            className={`${syncNotice.type === 'error' ? 'text-rose-700 hover:text-rose-900' : 'text-amber-700 hover:text-amber-900'} font-bold px-1 cursor-pointer`}
+          >
+            ✕
+          </button>
+        </div>
+      )}
       {/* KDS Header summary */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 text-white p-3.5 sm:p-4 rounded-2xl shadow-sm">
         <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -205,19 +282,21 @@ export const KitchenDisplaySystem: React.FC<KitchenDisplaySystemProps> = ({ orde
                 <div className="p-3 bg-slate-50 border-t border-slate-100">
                   {order.status === 'NOVO' ? (
                     <button
+                      disabled={Boolean(updatingOrderIds[order.id])}
                       onClick={() => handleStartPrep(order)}
-                      className="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
+                      className="w-full py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-60 disabled:cursor-wait text-slate-950 font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
                     >
                       <ChefHat className="w-4 h-4" />
-                      <span>Iniciar Preparo na Cozinha</span>
+                      <span>{updatingOrderIds[order.id] ? 'Iniciando...' : 'Iniciar Preparo na Cozinha'}</span>
                     </button>
                   ) : (
                     <button
+                      disabled={Boolean(updatingOrderIds[order.id])}
                       onClick={() => handleFinishPrep(order)}
-                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
+                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-wait text-white font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"
                     >
                       <PackageCheck className="w-4 h-4" />
-                      <span>Concluir Prato / Pronto p/ Balcão</span>
+                      <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Concluir Prato / Pronto p/ Balcão'}</span>
                     </button>
                   )}
                 </div>

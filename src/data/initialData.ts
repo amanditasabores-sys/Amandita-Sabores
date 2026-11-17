@@ -1,4 +1,9 @@
 import { MenuItem, RestaurantConfig, User, Order, MenuItemAddon, Combo, DailyMenuConfig } from '../types/index';
+import {
+  DEFAULT_OPERATING_HOURS,
+  DEFAULT_CLOSED_PRIMARY_MESSAGE,
+  DEFAULT_CLOSED_SECONDARY_MESSAGE,
+} from '../utils/storeHours.ts';
 
 // Oficial additions as shown in the cardápio image:
 // "ADICIONAIS - R$ 3,00: Escolha qualquer um dos recheios abaixo:
@@ -425,6 +430,9 @@ export const INITIAL_CONFIG: RestaurantConfig = {
   notifyNewOrders: true,
   notifyDeliveryConfirmed: true,
   defaultDeliveryPersonId: '',
+  operatingHours: DEFAULT_OPERATING_HOURS,
+  closedPrimaryMessage: DEFAULT_CLOSED_PRIMARY_MESSAGE,
+  closedSecondaryMessage: DEFAULT_CLOSED_SECONDARY_MESSAGE,
 };
 
 export const INITIAL_USERS: User[] = [

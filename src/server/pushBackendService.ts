@@ -209,32 +209,10 @@ export async function savePushSubscription(subData: PushSubscriptionData, staffT
     } catch {}
   }
 
-  // Strategy 3: Client SDK
-  if (clientDb) {
-    try {
-      await clientSetDoc(clientDoc(clientDb, 'push_subscriptions', endpointHash), record);
-      return true;
-    } catch {}
-  }
-
-  // Strategy 4: Firestore REST API with API Key
-  if (API_KEY) {
-    try {
-      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
-      const docPayload = jsonToFirestoreDocument(record);
-      const res = await fetch(`${baseUrl}/push_subscriptions/${endpointHash}?key=${API_KEY}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(docPayload),
-      });
-      return res.ok;
-    } catch {}
-  }
-
   return true;
 }
 
-export async function getAllPushSubscriptions(): Promise<PushSubscriptionData[]> {
+export async function getAllPushSubscriptions(staffToken?: string): Promise<PushSubscriptionData[]> {
   const results: PushSubscriptionData[] = [];
   const seenEndpoints = new Set<string>();
 
@@ -261,34 +239,13 @@ export async function getAllPushSubscriptions(): Promise<PushSubscriptionData[]>
     } catch {}
   }
 
-  // Strategy 2: Client SDK
-  if (clientDb) {
+  // Strategy 2: Firestore REST API with authenticated Staff Bearer token
+  if (staffToken && PROJECT_ID) {
     try {
-      const snap = await clientGetDocs(clientCollection(clientDb, 'push_subscriptions'));
-      snap.forEach((docSnap) => {
-        const d = docSnap.data();
-        if (d && d.endpoint && d.keys && !seenEndpoints.has(d.endpoint)) {
-          seenEndpoints.add(d.endpoint);
-          results.push({
-            subscription: {
-              endpoint: d.endpoint,
-              keys: d.keys,
-            } as any,
-            role: d.role,
-            userAgent: d.userAgent,
-            subscribedAt: d.updatedAt || '',
-          });
-        }
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/push_subscriptions`;
+      const res = await fetch(baseUrl, {
+        headers: { Authorization: `Bearer ${staffToken}` },
       });
-      if (results.length > 0) return results;
-    } catch {}
-  }
-
-  // Strategy 3: Firestore REST API
-  if (API_KEY) {
-    try {
-      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/push_subscriptions?key=${API_KEY}`;
-      const res = await fetch(baseUrl);
       if (res.ok) {
         const data = await res.json();
         if (data.documents && Array.isArray(data.documents)) {
@@ -311,11 +268,12 @@ export async function getAllPushSubscriptions(): Promise<PushSubscriptionData[]>
             }
           }
         }
+        if (results.length > 0) return results;
       }
     } catch {}
   }
 
-  // Strategy 4: Local memory cache
+  // Strategy 3: Local memory cache
   for (const [endpoint, sub] of activePushSubscriptions.entries()) {
     if (!seenEndpoints.has(endpoint)) {
       results.push(sub);
@@ -325,7 +283,7 @@ export async function getAllPushSubscriptions(): Promise<PushSubscriptionData[]>
   return results;
 }
 
-export async function deletePushSubscription(endpoint: string): Promise<void> {
+export async function deletePushSubscription(endpoint: string, staffToken?: string): Promise<void> {
   activePushSubscriptions.delete(endpoint);
   const endpointHash = crypto.createHash('sha256').update(endpoint).digest('hex');
   if (adminDb) {
@@ -334,23 +292,20 @@ export async function deletePushSubscription(endpoint: string): Promise<void> {
       return;
     } catch {}
   }
-  if (clientDb) {
+  if (staffToken && PROJECT_ID) {
     try {
-      await clientDeleteDoc(clientDoc(clientDb, 'push_subscriptions', endpointHash));
-      return;
-    } catch {}
-  }
-  if (API_KEY) {
-    try {
-      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/push_subscriptions/${endpointHash}?key=${API_KEY}`;
-      await fetch(baseUrl, { method: 'DELETE' });
+      const baseUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/push_subscriptions/${endpointHash}`;
+      await fetch(baseUrl, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${staffToken}` },
+      });
     } catch {}
   }
 }
 
-export async function sendTestPushNotification(): Promise<{ sent: number; failed: number }> {
+export async function sendTestPushNotification(staffToken?: string): Promise<{ sent: number; failed: number }> {
   getVapidConfig(); // Ensure webpush is configured
-  const subscriptions = await getAllPushSubscriptions();
+  const subscriptions = await getAllPushSubscriptions(staffToken);
   if (subscriptions.length === 0) {
     return { sent: 0, failed: 0 };
   }
@@ -387,7 +342,7 @@ export async function sendTestPushNotification(): Promise<{ sent: number; failed
   }
 
   for (const endpoint of deadEndpoints) {
-    await deletePushSubscription(endpoint);
+    await deletePushSubscription(endpoint, staffToken);
   }
 
   return { sent, failed };
@@ -395,7 +350,8 @@ export async function sendTestPushNotification(): Promise<{ sent: number; failed
 
 export async function sendOrderPushNotification(
   order: any,
-  event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY' = 'NEW_ORDER'
+  event: 'NEW_ORDER' | 'DELIVERY_CONFIRMED' | 'READY_FOR_DELIVERY' = 'NEW_ORDER',
+  staffToken?: string
 ): Promise<{ sent: number; failed: number; total: number; skipped?: string }> {
   if (!order || !order.id) {
     return { sent: 0, failed: 0, total: 0, skipped: 'invalid_order' };
@@ -421,7 +377,7 @@ export async function sendOrderPushNotification(
   getVapidConfig();
 
   // 4. Retrieve subscriptions
-  const allSubscriptions = await getAllPushSubscriptions();
+  const allSubscriptions = await getAllPushSubscriptions(staffToken);
   if (allSubscriptions.length === 0) {
     console.info(`[Web Push] Pedido #${order.orderNumber}: Nenhuma inscrição push registrada para alerta.`);
     return { sent: 0, failed: 0, total: 0, skipped: 'no_subscriptions' };
@@ -464,9 +420,20 @@ export async function sendOrderPushNotification(
     tag = `order-${order.id}`;
     targetUrl = '/?view=producao';
   } else if (event === 'READY_FOR_DELIVERY') {
-    const addressText = order.customer?.address?.street
-      ? `${order.customer.address.street}, ${order.customer.address.number || 'S/N'}${order.customer.address.neighborhood ? ` · ${order.customer.address.neighborhood}` : ''}`
-      : 'Endereço no pedido';
+    const a = order.customer?.address;
+    const addrParts: string[] = [];
+    if (a?.condominium && !/outros|resid[eê]ncia/i.test(a.condominium)) addrParts.push(a.condominium);
+    if (a?.street && !/outros|resid[eê]ncia/i.test(a.street) && a.street !== a?.condominium) {
+      addrParts.push(a.number ? `${a.street}, ${a.number}` : a.street);
+    } else if (a?.number) {
+      addrParts.push(`Nº ${a.number}`);
+    }
+    if (a?.block) addrParts.push(`Bloco ${a.block}`);
+    if (a?.apartment) addrParts.push(`Ap ${a.apartment}`);
+    if (a?.neighborhood && !/outros/i.test(a.neighborhood) && a.neighborhood !== a?.condominium) {
+      addrParts.push(a.neighborhood);
+    }
+    const addressText = addrParts.length > 0 ? addrParts.join(' · ') : 'Endereço no pedido';
     title = `Pedido #${order.orderNumber} pronto para entrega!`;
     body = `${order.customer?.name || 'Cliente'} · ${addressText} · Pronto para retirada.`;
     tag = `ready-${order.id}`;

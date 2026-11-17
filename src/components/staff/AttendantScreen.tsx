@@ -90,6 +90,11 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
                 <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-[#C86D3B]/25 text-[#E89255] border border-[#C86D3B]/40 uppercase tracking-wider">
                   ATENDENTE
                 </span>
+                {store.getAuthSessionMode() === 'local_contingency' && (
+                  <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/40 uppercase tracking-wider" title="Firebase não configurado neste dispositivo">
+                    CONTINGÊNCIA LOCAL
+                  </span>
+                )}
               </div>
               <p className="text-xs text-[#D9C7B8] flex items-center gap-2">
                 <span className="font-mono text-amber-300 font-bold flex items-center gap-1">
@@ -211,6 +216,7 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
           <LiveOrdersKanban
             orders={orders}
             onOrderUpdated={refreshOrders}
+            currentUser={currentUser}
           />
         )}
       </main>

@@ -117,6 +117,19 @@
       },
       "required": ["id", "username", "timestamp", "action"]
     },
+    "StoreSchedule": {
+      "title": "StoreSchedule",
+      "description": "Horários informativos de funcionamento e mensagens da página automática de estabelecimento fechado",
+      "type": "object",
+      "properties": {
+        "operatingHours": { "type": "array" },
+        "closedPrimaryMessage": { "type": "string", "maxLength": 200 },
+        "closedSecondaryMessage": { "type": "string", "maxLength": 500 },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["operatingHours", "closedPrimaryMessage", "closedSecondaryMessage", "updatedAt", "updatedBy"]
+    },
     "DeliveryShift": {
       "title": "DeliveryShift",
       "description": "Turno e movimento diário de supervisão de entregas e estatísticas de entregadores",
@@ -146,7 +159,7 @@
     },
     "/configs/{configId}": {
       "schema": "RestaurantConfig",
-      "description": "Configurações institucionais, chave PIX e parâmetros de entrega"
+      "description": "Configurações institucionais, chave PIX, horários de funcionamento e parâmetros de entrega"
     },
     "/cash_shifts/{shiftId}": {
       "schema": "CashShift",

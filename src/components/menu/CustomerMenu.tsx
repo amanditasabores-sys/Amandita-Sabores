@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { store } from '../../services/store';
-import { MenuItem, MenuItemAddon, OrderItem, PaymentMethod, FulfillmentType, Order, Combo, DailyMenuConfig } from '../../types';
-import { formatCurrency, generateWhatsAppOrderMessage } from '../../utils/formatters';
+import { MenuItem, MenuItemAddon, OrderItem, PaymentMethod, FulfillmentType, Order, Combo, DailyMenuConfig, PublicStoreAvailability } from '../../types';
+import { formatCurrency, generateWhatsAppOrderMessage, formatCustomerAddress } from '../../utils/formatters';
 import { getPublicAppUrl } from '../../utils/url';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
+import { generatePurchasePixPayload } from '../../utils/pix';
 import { 
   Search, 
   ShoppingBag, 
@@ -37,6 +38,7 @@ import {
   CheckSquare
 } from 'lucide-react';
 import { AmanditaLogo } from '../common/AmanditaLogo';
+import { StoreClosedView } from './StoreClosedView';
 
 interface CustomerMenuProps {
   onNavigateToTracking?: (orderId: string, trackingCode?: string) => void;
@@ -50,18 +52,76 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [combos, setCombos] = useState<Combo[]>(() => store.getCombos());
   const [dailyConfig, setDailyConfig] = useState<DailyMenuConfig>(() => store.getDailyMenuConfig());
   const [isInitialLoadingDailyMenu, setIsInitialLoadingDailyMenu] = useState<boolean>(() => !store.getDailyMenuConfig().enabled);
+  const [availability, setAvailability] = useState<PublicStoreAvailability | null>(null);
+  const [isCheckingAvailability, setIsCheckingAvailability] = useState<boolean>(true);
+  const [closedCheckoutNotice, setClosedCheckoutNotice] = useState<string | null>(null);
+  const lastAvailabilityCheckRef = useRef<number>(0);
 
-  // Cross-device Daily Menu initial fetch
+  // Authoritative server check: public menu is open ONLY when server verifies an active open cash shift
+  const isStoreOpenAuthoritative = Boolean(availability && availability.verified && availability.isOpen);
+
+  // Cross-device Daily Menu & Cash Register Availability live synchronization
   useEffect(() => {
     let isMounted = true;
+
+    const refreshAvailability = async (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastAvailabilityCheckRef.current < 400) {
+        return;
+      }
+      lastAvailabilityCheckRef.current = now;
+
+      try {
+        const res = await store.fetchPublicStoreAvailability();
+        if (!isMounted) return;
+        setAvailability(res);
+        setConfig(store.getRestaurantConfig());
+        setIsCheckingAvailability(false);
+        if (!res.verified || !res.isOpen) {
+          setSelectedItemForModal(null);
+          setIsCartOpen(false);
+        } else {
+          setClosedCheckoutNotice(null);
+        }
+      } catch {
+        if (isMounted) {
+          setIsCheckingAvailability(false);
+        }
+      }
+    };
+
+    refreshAvailability(true);
     store.syncDailyMenuWithServer(true).finally(() => {
       if (isMounted) {
         setDailyConfig(store.getDailyMenuConfig());
         setIsInitialLoadingDailyMenu(false);
       }
     });
+
+    const intervalId = setInterval(() => {
+      refreshAvailability(false);
+    }, 10000);
+
+    const handleVisibilityOrFocus = () => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        refreshAvailability(false);
+      }
+    };
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    window.addEventListener('online', handleVisibilityOrFocus);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    }
+
     return () => {
       isMounted = false;
+      clearInterval(intervalId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      window.removeEventListener('online', handleVisibilityOrFocus);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      }
     };
   }, []);
 
@@ -73,13 +133,45 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [pixQrDataUrl, setPixQrDataUrl] = useState<string>('');
   const [copiedPixCode, setCopiedPixCode] = useState(false);
 
-  // Sync state
+  // Sync state & immediate remote open/close transition
   useEffect(() => {
-    const handleUpdate = () => {
+    const handleUpdate = (event: Event) => {
+      const detail = (event as CustomEvent)?.detail;
+      const eventType = detail?.type;
+
       setMenuItems(store.getMenuItems());
       setCombos(store.getCombos());
       setDailyConfig(store.getDailyMenuConfig());
       setConfig(store.getRestaurantConfig());
+
+      if (eventType === 'STORE_AVAILABILITY_UPDATED' && detail?.payload) {
+        const nextAvail = detail.payload as PublicStoreAvailability;
+        setAvailability(nextAvail);
+        setIsCheckingAvailability(false);
+        if (!nextAvail.verified || !nextAvail.isOpen) {
+          setSelectedItemForModal(null);
+          setIsCartOpen(false);
+        } else {
+          setClosedCheckoutNotice(null);
+        }
+      } else if (eventType === 'CONFIG_UPDATED' || eventType === 'CASH_SHIFT_UPDATED') {
+        const now = Date.now();
+        if (now - lastAvailabilityCheckRef.current >= 400) {
+          lastAvailabilityCheckRef.current = now;
+          store.fetchPublicStoreAvailability().then((res) => {
+            setAvailability(res);
+            setConfig(store.getRestaurantConfig());
+            setIsCheckingAvailability(false);
+            if (!res.verified || !res.isOpen) {
+              setSelectedItemForModal(null);
+              setIsCartOpen(false);
+            } else {
+              setClosedCheckoutNotice(null);
+            }
+          }).catch(() => {});
+        }
+      }
+
       if (createdOrderId) {
         const fresh = store.getOrderById(createdOrderId);
         if (fresh) setCreatedOrder(fresh);
@@ -135,6 +227,14 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   // Fulfillment Type: Entrega vs Retirada no Balcão
   const [fulfillmentType, setFulfillmentType] = useState<FulfillmentType>('DELIVERY');
   const [formError, setFormError] = useState<string | null>(null);
+  const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
+  const submittingOrderRef = useRef(false);
+  const draftOrderIdentityRef = useRef<{
+    signature: string;
+    id: string;
+    orderNumber: string;
+    trackingCode: string;
+  } | null>(null);
 
   // Checkout Form State
   const [customerName, setCustomerName] = useState('');
@@ -274,19 +374,22 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     handleOpenItemModal(item);
   };
 
+  const roundCurrency = (value: number) => Math.round(((Number.isFinite(value) ? value : 0) + Number.EPSILON) * 100) / 100;
+
   const handleAddComboToCart = (combo: Combo) => {
     if (!combo.available) {
       alert('Este combo possui componentes temporariamente indisponíveis no estoque.');
       return;
     }
 
+    const comboPriceRounded = roundCurrency(combo.comboPrice);
     const cartItem: OrderItem = {
       id: `cart-combo-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       menuItemId: combo.id,
       name: combo.name,
       quantity: 1,
-      unitPrice: combo.comboPrice,
-      subtotal: combo.comboPrice,
+      unitPrice: comboPriceRounded,
+      subtotal: comboPriceRounded,
       isCombo: true,
       comboId: combo.id,
       comboComponents: combo.items,
@@ -295,9 +398,10 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     setCart((prev) => {
       const existing = prev.find((i) => i.isCombo && i.comboId === combo.id);
       if (existing) {
-        return prev.map((i) => 
-          i.id === existing.id 
-            ? { ...i, quantity: i.quantity + 1, subtotal: (i.quantity + 1) * i.unitPrice }
+        const nextQty = existing.quantity + 1;
+        return prev.map((i) =>
+          i.id === existing.id
+            ? { ...i, quantity: nextQty, subtotal: roundCurrency(nextQty * i.unitPrice) }
             : i
         );
       }
@@ -322,9 +426,9 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const handleConfirmModalAdd = () => {
     if (!selectedItemForModal) return;
 
-    const addonsTotal = modalSelectedAddons.reduce((sum, a) => sum + a.price, 0);
-    const unitPrice = selectedItemForModal.price + addonsTotal;
-    const subtotal = unitPrice * modalQuantity;
+    const addonsTotal = roundCurrency(modalSelectedAddons.reduce((sum, a) => sum + a.price, 0));
+    const unitPrice = roundCurrency(selectedItemForModal.price + addonsTotal);
+    const subtotal = roundCurrency(unitPrice * modalQuantity);
 
     const orderItem: OrderItem = {
       id: `item-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
@@ -358,7 +462,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     setCart((prev) =>
       prev.map((i) =>
         i.id === cartItemId
-          ? { ...i, quantity: newQty, subtotal: i.unitPrice * newQty }
+          ? { ...i, quantity: newQty, subtotal: roundCurrency(i.unitPrice * newQty) }
           : i
       )
     );
@@ -368,17 +472,17 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     setCart((prev) => prev.filter((i) => i.id !== cartItemId));
   };
 
-  // Calculations
   const cartSubtotal = useMemo(() => {
-    return cart.reduce((sum, item) => sum + item.subtotal, 0);
+    return roundCurrency(cart.reduce((sum, item) => sum + item.subtotal, 0));
   }, [cart]);
 
-  const deliveryFee = fulfillmentType === 'RETIRADA' ? 0 : config.deliveryFeeBase;
-  const cartTotal = cartSubtotal + deliveryFee;
+  const deliveryFee = fulfillmentType === 'RETIRADA' ? 0 : roundCurrency(config.deliveryFeeBase || 0);
+  const cartTotal = roundCurrency(cartSubtotal + deliveryFee);
 
-  // Handle Checkout / Create Order
+  // Handle Checkout / Create Order (awaits real server confirmation before success modal or clearing cart)
   const handlePlaceOrder = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submittingOrderRef.current || isSubmittingOrder) return;
     setFormError(null);
 
     if (cart.length === 0) {
@@ -393,48 +497,122 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       return;
     }
 
+    submittingOrderRef.current = true;
+    setIsSubmittingOrder(true);
+
+    const liveConfig = store.getRestaurantConfig();
     let formattedAddress = undefined;
     if (!isRetirada) {
-      let condoTitle = condoType === 'Eco Way' ? 'Condomínio Eco Way' : condoType === 'Eco Fit' ? 'Condomínio Eco Fit' : (condoCustom.trim() || 'Residência');
+      const hasPresetCondo = condoType === 'Eco Way' || condoType === 'Eco Fit';
+      const resolvedCondo = hasPresetCondo
+        ? `Condomínio ${condoType}`
+        : (condoCustom.trim() || undefined);
+      const resolvedStreet = street.trim() || resolvedCondo || '';
+      const resolvedNeighborhood = hasPresetCondo
+        ? (neighborhood.trim() || `Condomínio ${condoType}`)
+        : (neighborhood.trim() || '');
       formattedAddress = {
-        condominium: condoType && condoType !== 'Outros' ? `Condomínio ${condoType}` : (condoCustom.trim() || undefined),
-        street: street.trim() || condoTitle,
+        condominium: resolvedCondo,
+        street: resolvedStreet,
         number: number.trim() || (apto.trim() || bloco.trim() ? undefined : 'S/N'),
         block: bloco.trim() || undefined,
         apartment: apto.trim() || undefined,
-        neighborhood: condoType ? `Condomínio ${condoType}` : (neighborhood.trim() || 'Bairro'),
+        neighborhood: resolvedNeighborhood,
         complement: complement.trim() || undefined,
-        city: config.city || 'Campina Grande',
+        city: liveConfig.city || 'Campina Grande',
         reference: reference.trim() || undefined,
       };
     }
 
     try {
-      const syncRes = await store.createOrderAsync({
-        estimatedDeliveryMinutes: isRetirada ? config.avgPrepTimeMinutes : config.avgPrepTimeMinutes + config.avgDeliveryTimeMinutes,
+      const draftSignature = JSON.stringify({
+        items: cart.map((i) => ({
+          id: i.id,
+          menuItemId: i.menuItemId,
+          quantity: i.quantity,
+          unitPrice: i.unitPrice,
+          subtotal: i.subtotal,
+        })),
         fulfillmentType,
-        customer: {
-          name: customerName.trim() || (isRetirada ? 'Cliente Balcão' : 'Cliente Entrega'),
-          phone: customerPhone.trim() || config.phone,
-          address: formattedAddress,
-          notes: orderNotes.trim() || undefined,
-        },
-        items: cart,
-        subtotal: cartSubtotal,
-        deliveryFee,
-        discount: 0,
-        totalAmount: cartTotal,
         paymentMethod,
-        paymentChangeFor: paymentMethod === 'DINHEIRO' && paymentChangeFor ? parseFloat(paymentChangeFor) : undefined,
-        cashReceived: paymentMethod === 'DINHEIRO' ? (parseFloat(paymentChangeFor) || cartTotal) : undefined,
-        changeAmount: paymentMethod === 'DINHEIRO' ? Math.max(0, (parseFloat(paymentChangeFor) || cartTotal) - cartTotal) : undefined,
-        createdBy: customerName.trim() || 'Cliente Cardápio Web',
-        paymentStatus: 'PENDENTE',
-        status: 'NOVO',
+        cartTotal,
       });
-      const order = syncRes.order;
 
-      // If order has PIX code, generate QR Code data URL
+      if (!draftOrderIdentityRef.current || draftOrderIdentityRef.current.signature !== draftSignature) {
+        const existingOrders = store.getOrders();
+        const maxOrderNum = existingOrders.reduce((max, o) => {
+          const parsed = parseInt((o.orderNumber || '').replace(/\D/g, ''), 10);
+          return Number.isFinite(parsed) && parsed > max ? parsed : max;
+        }, 1000);
+        const generatedTrackingCode =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID().replace(/-/g, '')
+            : `tk_${Date.now()}_${Math.random().toString(36).substring(2, 12)}_${Math.random().toString(36).substring(2, 8)}`;
+
+        draftOrderIdentityRef.current = {
+          signature: draftSignature,
+          id: `ord-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          orderNumber: `#${maxOrderNum + 1}`,
+          trackingCode: generatedTrackingCode,
+        };
+      }
+
+      const draftIdentity = draftOrderIdentityRef.current;
+      const requireCloudConfirm = true;
+
+      const syncRes = await store.createOrderAsync(
+        {
+          id: draftIdentity.id,
+          orderNumber: draftIdentity.orderNumber,
+          trackingCode: draftIdentity.trackingCode,
+          estimatedDeliveryMinutes: isRetirada ? liveConfig.avgPrepTimeMinutes : liveConfig.avgPrepTimeMinutes + liveConfig.avgDeliveryTimeMinutes,
+          fulfillmentType,
+          customer: {
+            name: customerName.trim() || (isRetirada ? 'Cliente Balcão' : 'Cliente Entrega'),
+            phone: customerPhone.trim() || liveConfig.phone,
+            address: formattedAddress,
+            notes: orderNotes.trim() || undefined,
+          },
+          items: cart,
+          subtotal: cartSubtotal,
+          deliveryFee,
+          discount: 0,
+          totalAmount: cartTotal,
+          paymentMethod,
+          paymentChangeFor: paymentMethod === 'DINHEIRO' && paymentChangeFor ? roundCurrency(parseFloat(paymentChangeFor)) : undefined,
+          cashReceived: paymentMethod === 'DINHEIRO' ? roundCurrency(parseFloat(paymentChangeFor) || cartTotal) : undefined,
+          changeAmount: paymentMethod === 'DINHEIRO' ? Math.max(0, roundCurrency((parseFloat(paymentChangeFor) || cartTotal) - cartTotal)) : undefined,
+          createdBy: customerName.trim() || 'Cliente Cardápio Web',
+          paymentStatus: 'PENDENTE',
+          status: 'NOVO',
+        },
+        { requireServerConfirmation: requireCloudConfirm, publicMenuOrder: true }
+      );
+
+      if (requireCloudConfirm && (!syncRes.synced || !syncRes.order?.id)) {
+        const errorMessage =
+          syncRes.error ||
+          'Não foi possível confirmar o envio do pedido ao servidor. Verifique sua conexão e tente novamente. Seu carrinho foi preservado.';
+        setFormError(errorMessage);
+        if (syncRes.isStoreClosed) {
+          setClosedCheckoutNotice(errorMessage);
+          setIsCartOpen(false);
+          setSelectedItemForModal(null);
+          store.fetchPublicStoreAvailability().then((freshAvail) => {
+            setAvailability(freshAvail);
+            setConfig(store.getRestaurantConfig());
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      const order = syncRes.order;
+      draftOrderIdentityRef.current = null;
+
+      setPixQrDataUrl('');
+      setCopiedPixCode(false);
+
+      // If order has PIX code, generate QR Code data URL directly from the exact BR Code payload
       if (order.paymentMethod === 'PIX' && order.pixCode) {
         try {
           const qrUrl = await generateQRCodeDataUrl(order.pixCode, { width: 360, margin: 1 });
@@ -461,9 +639,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         })
         .join('\n');
 
-      const addressText = isRetirada 
-        ? `Retirada no Balcão (${config.address})`
-        : `${order.customer.address?.street}, ${order.customer.address?.number || 'S/N'}${order.customer.address?.block ? ` · Bloco ${order.customer.address.block}` : ''}${order.customer.address?.apartment ? ` · Ap ${order.customer.address.apartment}` : ''} - ${order.customer.address?.neighborhood || ''}`;
+      const addressText = formatCustomerAddress(order.customer, isRetirada, liveConfig.address);
 
       const paymentMethodFormatted = 
         paymentMethod === 'PIX'
@@ -484,7 +660,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         trackingUrl,
       });
 
-      const waUrl = `https://wa.me/${config.whatsapp}?text=${waText}`;
+      const waUrl = `https://wa.me/${liveConfig.whatsapp}?text=${waText}`;
 
       setCreatedOrder(order);
       setCreatedOrderId(order.id);
@@ -495,8 +671,16 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         try { localStorage.removeItem('gf_customer_cart'); } catch {}
       }
       setIsCartOpen(false);
-    } catch (orderErr) {
-      setFormError('Não foi possível registrar seu pedido. Por favor, tente novamente ou contate nosso WhatsApp.');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '';
+      setFormError(
+        msg
+          ? `Não foi possível registrar seu pedido no servidor (${msg}). Seu carrinho foi preservado para nova tentativa.`
+          : 'Não foi possível registrar seu pedido. Por favor, tente novamente ou contate nosso WhatsApp.'
+      );
+    } finally {
+      submittingOrderRef.current = false;
+      setIsSubmittingOrder(false);
     }
   };
 
@@ -508,7 +692,35 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   };
 
   return (
-    <div className="min-h-screen w-full max-w-full bg-[#FAF7F2] text-[#2C1810] pb-28">
+    <div
+      className={
+        isStoreOpenAuthoritative
+          ? 'min-h-screen w-full max-w-full bg-[#FAF7F2] text-[#2C1810] pb-28'
+          : 'min-h-screen w-full max-w-full bg-[#FAF7F2] text-[#2C1810]'
+      }
+    >
+      {isCheckingAvailability ? (
+        <div className="min-h-screen w-full flex items-center justify-center px-4 py-12">
+          <div className="w-full max-w-lg mx-auto text-center animate-pulse">
+            <div className="bg-[#FFFDF9] rounded-3xl p-8 sm:p-10 border border-[#E8DFD5] shadow-sm space-y-4">
+              <div className="flex justify-center">
+                <AmanditaLogo variant="full" size="md" theme="light" />
+              </div>
+              <div className="flex items-center justify-center gap-2 text-xs font-bold text-[#8C5E47]">
+                <Sparkles className="w-4 h-4 text-[#C86D3B] animate-spin" />
+                <span>Verificando disponibilidade do cardápio...</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : !isStoreOpenAuthoritative ? (
+        <StoreClosedView
+          availability={availability}
+          config={config}
+          rejectionNotice={closedCheckoutNotice}
+        />
+      ) : (
+        <>
       {/* RESTAURANT TOP HEADER BANNER (ELEGANT WARM BISTRO IDENTITY) */}
       <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-lg sticky top-0 z-30 border-b border-[#C86D3B]/30 w-full max-w-full">
         <div className="w-full max-w-4xl mx-auto px-3.5 sm:px-4 py-3 flex items-center justify-between gap-3 min-w-0">
@@ -520,15 +732,9 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                 <h1 className="font-serif font-black text-sm sm:text-base tracking-tight text-[#FFFDF9] truncate">
                   {config.name || 'Amandita Sabores'}
                 </h1>
-                {config.isOpen ? (
-                  <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shrink-0">
-                    ABERTO AGORA
-                  </span>
-                ) : (
-                  <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 shrink-0">
-                    FECHADO NO MOMENTO
-                  </span>
-                )}
+                <span className="px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shrink-0">
+                  ABERTO AGORA
+                </span>
               </div>
               <p className="text-[11px] sm:text-xs text-[#D9C7B8] flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5">
                 <span className="truncate max-w-[170px] sm:max-w-none">{config.address}</span>
@@ -1400,6 +1606,15 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                           </div>
                         ) : (
                           <div className="space-y-2">
+                            {condoType === 'Outros' && (
+                              <input
+                                type="text"
+                                value={condoCustom}
+                                onChange={(e) => setCondoCustom(e.target.value)}
+                                placeholder="Nome do Condomínio / Residencial (opcional)"
+                                className="w-full px-2.5 py-1.5 bg-white border border-[#E8DFD5] rounded-lg text-xs"
+                              />
+                            )}
                             <input
                               type="text"
                               value={street}
@@ -1425,6 +1640,14 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                             </div>
                           </div>
                         )}
+
+                        <input
+                          type="text"
+                          value={complement}
+                          onChange={(e) => setComplement(e.target.value)}
+                          placeholder="Complemento (casa, bloco/apto, sala — opcional)"
+                          className="w-full px-2.5 py-1.5 bg-white border border-[#E8DFD5] rounded-lg text-xs"
+                        />
 
                         <input
                           type="text"
@@ -1505,6 +1728,26 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                           />
                         </div>
                       )}
+
+                      {paymentMethod === 'PIX' && (() => {
+                        const pixAvailability = generatePurchasePixPayload({
+                          pixKey: config.pixKey,
+                          keyType: config.pixKeyType,
+                          receiverName: config.pixReceiverName,
+                          receiverCity: config.pixReceiverCity,
+                          storeName: config.name,
+                          amount: cartTotal > 0 ? cartTotal : 1,
+                        });
+                        return pixAvailability.success ? (
+                          <div className="mt-2 p-2.5 bg-emerald-50/80 border border-emerald-200 rounded-xl text-[11px] text-emerald-950 leading-relaxed">
+                            O QR Code PIX e o código Copia e Cola no valor exato de <strong>{formatCurrency(cartTotal)}</strong> serão gerados ao confirmar o pedido. A confirmação do pagamento é manual mediante envio do comprovante.
+                          </div>
+                        ) : (
+                          <div className="mt-2 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-900 leading-relaxed">
+                            Chave PIX do estabelecimento indisponível no momento. Você ainda pode enviar o pedido e combinar o pagamento pelo WhatsApp.
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {formError && (
@@ -1535,10 +1778,15 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                     {/* Submit Button */}
                     <button
                       type="submit"
-                      className="w-full py-3.5 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white font-bold rounded-2xl text-xs sm:text-sm hover:opacity-95 transition shadow-md flex items-center justify-center gap-2 cursor-pointer"
+                      disabled={isSubmittingOrder}
+                      className="w-full py-3.5 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white font-bold rounded-2xl text-xs sm:text-sm hover:opacity-95 transition shadow-md flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                     >
                       <Send className="w-4 h-4" />
-                      <span>Confirmar & Enviar Pedido ({formatCurrency(cartTotal)})</span>
+                      <span>
+                        {isSubmittingOrder
+                          ? 'Confirmando Pedido no Servidor...'
+                          : `Confirmar & Enviar Pedido (${formatCurrency(cartTotal)})`}
+                      </span>
                     </button>
                   </form>
                 </div>
@@ -1546,6 +1794,8 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
 
       {/* PLACED ORDER SUCCESS MODAL */}
@@ -1571,9 +1821,17 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
             {/* PIX QR CODE & CODE IF SELECTED */}
             {createdOrder.paymentMethod === 'PIX' && (
               <div className="p-4 bg-[#FAF7F2] rounded-2xl border border-[#E8DFD5] space-y-3">
-                <span className="text-xs font-bold uppercase tracking-wider text-[#721C24] block">
-                  Pague com PIX para Agilizar:
-                </span>
+                <div>
+                  <span className="text-xs font-bold uppercase tracking-wider text-[#721C24] block">
+                    Pague com PIX para Agilizar ({formatCurrency(createdOrder.totalAmount)}):
+                  </span>
+                  <p className="text-[11px] text-[#8C5E47] mt-0.5">
+                    Favorecido: <strong className="text-[#2C1810]">{config.pixReceiverName || config.name}</strong>
+                    {createdOrder.pixTxId ? (
+                      <span className="font-mono"> · TXID: {createdOrder.pixTxId}</span>
+                    ) : null}
+                  </p>
+                </div>
 
                 {pixQrDataUrl && (
                   <div className="p-2 bg-white rounded-xl shadow-xs inline-block mx-auto border border-[#E8DFD5]">
@@ -1585,15 +1843,27 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   </div>
                 )}
 
-                {createdOrder.pixCode && (
-                  <button
-                    type="button"
-                    onClick={handleCopyPix}
-                    className="w-full py-2 bg-white border border-[#E8DFD5] text-[#2C1810] rounded-xl text-xs font-bold hover:bg-slate-50 transition flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>{copiedPixCode ? 'Código PIX Copiado!' : 'Copiar Chave PIX Copia e Cola'}</span>
-                  </button>
+                {createdOrder.pixCode ? (
+                  <div className="space-y-2">
+                    <div className="p-2 bg-white border border-[#E8DFD5] rounded-xl font-mono text-[10px] text-[#2C1810] break-all max-h-16 overflow-y-auto text-left select-all">
+                      {createdOrder.pixCode}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleCopyPix}
+                      className="w-full py-2 bg-white border border-[#E8DFD5] text-[#2C1810] rounded-xl text-xs font-bold hover:bg-slate-50 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      {copiedPixCode ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{copiedPixCode ? 'Código PIX Copiado!' : 'Copiar PIX Copia e Cola'}</span>
+                    </button>
+                    <p className="text-[10px] text-[#6B4B3E] leading-relaxed bg-amber-50/90 border border-amber-200 rounded-xl p-2 text-left">
+                      <strong>Conferência manual:</strong> gerar o QR Code não confirma automaticamente o pagamento. Após pagar no aplicativo do seu banco, envie o comprovante pelo WhatsApp para a loja confirmar.
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-[#8C5E47]">
+                    Chave PIX do estabelecimento não configurada. Envie o pedido no WhatsApp para combinar o pagamento.
+                  </p>
                 )}
               </div>
             )}

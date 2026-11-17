@@ -137,6 +137,23 @@ export default defineConfig(({ mode }) => {
           type: 'module',
         },
       }),
+      {
+        name: 'disable-vite-hmr-websocket',
+        apply: 'serve',
+        enforce: 'post',
+        transform(code, id) {
+          const cleanId = id.split('?')[0].replace(/\\/g, '/');
+          if (cleanId.endsWith('/vite/dist/client/client.mjs')) {
+            return {
+              code: code.replace(
+                'transport.connect(createHMRHandler(handleMessage));',
+                '/* HMR WebSocket disabled */',
+              ),
+              map: null,
+            };
+          }
+        },
+      },
     ],
     define: {
       '__APP_BUILD_TIME__': JSON.stringify(buildTime),
@@ -158,6 +175,7 @@ export default defineConfig(({ mode }) => {
       host: '0.0.0.0',
       port: 3000,
       hmr: false,
+      ws: false,
     },
   };
 });

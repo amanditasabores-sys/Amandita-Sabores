@@ -1,8 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { store } from '../../services/store';
-import { thermalPrinterService } from '../../services/thermalPrinter';
-import { Order, OrderStatus } from '../../types';
-import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel, getStatusDetails } from '../../utils/formatters';
+import { thermalPrinterService, ThermalPrinterStatus } from '../../services/thermalPrinter';
+import { Order, OrderStatus, User } from '../../types';
+import {
+  formatAddressDetails,
+  formatCurrency,
+  formatDateTime,
+  formatFortalezaDateLabel,
+  formatTime,
+  getFortalezaDateKey,
+  getPaymentMethodLabel,
+  getStatusDetails
+} from '../../utils/formatters';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { getPublicAppUrl } from '../../utils/url';
 import { 
@@ -18,12 +27,18 @@ import {
   ExternalLink, 
   QrCode, 
   AlertCircle,
+  AlertTriangle,
   Trash2,
   UploadCloud,
   FileText,
+  RefreshCw,
+  Calendar,
+  History,
+  Bluetooth,
+  ChevronDown,
+  ChevronUp,
   X
 } from 'lucide-react';
-import { User } from '../../types';
 import { ConfirmModal } from '../common/ConfirmModal';
 
 interface LiveOrdersKanbanProps {
@@ -40,6 +55,8 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
   const [users, setUsers] = useState<User[]>(() => store.getUsers());
   const [isDeletingOrder, setIsDeletingOrder] = useState(false);
   const [deleteErrorMessage, setDeleteErrorMessage] = useState<string | null>(null);
+  const [updatingOrderIds, setUpdatingOrderIds] = useState<Record<string, boolean>>({});
+  const [isCancellingOrder, setIsCancellingOrder] = useState(false);
 
   // Cancellation & Refund Modal state
   const [orderToCancelModal, setOrderToCancelModal] = useState<Order | null>(null);
@@ -47,36 +64,69 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
   const [cancelErrorMsg, setCancelErrorMsg] = useState<string | null>(null);
   const [cancelSuccessResult, setCancelSuccessResult] = useState<{ order: Order; message: string } | null>(null);
 
+  // Date view organization (America/Fortaleza) & Manual Refresh state
+  const todayKey = getFortalezaDateKey();
+  const [viewMode, setViewMode] = useState<'hoje' | 'historico'>('hoje');
+  const [selectedHistoryDate, setSelectedHistoryDate] = useState<string>(() => {
+    const yesterday = new Date(Date.now() - 86400000);
+    return getFortalezaDateKey(yesterday);
+  });
+  const [showPriorPending, setShowPriorPending] = useState(true);
+  const [isRefreshingOrders, setIsRefreshingOrders] = useState(false);
+  const [refreshFeedback, setRefreshFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [syncActionNotice, setSyncActionNotice] = useState<{ type: 'error' | 'warning'; message: string } | null>(null);
+  const [printerStatus, setPrinterStatus] = useState<ThermalPrinterStatus>(() => thermalPrinterService.getStatus());
+
+  useEffect(() => {
+    const unsub = thermalPrinterService.subscribe((newStatus) => {
+      setPrinterStatus(newStatus);
+    });
+    return unsub;
+  }, []);
+
   const handleOpenCancelModal = (order: Order) => {
     setOrderToCancelModal(order);
     setCancelReasonInput('');
     setCancelErrorMsg(null);
   };
 
-  const handleConfirmCancelOrder = () => {
-    if (!orderToCancelModal) return;
+  const handleConfirmCancelOrder = async () => {
+    if (!orderToCancelModal || isCancellingOrder) return;
     if (!cancelReasonInput.trim()) {
       setCancelErrorMsg('Por favor informe o motivo obrigatório do cancelamento.');
       return;
     }
-    const operator = currentUser?.name || currentUser?.username || 'Administrador';
-    const res = store.cancelOrder(orderToCancelModal.id, cancelReasonInput.trim(), operator);
-    if (!res.success) {
-      setCancelErrorMsg(res.message);
-      return;
-    }
-    const updated = store.getOrderById(orderToCancelModal.id);
-    setOrderToCancelModal(null);
-    onOrderUpdated();
-    if (selectedOrderForModal && selectedOrderForModal.id === orderToCancelModal.id && updated) {
-      setSelectedOrderForModal(updated);
-    }
-    if (updated) {
-      setCancelSuccessResult({
-        order: updated,
-        message: res.message,
-      });
-      setTimeout(() => setCancelSuccessResult(null), 10000);
+    setIsCancellingOrder(true);
+    setCancelErrorMsg(null);
+    const targetOrderId = orderToCancelModal.id;
+    try {
+      const operator = currentUser?.name || currentUser?.username || 'Administrador';
+      const res = await store.cancelOrderAsync(targetOrderId, cancelReasonInput.trim(), operator);
+      if (!res.success) {
+        setCancelErrorMsg(res.message);
+        return;
+      }
+      const updated = store.getOrderById(targetOrderId);
+      setOrderToCancelModal(null);
+      onOrderUpdated();
+      if (selectedOrderForModal && selectedOrderForModal.id === targetOrderId && updated) {
+        setSelectedOrderForModal(updated);
+      }
+      if (!res.synced) {
+        setSyncActionNotice({
+          type: 'warning',
+          message: `Cancelamento do pedido ${updated?.orderNumber || targetOrderId} salvo localmente e pendente de envio ao servidor.`,
+        });
+      }
+      if (updated) {
+        setCancelSuccessResult({
+          order: updated,
+          message: res.message,
+        });
+        setTimeout(() => setCancelSuccessResult(null), 10000);
+      }
+    } finally {
+      setIsCancellingOrder(false);
     }
   };
 
@@ -88,14 +138,19 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
 
   const activeDrivers = users.filter((u) => u.role?.toUpperCase() === 'ENTREGADOR' && u.status === 'ATIVO');
 
-  const handleReassignDriver = (orderId: string, driverId: string) => {
-    const adminName = currentUser?.name || currentUser?.username || 'Administrador';
-    if (!driverId) {
-      store.assignDeliveryPerson(orderId, null, adminName);
-    } else {
-      const driver = activeDrivers.find((d) => d.id === driverId);
-      if (driver) {
-        store.assignDeliveryPerson(
+  const handleReassignDriver = async (orderId: string, driverId: string) => {
+    if (updatingOrderIds[orderId]) return;
+    setUpdatingOrderIds((prev) => ({ ...prev, [orderId]: true }));
+    setSyncActionNotice(null);
+    try {
+      const adminName = currentUser?.name || currentUser?.username || 'Administrador';
+      let res: { order: Order | null; synced: boolean; rejected?: boolean; error?: string };
+      if (!driverId) {
+        res = await store.assignDeliveryPersonAsync(orderId, null, adminName);
+      } else {
+        const driver = activeDrivers.find((d) => d.id === driverId);
+        if (!driver) return;
+        res = await store.assignDeliveryPersonAsync(
           orderId,
           {
             id: driver.id,
@@ -105,13 +160,28 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
           adminName
         );
       }
-    }
-    onOrderUpdated();
-    if (selectedOrderForModal && selectedOrderForModal.id === orderId) {
-      setSelectedOrderForModal(store.getOrderById(orderId) || null);
+      if (!res.synced) {
+        setSyncActionNotice({
+          type: res.rejected ? 'error' : 'warning',
+          message: res.rejected
+            ? `Atribuição recusada pelo servidor: ${res.error || 'Verifique suas permissões.'}`
+            : `Atribuição salva localmente e aguardando envio ao servidor: ${res.error || 'Sem conexão.'}`,
+        });
+      }
+      onOrderUpdated();
+      if (selectedOrderForModal && selectedOrderForModal.id === orderId) {
+        setSelectedOrderForModal(store.getOrderById(orderId) || null);
+      }
+    } finally {
+      setUpdatingOrderIds((prev) => {
+        const next = { ...prev };
+        delete next[orderId];
+        return next;
+      });
     }
   };
 
+  const canDeleteOrders = store.canUserDeleteOrder(currentUser);
   const config = store.getRestaurantConfig();
 
   const handleDeleteOrder = (order: Order) => {
@@ -140,45 +210,191 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     }
   };
 
-  // Columns definition
+  const handleManualRefreshOrders = async () => {
+    if (isRefreshingOrders) return;
+    setIsRefreshingOrders(true);
+    setRefreshFeedback(null);
+    try {
+      const res = await store.refreshOrdersFromFirestore();
+      onOrderUpdated();
+      setRefreshFeedback({
+        type: res.success ? 'success' : 'error',
+        message: res.message,
+      });
+      setTimeout(() => setRefreshFeedback(null), 6000);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRefreshFeedback({
+        type: 'error',
+        message: `Erro ao consultar pedidos no servidor: ${msg}`,
+      });
+    } finally {
+      setIsRefreshingOrders(false);
+    }
+  };
+
+  const handleQuickPrinterReconnect = async () => {
+    const res = await thermalPrinterService.reconnectSavedBLE();
+    setThermalPrintNotice({
+      message: res.message,
+      success: res.success,
+    });
+    setTimeout(() => setThermalPrintNotice(null), 5000);
+  };
+
+  // Date-organized buckets based strictly on order.createdAt (America/Fortaleza)
+  const todayOrders = useMemo(
+    () => orders.filter((o) => getFortalezaDateKey(o.createdAt) === todayKey),
+    [orders, todayKey]
+  );
+
+  const priorPendingOrders = useMemo(
+    () =>
+      orders.filter((o) => {
+        const key = getFortalezaDateKey(o.createdAt);
+        return Boolean(key) && key < todayKey && o.status !== 'ENTREGUE' && o.status !== 'CANCELADO';
+      }),
+    [orders, todayKey]
+  );
+
+  const todayCanceledOrders = useMemo(
+    () => todayOrders.filter((o) => o.status === 'CANCELADO'),
+    [todayOrders]
+  );
+
+  const availableHistoryDates = useMemo(() => {
+    const keys = new Set<string>();
+    orders.forEach((o) => {
+      const k = getFortalezaDateKey(o.createdAt);
+      if (k) keys.add(k);
+    });
+    return Array.from(keys).sort((a, b) => b.localeCompare(a)).slice(0, 14);
+  }, [orders]);
+
+  const historyOrdersForDate = useMemo(
+    () => orders.filter((o) => getFortalezaDateKey(o.createdAt) === selectedHistoryDate),
+    [orders, selectedHistoryDate]
+  );
+
+  // Columns definition (operational board strictly reflects Today's orders)
   const columns: { status: OrderStatus; title: string; count: number; colorClass: string }[] = [
     {
       status: 'NOVO',
       title: 'Novos Pedidos',
-      count: orders.filter((o) => o.status === 'NOVO').length,
+      count: todayOrders.filter((o) => o.status === 'NOVO').length,
       colorClass: 'border-amber-400 bg-amber-500/10 text-amber-800',
     },
     {
       status: 'EM_PREPARO',
       title: 'Em Preparo (Cozinha)',
-      count: orders.filter((o) => o.status === 'EM_PREPARO').length,
+      count: todayOrders.filter((o) => o.status === 'EM_PREPARO').length,
       colorClass: 'border-blue-400 bg-blue-500/10 text-blue-800',
     },
     {
       status: 'PRONTO',
       title: 'Pronto (Aguardando Retirada)',
-      count: orders.filter((o) => o.status === 'PRONTO').length,
+      count: todayOrders.filter((o) => o.status === 'PRONTO').length,
       colorClass: 'border-purple-400 bg-purple-500/10 text-purple-800',
     },
     {
       status: 'EM_ROTA',
       title: 'Em Rota / Saiu para Entrega',
-      count: orders.filter((o) => o.status === 'EM_ROTA').length,
+      count: todayOrders.filter((o) => o.status === 'EM_ROTA').length,
       colorClass: 'border-indigo-400 bg-indigo-500/10 text-indigo-800',
     },
     {
       status: 'ENTREGUE',
       title: 'Entregue (Concluído)',
-      count: orders.filter((o) => o.status === 'ENTREGUE').length,
+      count: todayOrders.filter((o) => o.status === 'ENTREGUE').length,
       colorClass: 'border-emerald-400 bg-emerald-500/10 text-emerald-800',
     },
   ];
 
   const handleAdvanceStatus = async (order: Order, nextStatus: OrderStatus) => {
-    await store.updateOrderStatusAsync(order.id, nextStatus, 'Painel Administrativo', `Avançado para ${nextStatus}`);
-    onOrderUpdated();
-    if (selectedOrderForModal && selectedOrderForModal.id === order.id) {
-      setSelectedOrderForModal(store.getOrderById(order.id) || null);
+    if (updatingOrderIds[order.id]) return;
+    setUpdatingOrderIds((prev) => ({ ...prev, [order.id]: true }));
+    setSyncActionNotice(null);
+    try {
+      const authorName = currentUser?.name || currentUser?.username || 'Painel Administrativo';
+      const res = await store.updateOrderStatusAsync(order.id, nextStatus, authorName, `Avançado para ${nextStatus}`);
+      if (!res.synced) {
+        if (res.rejected) {
+          setSyncActionNotice({
+            type: 'error',
+            message: `Não foi possível alterar o pedido ${order.orderNumber} para ${nextStatus}: ${res.error || 'Recusado pelo servidor.'}`,
+          });
+        } else if (res.error || res.offlineQueued) {
+          setSyncActionNotice({
+            type: 'warning',
+            message: `Alteração do pedido ${order.orderNumber} salva localmente e aguardando envio ao servidor: ${res.error || 'Sem conexão com a internet.'}`,
+          });
+        }
+        setTimeout(() => setSyncActionNotice(null), 8000);
+      }
+      onOrderUpdated();
+      if (selectedOrderForModal && selectedOrderForModal.id === order.id) {
+        setSelectedOrderForModal(store.getOrderById(order.id) || null);
+      }
+    } finally {
+      setUpdatingOrderIds((prev) => {
+        const next = { ...prev };
+        delete next[order.id];
+        return next;
+      });
+    }
+  };
+
+  const canConfirmPayments = useMemo(() => {
+    const activeUser = currentUser || store.getCurrentUser();
+    return store.canUserConfirmPayments(activeUser);
+  }, [currentUser]);
+
+  const [paymentConfirmNotice, setPaymentConfirmNotice] = useState<{
+    orderId: string;
+    type: 'error' | 'warning';
+    message: string;
+  } | null>(null);
+
+  const handleConfirmManualPayment = async (order: Order) => {
+    if (updatingOrderIds[order.id]) return;
+    setUpdatingOrderIds((prev) => ({ ...prev, [order.id]: true }));
+    setSyncActionNotice(null);
+    setPaymentConfirmNotice(null);
+    try {
+      const activeUser = currentUser || store.getCurrentUser();
+      const authorName = activeUser?.name || activeUser?.username || 'Caixa';
+      const res = await store.updatePaymentStatusAsync(
+        order.id,
+        'PAGO',
+        authorName,
+        `Recebimento ${getPaymentMethodLabel(order.paymentMethod)} conferido manualmente`
+      );
+      if (!res.synced) {
+        if (res.rejected || res.uncertain) {
+          const type = res.rejected ? 'error' : 'warning';
+          const message = res.rejected
+            ? `Não foi possível confirmar pagamento de ${order.orderNumber}: ${res.error || 'Recusado pelo servidor.'}`
+            : `Não foi possível confirmar o recebimento de ${order.orderNumber} no servidor (${res.error || 'falha de rede'}). O pedido permanece PENDENTE até confirmação atômica.`;
+          setSyncActionNotice({ type, message });
+          setPaymentConfirmNotice({ orderId: order.id, type, message });
+          setTimeout(() => setSyncActionNotice(null), 9000);
+        } else {
+          const message = `Confirmação de ${order.orderNumber} registrada em modo de contingência local (Firebase não configurado).`;
+          setSyncActionNotice({ type: 'warning', message });
+          setPaymentConfirmNotice({ orderId: order.id, type: 'warning', message });
+          setTimeout(() => setSyncActionNotice(null), 8000);
+        }
+      }
+      onOrderUpdated();
+      if (selectedOrderForModal && selectedOrderForModal.id === order.id) {
+        setSelectedOrderForModal(store.getOrderById(order.id) || null);
+      }
+    } finally {
+      setUpdatingOrderIds((prev) => {
+        const next = { ...prev };
+        delete next[order.id];
+        return next;
+      });
     }
   };
 
@@ -208,6 +424,135 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
 
   return (
     <div className="space-y-4">
+      {/* Operational Date Switcher, Printer Quick Status & Manual Server Refresh Toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setViewMode('hoje')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+              viewMode === 'hoje'
+                ? 'bg-[#2C1810] text-white shadow-2xs'
+                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+            }`}
+          >
+            <Calendar className="w-3.5 h-3.5" />
+            <span>Operação de Hoje ({formatFortalezaDateLabel(todayKey)})</span>
+            <span className="px-1.5 py-0.5 rounded-md text-[10px] bg-white/15 font-mono">
+              {todayOrders.length}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setViewMode('historico')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+              viewMode === 'historico'
+                ? 'bg-[#2C1810] text-white shadow-2xs'
+                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+            }`}
+          >
+            <History className="w-3.5 h-3.5" />
+            <span>Histórico por Data</span>
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {printerStatus.mode === 'bluetooth_ble' && printerStatus.hasSavedDevice && (
+            printerStatus.connected ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold"
+                title={`Impressora conectada: ${printerStatus.deviceName || 'Térmica 58mm'}`}
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <Bluetooth className="w-3 h-3" />
+                <span className="hidden sm:inline">Impressora Conectada</span>
+              </span>
+            ) : printerStatus.reconnecting ? (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-bold">
+                <RefreshCw className="w-3 h-3 animate-spin" />
+                <span>Reconectando Impressora...</span>
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={handleQuickPrinterReconnect}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-[11px] font-bold transition cursor-pointer"
+                title="A sessão Web Bluetooth é encerrada após recarregamento da página. Clique para reconectar a impressora salva."
+              >
+                <Bluetooth className="w-3 h-3" />
+                <span>Impressora Desconectada · Reconectar</span>
+              </button>
+            )
+          )}
+
+          <button
+            type="button"
+            onClick={handleManualRefreshOrders}
+            disabled={isRefreshingOrders}
+            className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition shadow-2xs cursor-pointer"
+            title="Buscar pedidos mais recentes diretamente do servidor (Firestore) sem interromper a sincronização em tempo real"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingOrders ? 'animate-spin' : ''}`} />
+            <span>{isRefreshingOrders ? 'ATUALIZANDO...' : 'ATUALIZAR PEDIDOS'}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Feedback Banner for Manual Refresh */}
+      {refreshFeedback && (
+        <div
+          className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 shadow-2xs ${
+            refreshFeedback.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+              : 'bg-rose-50 text-rose-800 border border-rose-200'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {refreshFeedback.type === 'success' ? (
+              <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            )}
+            <span className="font-semibold">{refreshFeedback.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRefreshFeedback(null)}
+            className="text-slate-400 hover:text-slate-600 font-bold px-1 cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Sync Action Error / Pending Warning */}
+      {syncActionNotice && (
+        <div
+          className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 shadow-2xs ${
+            syncActionNotice.type === 'error'
+              ? 'bg-rose-50 text-rose-900 border border-rose-300'
+              : 'bg-amber-50 text-amber-900 border border-amber-300'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {syncActionNotice.type === 'error' ? (
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            )}
+            <span className="font-semibold">{syncActionNotice.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSyncActionNotice(null)}
+            className={`${syncActionNotice.type === 'error' ? 'text-rose-600 hover:text-rose-800' : 'text-amber-600 hover:text-amber-800'} font-bold px-1 cursor-pointer`}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Toast Notice for Thermal Printer */}
       {thermalPrintNotice && (
         <div className={`p-3 rounded-xl text-xs flex items-center justify-between gap-2 shadow-sm ${
@@ -229,10 +574,186 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
         </div>
       )}
 
-      {/* Kanban Board Grid */}
+      {/* Prior Days Non-Finalized Pending Orders Section (Visible in Hoje view when needed) */}
+      {viewMode === 'hoje' && priorPendingOrders.length > 0 && (
+        <div className="bg-amber-50/90 border border-amber-300 rounded-2xl p-3.5 space-y-2.5 shadow-2xs">
+          <button
+            type="button"
+            onClick={() => setShowPriorPending((prev) => !prev)}
+            className="w-full flex items-center justify-between gap-2 text-left cursor-pointer"
+          >
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+              <div>
+                <h4 className="text-xs font-extrabold text-amber-950">
+                  Pendências de Dias Anteriores ({priorPendingOrders.length})
+                </h4>
+                <p className="text-[11px] text-amber-800">
+                  Pedidos não finalizados/cancelados de datas anteriores mantidos com a data original de criação.
+                </p>
+              </div>
+            </div>
+            {showPriorPending ? (
+              <ChevronUp className="w-4 h-4 text-amber-800 shrink-0" />
+            ) : (
+              <ChevronDown className="w-4 h-4 text-amber-800 shrink-0" />
+            )}
+          </button>
+
+          {showPriorPending && (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 pt-1">
+              {priorPendingOrders.map((order) => {
+                const statusInfo = getStatusDetails(order.status);
+                return (
+                  <div
+                    key={order.id}
+                    onClick={() => setSelectedOrderForModal(order)}
+                    className="bg-white rounded-xl p-3 border border-amber-200 hover:border-amber-400 transition cursor-pointer flex flex-col justify-between gap-2"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-black text-xs text-slate-900 font-mono">{order.orderNumber}</span>
+                          <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold border ${statusInfo.bgLightClass} ${statusInfo.colorClass} ${statusInfo.borderClass}`}>
+                            {statusInfo.label}
+                          </span>
+                        </div>
+                        <p className="text-xs font-bold text-slate-800 mt-0.5">{order.customer.name}</p>
+                        <p className="text-[10px] text-amber-800 font-semibold">
+                          Criado em {formatDateTime(order.createdAt)}
+                        </p>
+                      </div>
+                      <span className="text-xs font-bold text-slate-900 font-mono">
+                        {formatCurrency(order.totalAmount)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-600 truncate">
+                      {order.fulfillmentType === 'RETIRADA'
+                        ? 'Retirada no Balcão'
+                        : formatAddressDetails(order.customer.address).primaryLine}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {viewMode === 'historico' ? (
+        <div className="bg-white rounded-2xl border border-slate-200 p-4 space-y-4 shadow-2xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
+            <div>
+              <h3 className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
+                <History className="w-4 h-4 text-[#C86D3B]" />
+                <span>Histórico de Pedidos por Data ({formatFortalezaDateLabel(selectedHistoryDate)})</span>
+              </h3>
+              <p className="text-xs text-slate-500">
+                Fuso horário oficial: América/Fortaleza · {historyOrdersForDate.length} pedido(s) encontrado(s) nesta data
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="date"
+                value={selectedHistoryDate}
+                onChange={(e) => setSelectedHistoryDate(e.target.value)}
+                className="px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#C86D3B]"
+              />
+            </div>
+          </div>
+
+          {availableHistoryDates.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-bold text-slate-500 mr-1">Datas recentes:</span>
+              {availableHistoryDates.map((dKey) => (
+                <button
+                  key={dKey}
+                  type="button"
+                  onClick={() => setSelectedHistoryDate(dKey)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                    selectedHistoryDate === dKey
+                      ? 'bg-[#C86D3B] text-white'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                  }`}
+                >
+                  {dKey === todayKey ? `Hoje (${formatFortalezaDateLabel(dKey)})` : formatFortalezaDateLabel(dKey)}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {historyOrdersForDate.length === 0 ? (
+            <div className="py-12 text-center text-slate-400 text-xs">
+              Nenhum pedido registrado na data {formatFortalezaDateLabel(selectedHistoryDate)}.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              {historyOrdersForDate.map((order) => {
+                const statusInfo = getStatusDetails(order.status);
+                const addrDetails = formatAddressDetails(order.customer.address);
+                return (
+                  <div
+                    key={order.id}
+                    onClick={() => setSelectedOrderForModal(order)}
+                    className="bg-slate-50/70 hover:bg-white rounded-xl p-3.5 border border-slate-200 hover:border-slate-300 transition cursor-pointer flex flex-col justify-between gap-2"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-black text-sm text-slate-900 font-mono">{order.orderNumber}</span>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${statusInfo.bgLightClass} ${statusInfo.colorClass} ${statusInfo.borderClass}`}>
+                            {statusInfo.label}
+                          </span>
+                        </div>
+                        <p className="text-xs font-bold text-slate-800 mt-1">{order.customer.name}</p>
+                        <p className="text-[11px] text-slate-500">{formatDateTime(order.createdAt)}</p>
+                      </div>
+                      <div className="text-right">
+                        <span className="font-bold text-sm text-slate-900 font-mono">{formatCurrency(order.totalAmount)}</span>
+                        <p className="text-[10px] text-slate-500">{getPaymentMethodLabel(order.paymentMethod)}</p>
+                      </div>
+                    </div>
+
+                    <p className="text-[11px] text-slate-600">
+                      {order.fulfillmentType === 'RETIRADA' ? 'Retirada no Balcão' : addrDetails.fullSingleLine}
+                    </p>
+
+                    <div className="flex items-center justify-between pt-2 border-t border-slate-200/70 text-[11px]">
+                      <span className="text-slate-500">{order.items.length} item(ns)</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); handleThermalPrint(order); }}
+                          className="p-1 text-[#C86D3B] hover:bg-amber-50 rounded-lg transition cursor-pointer"
+                          title="Imprimir Cupom Térmico 58mm"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                        </button>
+                        {canDeleteOrders && (
+                          <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); handleDeleteOrder(order); }}
+                            className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer"
+                            title="Excluir pedido"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      ) : (
+      <>
+      {/* Kanban Board Grid (Strictly Today's Operational Orders) */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3.5 items-start">
         {columns.map((col) => {
-          const columnOrders = orders.filter((o) => o.status === col.status);
+          const columnOrders = todayOrders.filter((o) => o.status === col.status);
 
           return (
             <div
@@ -306,10 +827,10 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
 
                         <p className="text-[11px] text-slate-500 truncate flex items-center gap-1 mt-0.5">
                           <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
-                          <span>
+                          <span className="truncate">
                             {order.fulfillmentType === 'RETIRADA' 
                               ? 'Retirada no Balcão' 
-                              : order.customer.address?.neighborhood || 'Entrega'}
+                              : formatAddressDetails(order.customer.address).primaryLine}
                           </span>
                         </p>
 
@@ -346,50 +867,63 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                           <span className="font-bold text-slate-900">
                             {formatCurrency(order.totalAmount)}
                           </span>
-                          <span className="text-[10px] text-slate-500 font-medium">
-                            {getPaymentMethodLabel(order.paymentMethod).split(' ')[0]}
-                          </span>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[10px] text-slate-500 font-medium">
+                              {getPaymentMethodLabel(order.paymentMethod).split(' ')[0]}
+                            </span>
+                            <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold ${
+                              order.paymentStatus === 'PAGO'
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : 'bg-amber-100 text-amber-900'
+                            }`}>
+                              {order.paymentStatus === 'PAGO' ? 'PAGO' : 'PEND.'}
+                            </span>
+                          </div>
                         </div>
 
                         {/* Quick Action buttons */}
                         <div className="flex items-center gap-1 mt-2.5 pt-2 border-t border-slate-100">
                           {order.status === 'NOVO' && (
                             <button
+                              disabled={Boolean(updatingOrderIds[order.id])}
                               onClick={(e) => { e.stopPropagation(); handleAdvanceStatus(order, 'EM_PREPARO'); }}
-                              className="flex-1 py-1 bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1"
+                              className="flex-1 py-1 bg-amber-500 hover:bg-amber-600 disabled:opacity-60 disabled:cursor-wait text-slate-950 rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                             >
                               <ChefHat className="w-3 h-3" />
-                              <span>Enviar p/ Cozinha</span>
+                              <span>{updatingOrderIds[order.id] ? 'Enviando...' : 'Enviar p/ Cozinha'}</span>
                             </button>
                           )}
 
                           {order.status === 'EM_PREPARO' && (
                             <button
+                              disabled={Boolean(updatingOrderIds[order.id])}
                               onClick={(e) => { e.stopPropagation(); handleAdvanceStatus(order, 'PRONTO'); }}
-                              className="flex-1 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1"
+                              className="flex-1 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-wait text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                             >
                               <PackageCheck className="w-3 h-3" />
-                              <span>Pronto p/ Entrega</span>
+                              <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Pronto p/ Entrega'}</span>
                             </button>
                           )}
 
                           {order.status === 'PRONTO' && (
                             <button
+                              disabled={Boolean(updatingOrderIds[order.id])}
                               onClick={(e) => { e.stopPropagation(); handleAdvanceStatus(order, 'EM_ROTA'); }}
-                              className="flex-1 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1"
+                              className="flex-1 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-wait text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                             >
                               <Bike className="w-3 h-3" />
-                              <span>Despachar Motoboy</span>
+                              <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Despachar Motoboy'}</span>
                             </button>
                           )}
 
                           {order.status === 'EM_ROTA' && (
                             <button
+                              disabled={Boolean(updatingOrderIds[order.id])}
                               onClick={(e) => { e.stopPropagation(); handleAdvanceStatus(order, 'ENTREGUE'); }}
-                              className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1"
+                              className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-wait text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                             >
                               <CheckCircle className="w-3 h-3" />
-                              <span>Concluir Entrega</span>
+                              <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Concluir Entrega'}</span>
                             </button>
                           )}
 
@@ -417,13 +951,15 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                             <FileText className="w-3.5 h-3.5" />
                           </button>
 
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleDeleteOrder(order); }}
-                            className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition"
-                            title="Excluir lançamento deste pedido"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          {canDeleteOrders && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDeleteOrder(order); }}
+                              className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer"
+                              title="Excluir lançamento deste pedido"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
                     );
@@ -434,6 +970,39 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
           );
         })}
       </div>
+
+      {/* Today's Canceled Orders Strip (if any canceled today) */}
+      {todayCanceledOrders.length > 0 && (
+        <div className="bg-rose-50/70 border border-rose-200 rounded-2xl p-3.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <h4 className="text-xs font-extrabold text-rose-900 flex items-center gap-1.5">
+              <XCircle className="w-4 h-4 text-rose-600" />
+              <span>Pedidos Cancelados Hoje ({todayCanceledOrders.length})</span>
+            </h4>
+            <span className="text-[11px] text-rose-700">Clique para inspecionar motivo ou imprimir estorno</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            {todayCanceledOrders.map((order) => (
+              <div
+                key={order.id}
+                onClick={() => setSelectedOrderForModal(order)}
+                className="bg-white rounded-xl p-2.5 border border-rose-200 hover:border-rose-400 transition cursor-pointer flex items-center justify-between gap-2 text-xs"
+              >
+                <div className="min-w-0">
+                  <span className="font-black font-mono text-rose-900">{order.orderNumber}</span>
+                  <span className="text-slate-700 font-semibold ml-1.5 truncate">{order.customer.name}</span>
+                  {order.cancellationReason && (
+                    <p className="text-[10px] text-rose-700 truncate">{order.cancellationReason}</p>
+                  )}
+                </div>
+                <span className="font-bold text-rose-800 font-mono shrink-0">{formatCurrency(order.totalAmount)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      </>
+      )}
 
       {/* DETAILED ORDER MODAL */}
       {selectedOrderForModal && (
@@ -504,18 +1073,20 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                     Retirada no Balcão do Estabelecimento ({config.address})
                   </p>
                 ) : (
-                  <>
-                    <p className="font-semibold text-slate-800">
-                      {selectedOrderForModal.customer.address.street}, {selectedOrderForModal.customer.address.number}
-                      {selectedOrderForModal.customer.address.complement && ` · ${selectedOrderForModal.customer.address.complement}`}
-                    </p>
-                    <p className="text-slate-500">
-                      {selectedOrderForModal.customer.address.neighborhood} · {selectedOrderForModal.customer.address.city}
-                    </p>
-                    {selectedOrderForModal.customer.address.reference && (
-                      <p className="text-amber-800 mt-0.5">Ref: {selectedOrderForModal.customer.address.reference}</p>
-                    )}
-                  </>
+                  (() => {
+                    const addrInfo = formatAddressDetails(selectedOrderForModal.customer.address);
+                    return (
+                      <>
+                        <p className="font-semibold text-slate-800">{addrInfo.primaryLine}</p>
+                        {addrInfo.secondaryLine && (
+                          <p className="text-slate-500">{addrInfo.secondaryLine}</p>
+                        )}
+                        {addrInfo.referenceLine && (
+                          <p className="text-amber-800 mt-0.5">Ref: {addrInfo.referenceLine}</p>
+                        )}
+                      </>
+                    );
+                  })()
                 )}
                 {selectedOrderForModal.customer.notes && (
                   <p className="text-slate-700 bg-white p-2 rounded-lg mt-1 border border-slate-200">
@@ -567,13 +1138,57 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                 <span>Total Geral</span>
                 <span className="text-amber-800">{formatCurrency(selectedOrderForModal.totalAmount)}</span>
               </div>
-              <div className="flex justify-between text-[11px] text-slate-500 pt-1">
+              <div className="flex justify-between items-center text-[11px] text-slate-500 pt-1 gap-2">
                 <span>Pagamento:</span>
-                <span className="font-semibold text-slate-800">
-                  {getPaymentMethodLabel(selectedOrderForModal.paymentMethod)} ({selectedOrderForModal.paymentStatus})
+                <span className="font-semibold text-slate-800 flex items-center gap-1.5 flex-wrap justify-end">
+                  <span>{getPaymentMethodLabel(selectedOrderForModal.paymentMethod)}</span>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                    selectedOrderForModal.paymentStatus === 'PAGO'
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-amber-100 text-amber-900'
+                  }`}>
+                    {selectedOrderForModal.paymentStatus}
+                  </span>
                   {selectedOrderForModal.paymentChangeFor ? ` · Troco p/ ${formatCurrency(selectedOrderForModal.paymentChangeFor)}` : ''}
                 </span>
               </div>
+              {selectedOrderForModal.paymentMethod === 'PIX' && selectedOrderForModal.pixTxId && (
+                <div className="flex justify-between text-[11px] text-slate-500">
+                  <span>TXID PIX:</span>
+                  <span className="font-mono font-semibold text-slate-700">{selectedOrderForModal.pixTxId}</span>
+                </div>
+              )}
+              {selectedOrderForModal.paymentStatus === 'PENDENTE' &&
+                selectedOrderForModal.status !== 'CANCELADO' &&
+                canConfirmPayments && (
+                  <div className="pt-2 border-t border-slate-200/80 space-y-2">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-[10px] text-amber-800 font-medium">
+                        Conferência manual: confirme somente após validar o recebimento.
+                      </span>
+                      <button
+                        type="button"
+                        disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
+                        onClick={() => handleConfirmManualPayment(selectedOrderForModal)}
+                        className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold rounded-lg text-[11px] transition cursor-pointer"
+                      >
+                        {updatingOrderIds[selectedOrderForModal.id] ? 'Confirmando...' : 'Confirmar Pagamento Recebido (Manual)'}
+                      </button>
+                    </div>
+                    {paymentConfirmNotice && paymentConfirmNotice.orderId === selectedOrderForModal.id && (
+                      <div
+                        className={`p-2 rounded-lg text-[11px] font-semibold flex items-center gap-1.5 ${
+                          paymentConfirmNotice.type === 'error'
+                            ? 'bg-rose-50 text-rose-800 border border-rose-200'
+                            : 'bg-amber-50 text-amber-900 border border-amber-200'
+                        }`}
+                      >
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        <span>{paymentConfirmNotice.message}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
             </div>
 
             {/* Refund & Cancellation Audit Card (se o pedido foi cancelado e estornado) */}
@@ -715,29 +1330,35 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
 
             {/* Advance Status Controls */}
             <div className="space-y-2 pt-2">
-              <span className="text-xs font-bold text-slate-700 block">Alterar Status:</span>
+              <span className="text-xs font-bold text-slate-700 block">
+                Alterar Status:{updatingOrderIds[selectedOrderForModal.id] ? ' (Sincronizando...)' : ''}
+              </span>
               <div className="grid grid-cols-3 gap-2">
                 <button
+                  disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
                   onClick={() => handleAdvanceStatus(selectedOrderForModal, 'EM_PREPARO')}
-                  className="py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 rounded-xl text-xs font-bold transition"
+                  className="py-2 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 text-blue-800 border border-blue-200 rounded-xl text-xs font-bold transition cursor-pointer"
                 >
                   Em Produção
                 </button>
                 <button
+                  disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
                   onClick={() => handleAdvanceStatus(selectedOrderForModal, 'PRONTO')}
-                  className="py-2 bg-purple-50 hover:bg-purple-100 text-purple-800 border border-purple-200 rounded-xl text-xs font-bold transition"
+                  className="py-2 bg-purple-50 hover:bg-purple-100 disabled:opacity-50 text-purple-800 border border-purple-200 rounded-xl text-xs font-bold transition cursor-pointer"
                 >
                   Pronto
                 </button>
                 <button
+                  disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
                   onClick={() => handleAdvanceStatus(selectedOrderForModal, 'EM_ROTA')}
-                  className="py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold transition"
+                  className="py-2 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-50 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold transition cursor-pointer"
                 >
                   Em Rota (Motoboy)
                 </button>
                 <button
+                  disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
                   onClick={() => handleAdvanceStatus(selectedOrderForModal, 'ENTREGUE')}
-                  className="py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold transition col-span-2"
+                  className="py-2 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold transition col-span-2 cursor-pointer"
                 >
                   Finalizar (Entregue)
                 </button>
@@ -750,23 +1371,26 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                   </button>
                 ) : (
                   <button
+                    disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
                     onClick={() => handleOpenCancelModal(selectedOrderForModal)}
-                    className="py-2 bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 rounded-xl text-xs font-bold transition cursor-pointer"
+                    className="py-2 bg-rose-50 hover:bg-rose-100 disabled:opacity-50 text-rose-800 border border-rose-200 rounded-xl text-xs font-bold transition cursor-pointer"
                   >
                     Cancelar / Devolver
                   </button>
                 )}
               </div>
 
-              <div className="pt-2 border-t border-slate-100 flex justify-end">
-                <button
-                  onClick={() => handleDeleteOrder(selectedOrderForModal)}
-                  className="px-3 py-1.5 bg-rose-100 hover:bg-rose-200 text-rose-800 font-semibold rounded-xl text-xs flex items-center gap-1.5 transition"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>Excluir Lançamento deste Pedido</span>
-                </button>
-              </div>
+              {canDeleteOrders && (
+                <div className="pt-2 border-t border-slate-100 flex justify-end">
+                  <button
+                    onClick={() => handleDeleteOrder(selectedOrderForModal)}
+                    className="px-3 py-1.5 bg-rose-100 hover:bg-rose-200 text-rose-800 font-semibold rounded-xl text-xs flex items-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Excluir Lançamento deste Pedido</span>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -791,14 +1415,17 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
             {printableOrder.fulfillmentType === 'RETIRADA' || !printableOrder.customer.address ? (
               <p className="font-bold mt-1 text-[13px]">*** RETIRADA NO BALCÃO ***</p>
             ) : (
-              <>
-                <p className="font-bold mt-1">ENDEREÇO:</p>
-                <p>{printableOrder.customer.address.street}, {printableOrder.customer.address.number}</p>
-                <p>{printableOrder.customer.address.neighborhood} {printableOrder.customer.address.complement ? `- ${printableOrder.customer.address.complement}` : ''}</p>
-                {printableOrder.customer.address.reference && (
-                  <p>REF: {printableOrder.customer.address.reference}</p>
-                )}
-              </>
+              (() => {
+                const addrInfo = formatAddressDetails(printableOrder.customer.address);
+                return (
+                  <>
+                    <p className="font-bold mt-1">ENDEREÇO:</p>
+                    <p>{addrInfo.primaryLine}</p>
+                    {addrInfo.secondaryLine && <p>{addrInfo.secondaryLine}</p>}
+                    {addrInfo.referenceLine && <p>REF: {addrInfo.referenceLine}</p>}
+                  </>
+                );
+              })()
             )}
             {printableOrder.customer.notes && (
               <p className="mt-1 font-bold">OBS: {printableOrder.customer.notes}</p>
@@ -976,17 +1603,19 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
             <div className="flex gap-2 pt-2">
               <button
                 type="button"
+                disabled={isCancellingOrder}
                 onClick={() => setOrderToCancelModal(null)}
-                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition"
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 rounded-xl text-xs font-bold transition"
               >
                 Voltar
               </button>
               <button
                 type="button"
+                disabled={isCancellingOrder}
                 onClick={handleConfirmCancelOrder}
-                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition shadow-xs"
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer"
               >
-                Confirmar Cancelamento
+                {isCancellingOrder ? 'Confirmando...' : 'Confirmar Cancelamento'}
               </button>
             </div>
           </div>

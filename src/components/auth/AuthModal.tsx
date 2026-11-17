@@ -24,6 +24,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const firebaseStatus = store.getFirebaseStatus();
 
   if (!isOpen) return null;
 
@@ -41,6 +42,19 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
     const res = await store.login(loginIdentifier, loginPassword);
     setLoading(false);
 
+    if (res.success && res.user) {
+      onSuccess(res.user);
+      onClose();
+    } else {
+      setError(res.message);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    setError(null);
+    setLoading(true);
+    const res = await store.loginWithGoogle();
+    setLoading(false);
     if (res.success && res.user) {
       onSuccess(res.user);
       onClose();
@@ -75,6 +89,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
 
         {/* Content Form */}
         <div className="p-6 space-y-4">
+          {!firebaseStatus.isConfigured && (
+            <div className="p-3 bg-amber-50 border border-amber-200 text-amber-900 rounded-xl text-[11px] flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 mt-0.5" />
+              <span>
+                <strong>Modo Contingência Local:</strong> Firebase não configurado neste dispositivo. Autenticação local sem sincronização na nuvem.
+              </span>
+            </div>
+          )}
+
           {error && (
             <div className="p-3.5 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2.5 animate-in fade-in">
               <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
@@ -133,6 +156,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
               <LogIn className="w-3.5 h-3.5" />
               <span>{loading ? 'Validando Acesso...' : 'Entrar no Sistema'}</span>
             </button>
+
+            {firebaseStatus.isConfigured && (
+              <button
+                type="button"
+                onClick={handleGoogleLogin}
+                disabled={loading}
+                className="w-full py-2.5 bg-white hover:bg-slate-50 text-[#2C1810] border border-[#E8DFD5] font-bold rounded-xl text-xs shadow-xs flex items-center justify-center gap-2 transition cursor-pointer disabled:opacity-50"
+              >
+                <LogIn className="w-3.5 h-3.5 text-[#C86D3B]" />
+                <span>Entrar com Google (Firebase Auth)</span>
+              </button>
+            )}
           </form>
         </div>
       </div>

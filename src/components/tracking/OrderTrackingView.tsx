@@ -393,7 +393,15 @@ export const OrderTrackingView: React.FC<OrderTrackingViewProps> = ({
             </div>
             <div className="flex justify-between text-xs text-slate-500 pt-1">
               <span>Forma de Pagamento</span>
-              <span className="font-semibold text-slate-700">{getPaymentMethodLabel(order.paymentMethod)} ({order.paymentStatus === 'PAGO' ? 'Pago' : 'Pagar na Entrega'})</span>
+              <span className="font-semibold text-slate-700">
+                {getPaymentMethodLabel(order.paymentMethod)} (
+                {order.paymentStatus === 'PAGO'
+                  ? 'Pago'
+                  : order.paymentMethod === 'PIX'
+                  ? 'Aguardando Confirmação'
+                  : 'Pagar na Entrega'}
+                )
+              </span>
             </div>
           </div>
         </div>

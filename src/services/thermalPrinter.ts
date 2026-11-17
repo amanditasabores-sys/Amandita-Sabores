@@ -31,6 +31,8 @@ export interface ThermalPrinterConfig {
 
 export interface ThermalPrinterStatus {
   connected: boolean;
+  reconnecting: boolean;
+  hasSavedDevice: boolean;
   deviceName: string | null;
   mode: PrinterConnectionMode;
   bluetoothSupported: boolean;
@@ -84,11 +86,17 @@ class ThermalPrinterService {
   private writeCharacteristic: any = null;
   private listeners: ((status: ThermalPrinterStatus) => void)[] = [];
   private isPrinting = false;
+  private isReconnecting = false;
   private lastError: string | null = null;
   private lastPrintedAt: string | null = null;
 
   constructor() {
     this.config = this.loadConfig();
+    if (typeof window !== 'undefined' && typeof navigator !== 'undefined') {
+      setTimeout(() => {
+        this.tryAutoReconnectOnStartup().catch(() => {});
+      }, 300);
+    }
   }
 
   // ==========================================
@@ -137,6 +145,8 @@ class ThermalPrinterService {
 
     return {
       connected: isConnected,
+      reconnecting: this.isReconnecting,
+      hasSavedDevice: Boolean(this.config.lastDeviceId || this.bleDevice),
       deviceName: this.bleDevice?.name || this.config.lastDeviceName || null,
       mode: this.config.connectionMode,
       bluetoothSupported: this.isBluetoothSupported(),
@@ -307,6 +317,84 @@ class ThermalPrinterService {
   }
 
   /**
+   * Tentativa passiva de restauração ao iniciar/recarregar a página:
+   * Utiliza navigator.bluetooth.getDevices() quando autorizado pelo Chrome.
+   * Por segurança do navegador, o reload completo encerra handles GATT ativos;
+   * se o navegador exigir interação do operador ou a impressora estiver desligada,
+   * o estado permanece honestamente como "Desconectada" para reconexão em 1 clique.
+   */
+  public async tryAutoReconnectOnStartup(): Promise<{ success: boolean; message: string }> {
+    const nav = typeof navigator !== 'undefined' ? (navigator as any) : null;
+    if (
+      !nav?.bluetooth ||
+      typeof nav.bluetooth.getDevices !== 'function' ||
+      this.config.connectionMode !== 'bluetooth_ble' ||
+      (!this.config.lastDeviceId && !this.config.lastDeviceName)
+    ) {
+      return { success: false, message: 'Sem dispositivo BLE prévio para restauração automática.' };
+    }
+
+    if (this.gattServer?.connected && this.writeCharacteristic) {
+      return { success: true, message: 'Impressora já conectada.' };
+    }
+
+    this.isReconnecting = true;
+    this.notifyStatus();
+
+    try {
+      const devices = await nav.bluetooth.getDevices();
+      const matched = devices.find(
+        (d: any) =>
+          (this.config.lastDeviceId && d.id === this.config.lastDeviceId) ||
+          (this.config.lastDeviceName && d.name === this.config.lastDeviceName)
+      );
+
+      if (!matched || !matched.gatt) {
+        return {
+          success: false,
+          message: 'Sessão Bluetooth encerrada pelo recarregamento. Clique em Reconectar Impressora.',
+        };
+      }
+
+      this.bleDevice = matched;
+      this.setupDeviceDisconnectionListener(matched);
+
+      const server = await Promise.race([
+        matched.gatt.connect(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Tempo limite ao reconectar BLE')), 5000)),
+      ]);
+      this.gattServer = server;
+
+      const foundChar = await this.discoverWriteCharacteristic(server);
+      if (!foundChar) {
+        this.writeCharacteristic = null;
+        this.gattServer = null;
+        return {
+          success: false,
+          message: 'Impressora encontrada, mas aguardando reconexão manual da característica BLE.',
+        };
+      }
+
+      this.writeCharacteristic = foundChar;
+      this.lastError = null;
+      return {
+        success: true,
+        message: `Impressora "${matched.name || 'Térmica 58mm'}" reconectada automaticamente.`,
+      };
+    } catch {
+      this.writeCharacteristic = null;
+      this.gattServer = null;
+      return {
+        success: false,
+        message: 'Conexão BLE encerrada ao recarregar a página. Use o botão Reconectar Impressora.',
+      };
+    } finally {
+      this.isReconnecting = false;
+      this.notifyStatus();
+    }
+  }
+
+  /**
    * Reconexão resiliente sem reabrir diálogo nativo do Chrome:
    * Restaura gattServer, recupera dispositivo via getDevices() se perdido após reload,
    * e redescobre a característica de escrita ESC/POS para evitar falha de characteristic nula.
@@ -322,12 +410,19 @@ class ThermalPrinterService {
       return { success: true, message: 'Impressora já conectada e pronta.' };
     }
 
+    this.isReconnecting = true;
+    this.notifyStatus();
+
     try {
       // 1. Se o objeto de dispositivo em memória foi perdido, tenta recuperar via getDevices()
-      if (!this.bleDevice && nav.bluetooth.getDevices && this.config.lastDeviceId) {
+      if (!this.bleDevice && nav.bluetooth.getDevices && (this.config.lastDeviceId || this.config.lastDeviceName)) {
         try {
           const devices = await nav.bluetooth.getDevices();
-          const matched = devices.find((d: any) => d.id === this.config.lastDeviceId);
+          const matched = devices.find(
+            (d: any) =>
+              (this.config.lastDeviceId && d.id === this.config.lastDeviceId) ||
+              (this.config.lastDeviceName && d.name === this.config.lastDeviceName)
+          );
           if (matched) {
             this.bleDevice = matched;
             this.setupDeviceDisconnectionListener(matched);
@@ -340,7 +435,7 @@ class ThermalPrinterService {
       if (!this.bleDevice || !this.bleDevice.gatt) {
         return {
           success: false,
-          message: 'Nenhuma impressora pareada salva. Clique em "Localizar e Parear Impressora".',
+          message: 'Handle Bluetooth encerrado pelo navegador ou dispositivo fora de alcance. Clique em "Parear / Reconectar" para autorizar novamente.',
         };
       }
 
@@ -357,12 +452,10 @@ class ThermalPrinterService {
         await this.disconnectBluetooth();
         const err = 'Impressora reconectada, mas a característica de escrita BLE não foi encontrada.';
         this.lastError = err;
-        this.notifyStatus();
         return { success: false, message: err };
       }
 
       this.writeCharacteristic = foundChar;
-      this.notifyStatus();
 
       return {
         success: true,
@@ -370,9 +463,13 @@ class ThermalPrinterService {
       };
     } catch (err: any) {
       const msg = err?.message || String(err);
+      this.writeCharacteristic = null;
+      this.gattServer = null;
       this.lastError = `Falha ao reconectar impressora: ${msg}`;
-      this.notifyStatus();
       return { success: false, message: this.lastError };
+    } finally {
+      this.isReconnecting = false;
+      this.notifyStatus();
     }
   }
 
@@ -1064,9 +1161,10 @@ class ThermalPrinterService {
   }
 
   /**
-   * Envia dados ESC/POS via BLE characteristic com chunking (fatiamento de 20-50 bytes)
+   * Envia dados ESC/POS via BLE characteristic com chunking (fatiamento de 32 bytes)
+   * e tentativa automática de recuperação caso a conexão GATT tenha caído por inatividade.
    */
-  private async sendEscPosOverBluetooth(data: Uint8Array): Promise<{ success: boolean; message?: string }> {
+  private async sendEscPosOverBluetooth(data: Uint8Array, allowRetry = true): Promise<{ success: boolean; message?: string }> {
     if (!this.writeCharacteristic || !this.gattServer?.connected) {
       const reconn = await this.reconnectSavedBLE();
       if (!reconn.success || !this.writeCharacteristic) {
@@ -1092,7 +1190,19 @@ class ThermalPrinterService {
       }
       return { success: true };
     } catch (err: any) {
-      return { success: false, message: err.message || 'Erro durante envio de pacotes BLE' };
+      // Limpa handles inválidos e tenta 1 reconexão limpa se permitido
+      this.writeCharacteristic = null;
+      this.gattServer = null;
+      this.notifyStatus();
+
+      if (allowRetry) {
+        const retryReconn = await this.reconnectSavedBLE();
+        if (retryReconn.success && this.writeCharacteristic) {
+          return this.sendEscPosOverBluetooth(data, false);
+        }
+      }
+
+      return { success: false, message: err?.message || 'Erro durante envio de pacotes BLE' };
     }
   }
 

@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { store } from '../../services/store';
+import { isFirebaseReady } from '../../services/firebase';
 import { thermalPrinterService } from '../../services/thermalPrinter';
 import { MenuItem, Order, OrderItem, PaymentMethod, User, MenuItemAddon } from '../../types';
-import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel } from '../../utils/formatters';
+import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel, formatAddressDetails } from '../../utils/formatters';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
+import { generatePurchasePixPayload, generateOrderPixTxId } from '../../utils/pix';
 import { 
   ShoppingBag, 
   Search, 
@@ -34,7 +36,9 @@ import {
   MapPin,
   Bike,
   Building2,
-  Home
+  Home,
+  Copy,
+  Check
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
 
@@ -53,12 +57,14 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
   const [orders, setOrders] = useState<Order[]>(() => store.getOrders());
   const [currentShift, setCurrentShift] = useState(() => store.getCurrentCashShift());
+  const [config, setConfig] = useState(() => store.getRestaurantConfig());
 
   useEffect(() => {
     const handleUpdate = () => {
       setMenuItems(store.getMenuItems());
       setOrders(store.getOrders());
       setCurrentShift(store.getCurrentCashShift());
+      setConfig(store.getRestaurantConfig());
     };
     window.addEventListener('gestaofood_state_changed', handleUpdate);
     return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
@@ -103,6 +109,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
   // Sale finalized modal & feedback state
   const submittingRef = useRef(false);
+  const draftOrderIdRef = useRef<string | null>(null);
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
   const [saleError, setSaleError] = useState<string | null>(null);
   const [saleSuccessBanner, setSaleSuccessBanner] = useState<{ orderNumber: string; total: number; order: Order; printed?: boolean } | null>(null);
@@ -113,19 +120,29 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [orderToCancel, setOrderToCancel] = useState<Order | null>(null);
   const [cancelReason, setCancelReason] = useState('');
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const [isCancellingOrder, setIsCancellingOrder] = useState(false);
 
   // History filters
   const [historyPeriod, setHistoryPeriod] = useState<'HOJE' | 'ONTEM' | '7DIAS' | 'TODOS'>('HOJE');
   const [historyPaymentFilter, setHistoryPaymentFilter] = useState<string>('TODOS');
   const [historySearch, setHistorySearch] = useState('');
 
-  const config = store.getRestaurantConfig();
+  // Live PIX QR Code preview for PDV
+  const [posPixQrDataUrl, setPosPixQrDataUrl] = useState('');
+  const [posPixQrError, setPosPixQrError] = useState<string | null>(null);
+  const [copiedPosPix, setCopiedPosPix] = useState(false);
+  const [posPixConfirmed, setPosPixConfirmed] = useState(false);
+  const [pdvPixTxId, setPdvPixTxId] = useState<string>(() =>
+    generateOrderPixTxId('PDV', `${Date.now()}${Math.floor(Math.random() * 1000)}`)
+  );
+
   const operatorName = currentUser?.name || currentUser?.username || 'Caixa Balcão';
 
   const reloadData = () => {
     setMenuItems(store.getMenuItems());
     setOrders(store.getOrders());
     setCurrentShift(store.getCurrentCashShift());
+    setConfig(store.getRestaurantConfig());
   };
 
   // Categories list
@@ -147,9 +164,11 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     });
   }, [menuItems, searchQuery, selectedCategory]);
 
-  // Calculations
+  // Calculations (rounded cleanly to 2 decimal places)
+  const roundCurrency = (value: number) => Math.round(((Number.isFinite(value) ? value : 0) + Number.EPSILON) * 100) / 100;
+
   const subtotal = useMemo(() => {
-    return cart.reduce((acc, item) => acc + item.subtotal, 0);
+    return roundCurrency(cart.reduce((acc, item) => acc + item.subtotal, 0));
   }, [cart]);
 
   const totalCartCount = useMemo(() => {
@@ -160,19 +179,75 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     const rawVal = parseFloat(discountValue) || 0;
     if (rawVal <= 0) return 0;
     if (discountType === 'PERCENT') {
-      return (subtotal * Math.min(rawVal, 100)) / 100;
+      return roundCurrency((subtotal * Math.min(rawVal, 100)) / 100);
     }
-    return Math.min(rawVal, subtotal);
+    return roundCurrency(Math.min(rawVal, subtotal));
   }, [discountValue, discountType, subtotal]);
 
-  const deliveryFee = fulfillmentType === 'DELIVERY' ? config.deliveryFeeBase : 0;
-  const totalAmount = Math.max(0, subtotal - discountAmount + deliveryFee);
+  const deliveryFee = fulfillmentType === 'DELIVERY' ? roundCurrency(config.deliveryFeeBase || 0) : 0;
+  const totalAmount = Math.max(0, roundCurrency(subtotal - discountAmount + deliveryFee));
 
   const changeDue = useMemo(() => {
     if (paymentMethod !== 'DINHEIRO') return 0;
     const tendered = parseFloat(cashTendered) || 0;
-    return Math.max(0, tendered - totalAmount);
+    return Math.max(0, roundCurrency(tendered - totalAmount));
   }, [cashTendered, totalAmount, paymentMethod]);
+
+  const posPixPreview = useMemo(() => {
+    if (paymentMethod !== 'PIX' || totalAmount <= 0) return null;
+    return generatePurchasePixPayload({
+      pixKey: config.pixKey,
+      keyType: config.pixKeyType,
+      receiverName: config.pixReceiverName,
+      receiverCity: config.pixReceiverCity,
+      storeName: config.name,
+      amount: totalAmount,
+      txId: pdvPixTxId,
+      description: 'Venda PDV Amandita',
+    });
+  }, [paymentMethod, totalAmount, pdvPixTxId, config.pixKey, config.pixKeyType, config.pixReceiverName, config.pixReceiverCity, config.name]);
+
+  const posPixCode = posPixPreview?.success ? posPixPreview.payload : '';
+  const posPixError = posPixPreview && !posPixPreview.success ? posPixPreview.error : posPixQrError;
+
+  useEffect(() => {
+    let cancelled = false;
+    const buildPosQr = async () => {
+      if (!posPixCode) {
+        if (!cancelled) {
+          setPosPixQrDataUrl('');
+          setPosPixQrError(null);
+        }
+        return;
+      }
+
+      try {
+        const qr = await generateQRCodeDataUrl(posPixCode, { width: 220, margin: 1 });
+        if (!cancelled) {
+          setPosPixQrDataUrl(qr);
+          setPosPixQrError(null);
+        }
+      } catch {
+        if (!cancelled) {
+          setPosPixQrDataUrl('');
+          setPosPixQrError('Não foi possível gerar o QR Code PIX.');
+        }
+      }
+    };
+    buildPosQr();
+    return () => {
+      cancelled = true;
+    };
+  }, [posPixCode]);
+
+  useEffect(() => {
+    setPosPixConfirmed(false);
+  }, [paymentMethod, totalAmount]);
+
+  // Reset idempotent draft order ID whenever the operator edits cart items or payment parameters
+  useEffect(() => {
+    draftOrderIdRef.current = null;
+  }, [cart, discountValue, discountType, fulfillmentType, paymentMethod]);
 
   // Add item with cardápio mode / addons check
   const handleItemClick = (item: MenuItem) => {
@@ -187,16 +262,17 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   };
 
   const quickAddToCart = (item: MenuItem, quantity: number, addons: MenuItemAddon[], notes: string) => {
-    const addonsTotal = addons.reduce((sum, a) => sum + a.price, 0);
-    const unitPrice = item.price + addonsTotal;
+    const addonsTotal = roundCurrency(addons.reduce((sum, a) => sum + a.price, 0));
+    const unitPrice = roundCurrency(item.price + addonsTotal);
     const key = `${item.id}-${addons.map((a) => a.id).sort().join(',')}-${notes}`;
 
     setCart((prev) => {
       const existing = prev.find((i) => i.key === key);
       if (existing) {
+        const nextQty = existing.quantity + quantity;
         return prev.map((i) =>
           i.key === key
-            ? { ...i, quantity: i.quantity + quantity, subtotal: (i.quantity + quantity) * unitPrice }
+            ? { ...i, quantity: nextQty, subtotal: roundCurrency(nextQty * unitPrice) }
             : i
         );
       }
@@ -211,7 +287,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
           unitPrice,
           addons: addons.length > 0 ? addons : undefined,
           notes: notes.trim() || undefined,
-          subtotal: unitPrice * quantity,
+          subtotal: roundCurrency(unitPrice * quantity),
         },
       ];
     });
@@ -232,7 +308,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         .map((item) => {
           if (item.key === key) {
             const newQty = item.quantity + delta;
-            return newQty > 0 ? { ...item, quantity: newQty, subtotal: newQty * item.unitPrice } : null;
+            return newQty > 0 ? { ...item, quantity: newQty, subtotal: roundCurrency(newQty * item.unitPrice) } : null;
           }
           return item;
         })
@@ -245,6 +321,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   };
 
   const handleClearCart = () => {
+    draftOrderIdRef.current = null;
     setCart([]);
     setCustomerName('');
     setCustomerPhone('');
@@ -257,11 +334,18 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     setOrderNotes('');
     setDiscountValue('0');
     setCashTendered('');
+    setPosPixConfirmed(false);
+    setPdvPixTxId(generateOrderPixTxId('PDV', `${Date.now()}${Math.floor(Math.random() * 1000)}`));
   };
 
-  // Submit sale with strict idempotency lock and safe financial ordering
+  // Submit sale with strict idempotency lock and atomic financial confirmation
   const handleFinalizeSale = async () => {
     if (cart.length === 0 || isSubmitting || submittingRef.current) return;
+
+    if (paymentMethod === 'PIX' && (Boolean(posPixError) || !posPixCode)) {
+      setSaleError(posPixError || 'Não foi possível gerar o código PIX. Verifique a chave PIX nas configurações da loja.');
+      return;
+    }
 
     if (paymentMethod === 'DINHEIRO') {
       const tendered = parseFloat(cashTendered) || 0;
@@ -279,25 +363,33 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       // Build formatted address for delivery if applicable
       let formattedAddress = undefined;
       if (fulfillmentType === 'DELIVERY') {
-        const condoTitle = deliveryCondo === 'Outros'
-          ? (deliveryCondoCustom.trim() || 'Outro Condomínio / Endereço')
-          : (deliveryCondo ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || 'Entrega'));
+        const hasPresetCondo = deliveryCondo === 'Eco Way' || deliveryCondo === 'Eco Fit';
+        const resolvedCondo = hasPresetCondo
+          ? `Condomínio ${deliveryCondo}`
+          : (deliveryCondoCustom.trim() || undefined);
 
         formattedAddress = {
-          condominium: deliveryCondo && deliveryCondo !== 'Outros' ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || undefined),
-          street: condoTitle,
+          condominium: resolvedCondo,
+          street: resolvedCondo || 'Endereço de Entrega',
           number: (deliveryAp.trim() || deliveryBloco.trim()) ? undefined : 'S/N',
           block: deliveryBloco.trim() || undefined,
           apartment: deliveryAp.trim() || undefined,
-          neighborhood: deliveryCondo ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || 'Bairro'),
+          neighborhood: hasPresetCondo ? `Condomínio ${deliveryCondo}` : (deliveryCondoCustom.trim() || undefined),
           complement: undefined,
           city: config.city || 'Campina Grande',
           reference: deliveryReference.trim() || undefined,
         };
       }
 
-      // Step 1: Record Order
-      const syncResult = await store.createOrderAsync({
+      const resolvedPaymentStatus: 'PAGO' | 'PENDENTE' =
+        paymentMethod === 'PIX' ? (posPixConfirmed ? 'PAGO' : 'PENDENTE') : 'PAGO';
+
+      if (!draftOrderIdRef.current) {
+        draftOrderIdRef.current = `ord-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      }
+
+      const orderPayload = {
+        id: draftOrderIdRef.current,
         fulfillmentType,
         customer: {
           name: customerName.trim() || (fulfillmentType === 'RETIRADA' ? 'Cliente Balcão' : 'Cliente Entrega'),
@@ -305,50 +397,70 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
           address: formattedAddress,
           notes: orderNotes.trim() || undefined,
         },
-        items: cart.map(({ key, ...item }) => item),
+        items: cart.map(({ key, ...item }) => ({
+          ...item,
+          unitPrice: roundCurrency(item.unitPrice),
+          subtotal: roundCurrency(item.subtotal),
+        })),
         subtotal,
         deliveryFee,
         discount: discountAmount,
         totalAmount,
         paymentMethod,
+        pixCode: paymentMethod === 'PIX' && posPixCode ? posPixCode : undefined,
+        pixTxId: paymentMethod === 'PIX' ? pdvPixTxId : undefined,
+        pixDescription: paymentMethod === 'PIX' ? 'Venda PDV Amandita' : undefined,
         paymentChangeFor: paymentMethod === 'DINHEIRO' ? (parseFloat(cashTendered) || totalAmount) : undefined,
         cashReceived: paymentMethod === 'DINHEIRO' ? (parseFloat(cashTendered) || totalAmount) : undefined,
-        changeAmount: paymentMethod === 'DINHEIRO' ? Math.max(0, (parseFloat(cashTendered) || totalAmount) - totalAmount) : undefined,
+        changeAmount: paymentMethod === 'DINHEIRO' ? Math.max(0, roundCurrency((parseFloat(cashTendered) || totalAmount) - totalAmount)) : undefined,
         createdBy: operatorName || 'Operador PDV',
         processedBy: operatorName || 'Operador PDV',
-        paymentStatus: 'PAGO',
-        status: 'EM_PREPARO', // Direct to kitchen
+        paymentStatus: resolvedPaymentStatus,
+        status: 'EM_PREPARO' as const,
         estimatedDeliveryMinutes: fulfillmentType === 'RETIRADA' ? 15 : config.avgDeliveryTimeMinutes,
-      });
-      const newOrder = syncResult.order;
+      };
 
-      // Step 2: Record Cash Register Movement if cash shift is open
-      const shift = store.getCurrentCashShift();
-      if (shift && shift.status === 'ABERTO') {
-        store.addCashMovement(
-          'VENDA',
-          totalAmount,
-          `Venda PDV Balcão ${newOrder.orderNumber} - ${customerName || 'Balcão'}`,
-          operatorName,
-          paymentMethod,
-          newOrder.id,
-          newOrder.orderNumber
-        );
+      let committedOrder: Order | null = null;
+
+      if (resolvedPaymentStatus === 'PAGO') {
+        const atomicRes = await store.createAndConfirmPaidOrderAsync(orderPayload, operatorName);
+        if (!atomicRes.order || atomicRes.rejected || atomicRes.uncertain) {
+          setSaleError(
+            atomicRes.error ||
+              'Não foi possível concluir a venda paga e registrar no caixa. Os itens foram preservados para nova tentativa.'
+          );
+          return;
+        }
+        committedOrder = atomicRes.order;
+      } else {
+        const requireCloudConfirm = isFirebaseReady();
+        const pendingRes = await store.createOrderAsync(orderPayload, {
+          requireServerConfirmation: requireCloudConfirm,
+        });
+        if (requireCloudConfirm && !pendingRes.synced) {
+          setSaleError(
+            pendingRes.error ||
+              'Não foi possível registrar o pedido PIX pendente no servidor. Os itens foram preservados.'
+          );
+          return;
+        }
+        committedOrder = pendingRes.order;
       }
 
-      // Step 3: Clear cart and inputs immediately so sale is committed and cannot be re-submitted
+      // Only clear cart, reset draft ID, close drawer, and show success AFTER confirmed persistence
+      draftOrderIdRef.current = null;
       handleClearCart();
       setIsCartDrawerOpen(false);
       reloadData();
       if (onOrderCreated) onOrderCreated();
       setCompletedOrder(null);
 
-      // Step 4: Auto-print thermal receipt AFTER sale and cash shift are confirmed
+      // Auto-print thermal receipt AFTER sale and cash shift are confirmed
       let printSuccess = false;
       try {
         const printerCfg = thermalPrinterService.getConfig();
-        if (printerCfg.enabled && printerCfg.autoPrintPickup && newOrder.fulfillmentType === 'RETIRADA') {
-          await thermalPrinterService.printOrder(newOrder);
+        if (printerCfg.enabled && printerCfg.autoPrintPickup && committedOrder.fulfillmentType === 'RETIRADA') {
+          await thermalPrinterService.printOrder(committedOrder);
           printSuccess = true;
         }
       } catch (printErr) {
@@ -356,11 +468,10 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
         printSuccess = false;
       }
 
-      // Step 5: Show clear confirmation feedback with instant reprint access
       setSaleSuccessBanner({
-        orderNumber: newOrder.orderNumber,
-        total: newOrder.totalAmount,
-        order: newOrder,
+        orderNumber: committedOrder.orderNumber,
+        total: committedOrder.totalAmount,
+        order: committedOrder,
         printed: printSuccess,
       });
       setTimeout(() => setSaleSuccessBanner(null), 8000);
@@ -425,25 +536,32 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     setCancelError(null);
   };
 
-  const handleExecuteCancelSale = () => {
-    if (!orderToCancel) return;
+  const handleExecuteCancelSale = async () => {
+    if (!orderToCancel || isCancellingOrder) return;
     if (!cancelReason.trim()) {
       setCancelError('Por favor informe o motivo obrigatório do cancelamento.');
       return;
     }
 
-    const res = store.cancelOrder(orderToCancel.id, cancelReason.trim(), operatorName);
-    if (!res.success) {
-      setCancelError(res.message);
-      return;
-    }
+    setIsCancellingOrder(true);
+    setCancelError(null);
+    const targetId = orderToCancel.id;
+    try {
+      const res = await store.cancelOrderAsync(targetId, cancelReason.trim(), operatorName);
+      if (!res.success) {
+        setCancelError(res.message);
+        return;
+      }
 
-    const cancelledOrder = store.getOrderById(orderToCancel.id);
-    setOrderToCancel(null);
-    reloadData();
+      const cancelledOrder = store.getOrderById(targetId);
+      setOrderToCancel(null);
+      reloadData();
 
-    if (cancelledOrder?.refundInfo) {
-      thermalPrinterService.printRefundReceipt(cancelledOrder);
+      if (cancelledOrder?.refundInfo) {
+        thermalPrinterService.printRefundReceipt(cancelledOrder);
+      }
+    } finally {
+      setIsCancellingOrder(false);
     }
   };
 
@@ -842,6 +960,77 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             </div>
           )}
 
+          {/* If PIX: Live QR Code & Copia e Cola with exact order amount */}
+          {paymentMethod === 'PIX' && totalAmount > 0 && (
+            <div className="p-3 bg-cyan-50/70 rounded-xl border border-cyan-200 text-xs space-y-2 animate-in fade-in">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-cyan-950 flex items-center gap-1.5">
+                  <QrCode className="w-3.5 h-3.5 text-cyan-700" />
+                  <span>PIX Exato ({formatCurrency(totalAmount)})</span>
+                </span>
+                <span className="text-[10px] font-semibold text-cyan-800">
+                  {config.pixReceiverName || config.name}
+                </span>
+              </div>
+
+              {posPixError ? (
+                <div className="p-2 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-[11px] font-medium">
+                  {posPixError}
+                </div>
+              ) : (
+                <>
+                  {posPixQrDataUrl && (
+                    <div className="flex justify-center bg-white p-2 rounded-xl border border-cyan-100">
+                      <img src={posPixQrDataUrl} alt="QR Code PIX PDV" className="w-36 h-36 object-contain" />
+                    </div>
+                  )}
+                  {posPixCode && (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] text-cyan-900 font-mono">
+                        <span>TXID: <strong>{pdvPixTxId}</strong></span>
+                        <span>Valor exato</span>
+                      </div>
+                      <div className="p-2 bg-white border border-cyan-200 rounded-lg font-mono text-[10px] text-slate-700 break-all max-h-16 overflow-y-auto select-all">
+                        {posPixCode}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(posPixCode);
+                          setCopiedPosPix(true);
+                          setTimeout(() => setCopiedPosPix(false), 2000);
+                        }}
+                        className="w-full py-1.5 px-2.5 bg-white hover:bg-cyan-50 text-cyan-950 border border-cyan-300 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                      >
+                        {copiedPosPix ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        <span>{copiedPosPix ? 'Código PIX Copiado!' : 'Copiar PIX Copia e Cola'}</span>
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-[10px] text-cyan-950 leading-tight bg-cyan-100/70 p-2 rounded-lg border border-cyan-200">
+                    <strong>Conferência manual:</strong> gerar o QR Code não confirma o recebimento automaticamente. Verifique no app do banco antes de marcar como pago.
+                  </p>
+                  <label className="flex items-start gap-2 p-2 bg-white border border-cyan-200 rounded-lg cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={posPixConfirmed}
+                      onChange={(e) => setPosPixConfirmed(e.target.checked)}
+                      className="mt-0.5 w-3.5 h-3.5 rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-[11px] font-semibold text-[#2C1810] leading-snug">
+                      Recebimento PIX já conferido no banco (marcar pedido como PAGO)
+                      {!posPixConfirmed && (
+                        <span className="block text-[10px] font-normal text-amber-800">
+                          Desmarcado: o pedido será registrado com pagamento PENDENTE até conferência manual.
+                        </span>
+                      )}
+                    </span>
+                  </label>
+                </>
+              )}
+            </div>
+          )}
+
           {/* Order Notes */}
           <div>
             <label className="block text-[10px] font-bold text-[#6B4B3E] uppercase mb-1">
@@ -894,7 +1083,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
           <div className="space-y-2">
             <button
               onClick={handleFinalizeSale}
-              disabled={isSubmitting || cart.length === 0}
+              disabled={isSubmitting || cart.length === 0 || (paymentMethod === 'PIX' && (Boolean(posPixError) || !posPixCode))}
               className="w-full py-3.5 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] hover:opacity-95 text-white font-extrabold rounded-xl text-sm shadow-md flex items-center justify-center gap-2 transition cursor-pointer active:scale-[0.99] disabled:opacity-50"
             >
               <CheckCircle2 className="w-5 h-5" />
@@ -928,12 +1117,27 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               <div className="min-w-0">
                 <h4 className="font-black text-sm text-white">Venda {saleSuccessBanner.orderNumber} Registrada com Sucesso!</h4>
                 <p className="text-xs text-emerald-200 font-mono">
-                  {formatCurrency(saleSuccessBanner.total)} · Pedido enviado para a Cozinha
+                  {formatCurrency(saleSuccessBanner.total)} · {saleSuccessBanner.order.paymentStatus === 'PENDENTE' ? 'PIX Aguardando Confirmação' : 'Pedido enviado para a Cozinha'}
                   {saleSuccessBanner.printed ? ' · Cupom Impresso' : ' · Cupom não impresso'}
                 </p>
               </div>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
+              {saleSuccessBanner.order.paymentMethod === 'PIX' && saleSuccessBanner.order.pixCode && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(saleSuccessBanner.order.pixCode!);
+                    setCopiedPosPix(true);
+                    setTimeout(() => setCopiedPosPix(false), 2000);
+                  }}
+                  className="px-2.5 py-1.5 bg-cyan-700 hover:bg-cyan-600 text-white rounded-xl text-xs font-bold transition flex items-center gap-1 cursor-pointer"
+                  title="Copiar PIX Copia e Cola do Pedido"
+                >
+                  {copiedPosPix ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span className="hidden sm:inline">{copiedPosPix ? 'Copiado!' : 'PIX'}</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => thermalPrinterService.printOrder(saleSuccessBanner.order, { forceReprint: true })}
@@ -1307,8 +1511,15 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                             </p>
                           </td>
                           <td className="py-3 px-4">
-                            <span className="font-semibold text-[#3D2314]">
+                            <span className="font-semibold text-[#3D2314] block">
                               {getPaymentMethodLabel(order.paymentMethod)}
+                            </span>
+                            <span className={`inline-block mt-0.5 px-1.5 py-0.2 rounded text-[9px] font-bold ${
+                              order.paymentStatus === 'PAGO'
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : 'bg-amber-100 text-amber-900'
+                            }`}>
+                              {order.paymentStatus === 'PAGO' ? 'PAGO' : 'PENDENTE'}
                             </span>
                           </td>
                           <td className="py-3 px-4 font-black text-[#721C24]">
@@ -1727,17 +1938,19 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             <div className="flex gap-2">
               <button
                 type="button"
+                disabled={isCancellingOrder}
                 onClick={() => setOrderToCancel(null)}
-                className="flex-1 py-2.5 bg-[#FAF7F2] text-[#3D2314] font-bold rounded-xl text-xs border border-[#E8DFD5] cursor-pointer"
+                className="flex-1 py-2.5 bg-[#FAF7F2] text-[#3D2314] font-bold rounded-xl text-xs border border-[#E8DFD5] disabled:opacity-50 cursor-pointer"
               >
                 Voltar
               </button>
               <button
                 type="button"
+                disabled={isCancellingOrder}
                 onClick={handleExecuteCancelSale}
-                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition cursor-pointer shadow-xs"
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white font-bold rounded-xl text-xs transition cursor-pointer shadow-xs"
               >
-                Confirmar Cancelamento
+                {isCancellingOrder ? 'Cancelando...' : 'Confirmar Cancelamento'}
               </button>
             </div>
           </div>
@@ -1761,12 +1974,18 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
             <p>CLIENTE: {printableOrder.customer.name}</p>
             {printableOrder.customer.phone && <p>TEL: {printableOrder.customer.phone}</p>}
             <p>TIPO: {printableOrder.fulfillmentType === 'RETIRADA' ? 'BALCÃO / RETIRADA' : 'DELIVERY'}</p>
-            {printableOrder.fulfillmentType === 'DELIVERY' && printableOrder.customer.address && (
-              <p className="font-bold">ENTREGA: {printableOrder.customer.address.street}, {printableOrder.customer.address.number} {printableOrder.customer.address.complement ? `(${printableOrder.customer.address.complement})` : ''}</p>
-            )}
-            {printableOrder.customer.address?.reference && (
-              <p className="text-[11px] italic">REF: {printableOrder.customer.address.reference}</p>
-            )}
+            {printableOrder.fulfillmentType === 'DELIVERY' && printableOrder.customer.address && (() => {
+              const addr = formatAddressDetails(printableOrder.customer.address);
+              return (
+                <div className="space-y-0.5">
+                  <p className="font-bold">ENTREGA: {addr.primaryLine}</p>
+                  {addr.secondaryLine && <p>{addr.secondaryLine}</p>}
+                  {addr.referenceLine && (
+                    <p className="text-[11px] italic">REF: {addr.referenceLine}</p>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           <div className="py-2 border-b border-dashed border-black space-y-1">

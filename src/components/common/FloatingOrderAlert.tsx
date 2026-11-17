@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { soundService } from '../../services/audio';
 import { Order } from '../../types';
-import { formatCurrency } from '../../utils/formatters';
+import { formatCurrency, formatAddressDetails } from '../../utils/formatters';
 import { Bell, Volume2, CheckCircle, Eye, X, Utensils, Bike, Store as StoreIcon } from 'lucide-react';
 
 interface FloatingOrderAlertProps {
@@ -180,10 +180,10 @@ export const FloatingOrderAlert: React.FC<FloatingOrderAlertProps> = ({ onOpenOr
           </div>
 
           {current.fulfillmentType === 'DELIVERY' && current.customer.address && (
-            <div className="text-[11px] text-[#2C1810] bg-white p-2 rounded-lg border border-[#E8DFD5] flex items-center gap-1.5">
-              <Bike className="w-3.5 h-3.5 text-[#C86D3B] shrink-0" />
-              <span className="font-semibold truncate">
-                {current.customer.address.street}, {current.customer.address.number} {current.customer.address.complement ? `(${current.customer.address.complement})` : ''}
+            <div className="text-[11px] text-[#2C1810] bg-white p-2 rounded-lg border border-[#E8DFD5] flex items-start gap-1.5">
+              <Bike className="w-3.5 h-3.5 text-[#C86D3B] shrink-0 mt-0.5" />
+              <span className="font-semibold line-clamp-2">
+                {formatAddressDetails(current.customer.address).fullSingleLine}
               </span>
             </div>
           )}

@@ -1,4 +1,53 @@
-import { OrderStatus, PaymentMethod } from '../types';
+import { CustomerAddress, OrderStatus, PaymentMethod } from '../types';
+
+export const APP_TIMEZONE = 'America/Fortaleza';
+
+export function getFortalezaDateKey(dateInput?: string | Date | number): string {
+  try {
+    const date = dateInput === undefined ? new Date() : new Date(dateInput);
+    if (Number.isNaN(date.getTime())) {
+      if (typeof dateInput === 'string' && /^\d{4}-\d{2}-\d{2}/.test(dateInput)) {
+        return dateInput.slice(0, 10);
+      }
+      return '';
+    }
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: APP_TIMEZONE,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const year = parts.find((p) => p.type === 'year')?.value;
+    const month = parts.find((p) => p.type === 'month')?.value;
+    const day = parts.find((p) => p.type === 'day')?.value;
+    if (year && month && day) {
+      return `${year}-${month}-${day}`;
+    }
+    return date.toISOString().slice(0, 10);
+  } catch {
+    return '';
+  }
+}
+
+export function formatFortalezaDateLabel(dateKeyOrIso: string): string {
+  if (!dateKeyOrIso) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateKeyOrIso)) {
+    const [y, m, d] = dateKeyOrIso.split('-');
+    return `${d}/${m}/${y}`;
+  }
+  try {
+    const date = new Date(dateKeyOrIso);
+    if (Number.isNaN(date.getTime())) return dateKeyOrIso;
+    return new Intl.DateTimeFormat('pt-BR', {
+      timeZone: APP_TIMEZONE,
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    }).format(date);
+  } catch {
+    return dateKeyOrIso;
+  }
+}
 
 export function formatCurrency(value: number): string {
   return new Intl.NumberFormat('pt-BR', {
@@ -11,6 +60,7 @@ export function formatDateTime(isoString: string): string {
   try {
     const date = new Date(isoString);
     return new Intl.DateTimeFormat('pt-BR', {
+      timeZone: APP_TIMEZONE,
       day: '2-digit',
       month: '2-digit',
       year: 'numeric',
@@ -26,6 +76,7 @@ export function formatTime(isoString: string): string {
   try {
     const date = new Date(isoString);
     return new Intl.DateTimeFormat('pt-BR', {
+      timeZone: APP_TIMEZONE,
       hour: '2-digit',
       minute: '2-digit',
     }).format(date);
@@ -126,41 +177,159 @@ export function getPaymentMethodLabel(method: PaymentMethod): string {
   }
 }
 
-export function formatCustomerAddress(customer?: { name?: string; address?: { condominium?: string; block?: string; apartment?: string; street?: string; number?: string; neighborhood?: string; complement?: string; city?: string; reference?: string; } }, isRetirada?: boolean, pickupAddress = 'Balcão'): string {
+function cleanAddressToken(value?: string): string {
+  if (!value) return '';
+  const trimmed = String(value).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'undefined' || trimmed.toLowerCase() === 'null') {
+    return '';
+  }
+  return trimmed;
+}
+
+function isPlaceholderNeighborhoodOrStreet(value: string): boolean {
+  const norm = value.toLowerCase();
+  return (
+    norm === 'condomínio outros' ||
+    norm === 'condominio outros' ||
+    norm === 'outros' ||
+    norm === 'residência' ||
+    norm === 'residencia' ||
+    norm === 'outro condomínio / endereço' ||
+    norm === 'outro condominio / endereco'
+  );
+}
+
+export interface FormattedAddressDetails {
+  primaryLine: string;
+  secondaryLine: string;
+  referenceLine?: string;
+  fullSingleLine: string;
+  navigationQuery: string;
+  condoUnitLine?: string;
+}
+
+export function formatAddressDetails(address?: CustomerAddress): FormattedAddressDetails {
+  if (!address) {
+    return {
+      primaryLine: 'Endereço não informado',
+      secondaryLine: '',
+      fullSingleLine: 'Endereço não informado',
+      navigationQuery: '',
+    };
+  }
+
+  const rawCondo = cleanAddressToken(address.condominium);
+  const condominium = rawCondo && !isPlaceholderNeighborhoodOrStreet(rawCondo) ? rawCondo : '';
+  const rawStreet = cleanAddressToken(address.street);
+  const street = rawStreet && !isPlaceholderNeighborhoodOrStreet(rawStreet) ? rawStreet : '';
+  const number = cleanAddressToken(address.number);
+  const block = cleanAddressToken(address.block);
+  const apartment = cleanAddressToken(address.apartment);
+  const complement = cleanAddressToken(address.complement);
+  const rawNeighborhood = cleanAddressToken(address.neighborhood);
+  const neighborhood =
+    rawNeighborhood && !isPlaceholderNeighborhoodOrStreet(rawNeighborhood)
+      ? rawNeighborhood
+      : '';
+  const city = cleanAddressToken(address.city);
+  const reference = cleanAddressToken(address.reference);
+
+  const unitParts: string[] = [];
+  if (block) unitParts.push(`Bloco ${block}`);
+  if (apartment) unitParts.push(`Ap ${apartment}`);
+  const condoUnitLine = unitParts.length > 0 ? unitParts.join(' · ') : undefined;
+
+  const primarySegments: string[] = [];
+  if (condominium) {
+    const condoDisplay = /^condom[ií]nio\b/i.test(condominium)
+      ? condominium
+      : `Condomínio ${condominium}`;
+    primarySegments.push(condoDisplay);
+  }
+
+  const streetMatchesCondo =
+    street &&
+    condominium &&
+    street.toLowerCase().replace(/^condom[ií]nio\s+/i, '') ===
+      condominium.toLowerCase().replace(/^condom[ií]nio\s+/i, '');
+
+  if (street && !streetMatchesCondo) {
+    primarySegments.push(number ? `${street}, ${number}` : street);
+  } else if (!street && number) {
+    primarySegments.push(`Nº ${number}`);
+  } else if (street && streetMatchesCondo && number) {
+    primarySegments.push(`Nº ${number}`);
+  }
+
+  if (condoUnitLine) {
+    primarySegments.push(condoUnitLine);
+  }
+
+  const primaryLine =
+    primarySegments.length > 0
+      ? primarySegments.join(' · ')
+      : 'Endereço de entrega informado';
+
+  const secondarySegments: string[] = [];
+  const neighborhoodMatchesCondo =
+    neighborhood &&
+    condominium &&
+    neighborhood.toLowerCase().replace(/^condom[ií]nio\s+/i, '') ===
+      condominium.toLowerCase().replace(/^condom[ií]nio\s+/i, '');
+
+  if (neighborhood && !neighborhoodMatchesCondo) {
+    secondarySegments.push(neighborhood);
+  }
+  if (complement) {
+    secondarySegments.push(complement);
+  }
+  if (city) {
+    secondarySegments.push(city);
+  }
+
+  const secondaryLine = secondarySegments.join(' · ');
+
+  const singleParts: string[] = [primaryLine];
+  if (secondaryLine) singleParts.push(secondaryLine);
+  if (reference) singleParts.push(`Ref: ${reference}`);
+
+  const navParts: string[] = [];
+  if (condominium) {
+    navParts.push(
+      /^condom[ií]nio\b/i.test(condominium) ? condominium : `Condomínio ${condominium}`
+    );
+  }
+  if (street && !streetMatchesCondo) {
+    navParts.push(number ? `${street}, ${number}` : street);
+  } else if (number && (!street || streetMatchesCondo)) {
+    navParts.push(number);
+  }
+  if (neighborhood && !neighborhoodMatchesCondo) {
+    navParts.push(neighborhood);
+  }
+  if (city) {
+    navParts.push(city);
+  }
+
+  return {
+    primaryLine,
+    secondaryLine,
+    referenceLine: reference || undefined,
+    fullSingleLine: singleParts.join(' · '),
+    navigationQuery: navParts.join(', '),
+    condoUnitLine,
+  };
+}
+
+export function formatCustomerAddress(
+  customer?: { name?: string; address?: CustomerAddress },
+  isRetirada?: boolean,
+  pickupAddress = 'Balcão'
+): string {
   if (isRetirada || !customer?.address) {
     return `Retirada no Balcão (${pickupAddress})`;
   }
-  const addr = customer.address;
-  const parts: string[] = [];
-
-  if (addr.condominium) {
-    let condoText = `Condomínio ${addr.condominium}`;
-    if (addr.block) condoText += ` · Bloco ${addr.block}`;
-    if (addr.apartment) condoText += ` · Ap ${addr.apartment}`;
-    parts.push(condoText);
-  }
-
-  if (addr.street) {
-    let streetText = addr.street;
-    if (addr.number) streetText += `, ${addr.number}`;
-    if (addr.neighborhood) streetText += ` - ${addr.neighborhood}`;
-    if (addr.complement) streetText += ` (${addr.complement})`;
-    parts.push(streetText);
-  }
-
-  if (parts.length === 0) {
-    if (addr.block || addr.apartment) {
-      parts.push(`Bloco ${addr.block || '-'}, Ap ${addr.apartment || '-'}`);
-    } else {
-      parts.push('Entrega solicitada');
-    }
-  }
-
-  if (addr.reference) {
-    parts.push(`Ref: ${addr.reference}`);
-  }
-
-  return parts.join(' | ');
+  return formatAddressDetails(customer.address).fullSingleLine;
 }
 
 export function generateWhatsAppOrderMessage(params: {
