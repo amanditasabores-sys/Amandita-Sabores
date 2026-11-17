@@ -1,11 +1,11 @@
-import type { Request, Response } from 'express';
-import app from '../server.ts';
+import type { IncomingMessage, ServerResponse } from 'http';
+import { getFirebaseServerInstances } from '../src/server/firebaseAdmin.ts';
 
 // Vercel Serverless Function entry point for /api/health
-// Delegates directly to the shared Express application so health checks reflect
-// the exact same Firebase Admin/Client SDK initialization and validation state
-// without creating duplicate or conflicting SDK instances.
-export default function handler(req: Request, res: Response) {
+// Uses the lightweight shared Firebase module (independent of the full Express bundle)
+// to report real Admin/Client SDK initialization status without exposing credentials.
+export default function handler(req: IncomingMessage, res: ServerResponse) {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
 
@@ -17,15 +17,30 @@ export default function handler(req: Request, res: Response) {
     return;
   }
 
-  const rawUrl = req.url || '/api/health';
-  const queryIndex = rawUrl.indexOf('?');
-  const querySuffix = queryIndex >= 0 ? rawUrl.slice(queryIndex) : '';
-  const pathname = queryIndex >= 0 ? rawUrl.slice(0, queryIndex) : rawUrl;
-
-  if (pathname !== '/api/health' && pathname !== '/health') {
-    req.url = `/api/health${querySuffix}`;
+  try {
+    const firebase = getFirebaseServerInstances();
+    res.statusCode = 200;
+    res.end(
+      JSON.stringify({
+        status: 'online',
+        system: 'Amandita Sabores - Diagnóstico Serverless e Persistência Firestore',
+        projectId: firebase.projectId,
+        hasAdminSdk: firebase.hasAdminSdk,
+        hasClientSdk: firebase.hasClientSdk,
+        timestamp: new Date().toISOString(),
+      })
+    );
+  } catch (err: unknown) {
+    const safeMsg = err instanceof Error ? err.name : 'HealthCheckError';
+    res.statusCode = 500;
+    res.end(
+      JSON.stringify({
+        status: 'error',
+        hasAdminSdk: false,
+        hasClientSdk: false,
+        error: safeMsg,
+        timestamp: new Date().toISOString(),
+      })
+    );
   }
-
-  return app(req, res);
 }
-

@@ -1,69 +1,21 @@
 import webpush from 'web-push';
 import crypto from 'crypto';
-import { initializeApp as initClientApp, getApps as getClientApps, getApp as getClientApp } from 'firebase/app';
-import { 
-  getFirestore as getClientFirestore, 
-  doc as clientDoc, 
-  setDoc as clientSetDoc, 
-  getDocs as clientGetDocs, 
-  collection as clientCollection, 
-  deleteDoc as clientDeleteDoc 
+import {
+  doc as clientDoc,
+  setDoc as clientSetDoc,
+  getDocs as clientGetDocs,
+  collection as clientCollection,
+  deleteDoc as clientDeleteDoc,
 } from 'firebase/firestore';
-import { initializeApp as initAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
-import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
 import { getVapidConfig } from './pushConfig.ts';
+import { getFirebaseServerInstances } from './firebaseAdmin.ts';
 
-const PROJECT_ID = process.env.VITE_FIREBASE_PROJECT_ID || 'amandita-sabores';
-const API_KEY = process.env.VITE_FIREBASE_API_KEY || '';
-const AUTH_DOMAIN = process.env.VITE_FIREBASE_AUTH_DOMAIN || `${PROJECT_ID}.firebaseapp.com`;
-const STORAGE_BUCKET = process.env.VITE_FIREBASE_STORAGE_BUCKET || `${PROJECT_ID}.firebasestorage.app`;
-const SENDER_ID = process.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '';
-const APP_ID = process.env.VITE_FIREBASE_APP_ID || '';
-
-// Initialize Firebase Admin if credentials are present
-let adminDb: FirebaseFirestore.Firestore | null = null;
-try {
-  let credential = null;
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    try {
-      const parsed = typeof process.env.FIREBASE_SERVICE_ACCOUNT === 'string'
-        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-        : process.env.FIREBASE_SERVICE_ACCOUNT;
-      credential = cert(parsed);
-    } catch {}
-  } else if (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-    credential = cert({
-      projectId: PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    });
-  }
-
-  if (credential) {
-    const adminApps = getAdminApps();
-    const adminApp = adminApps.length > 0 ? adminApps[0] : initAdminApp({ credential, projectId: PROJECT_ID }, 'server-push-admin');
-    adminDb = getAdminFirestore(adminApp);
-  }
-} catch {}
-
-// Initialize Firebase Client SDK
-let clientDb: ReturnType<typeof getClientFirestore> | null = null;
-if (API_KEY) {
-  try {
-    const existingApps = getClientApps();
-    const clientApp = existingApps.length > 0
-      ? getClientApp()
-      : initClientApp({
-          apiKey: API_KEY,
-          authDomain: AUTH_DOMAIN,
-          projectId: PROJECT_ID,
-          storageBucket: STORAGE_BUCKET,
-          messagingSenderId: SENDER_ID,
-          appId: APP_ID,
-        }, 'server-push-client');
-    clientDb = getClientFirestore(clientApp);
-  } catch {}
-}
+const {
+  projectId: PROJECT_ID,
+  apiKey: API_KEY,
+  adminDb,
+  clientDb,
+} = getFirebaseServerInstances();
 
 export interface PushSubscriptionData {
   subscription: webpush.PushSubscription;

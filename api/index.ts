@@ -14,10 +14,20 @@ export default function handler(req: Request, res: Response) {
   if (
     originalUrl &&
     originalUrl.startsWith('/api/') &&
+    originalUrl !== '/api/index' &&
     (!req.url || req.url === '/api' || req.url === '/' || req.url.startsWith('/api?'))
   ) {
     req.url = originalUrl;
   }
 
-  return app(req, res);
+  try {
+    return app(req, res);
+  } catch (err: unknown) {
+    const safeMsg = err instanceof Error ? err.message : 'Erro interno no gateway da API.';
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ success: false, message: safeMsg }));
+    }
+  }
 }

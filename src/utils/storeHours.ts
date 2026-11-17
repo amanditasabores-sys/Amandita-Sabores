@@ -1,4 +1,4 @@
-import { DayOfWeekKey, DayOperatingHours, StoreClosedSettings } from '../types';
+import type { DayOfWeekKey, DayOperatingHours, StoreClosedSettings } from '../types/index.ts';
 
 export const DEFAULT_CLOSED_PRIMARY_MESSAGE = 'Não estamos funcionando no momento';
 export const DEFAULT_CLOSED_SECONDARY_MESSAGE =

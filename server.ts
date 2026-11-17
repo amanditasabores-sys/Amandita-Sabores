@@ -1,12 +1,12 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import webpush from 'web-push';
 import crypto from 'crypto';
-import { initializeApp as initClientApp, getApps as getClientApps, getApp as getClientApp } from 'firebase/app';
+import { getFirebaseServerInstances } from './src/server/firebaseAdmin.ts';
+import type { Auth as AdminAuth } from 'firebase-admin/auth';
 import { 
-  getFirestore as getClientFirestore, 
   doc as clientDoc, 
   setDoc as clientSetDoc, 
   getDoc as clientGetDoc,
@@ -14,9 +14,6 @@ import {
   collection as clientCollection, 
   deleteDoc as clientDeleteDoc 
 } from 'firebase/firestore';
-import { initializeApp as initAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
-import { getAuth as getAdminAuth } from 'firebase-admin/auth';
-import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
 import { INITIAL_MENU, OFFICIAL_ADDONS } from './src/data/initialData.ts';
 import { getVapidConfig } from './src/server/pushConfig.ts';
 import {
@@ -28,16 +25,27 @@ import {
   validateWhatsAppNumber,
 } from './src/utils/storeHours.ts';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const resolveServerDir = (): string => {
+  try {
+    if (typeof import.meta !== 'undefined' && typeof import.meta.url === 'string' && import.meta.url.startsWith('file:')) {
+      return path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {}
+  if (typeof __dirname === 'string' && __dirname) {
+    return __dirname;
+  }
+  return process.cwd();
+};
+const SERVER_DIR = resolveServerDir();
 
-// Firebase Environment Configuration
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || 'amandita-sabores';
-const API_KEY = process.env.VITE_FIREBASE_API_KEY || '';
-const AUTH_DOMAIN = process.env.VITE_FIREBASE_AUTH_DOMAIN || `${PROJECT_ID}.firebaseapp.com`;
-const STORAGE_BUCKET = process.env.VITE_FIREBASE_STORAGE_BUCKET || `${PROJECT_ID}.firebasestorage.app`;
-const SENDER_ID = process.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '';
-const APP_ID = process.env.VITE_FIREBASE_APP_ID || '';
+// Shared Firebase Environment & SDK Instances
+const firebaseServer = getFirebaseServerInstances();
+const PROJECT_ID = firebaseServer.projectId;
+const API_KEY = firebaseServer.apiKey;
+const AUTH_DOMAIN = firebaseServer.authDomain;
+const STORAGE_BUCKET = firebaseServer.storageBucket;
+const SENDER_ID = firebaseServer.messagingSenderId;
+const APP_ID = firebaseServer.appId;
 const INITIAL_ADMIN_EMAIL = (process.env.VITE_INITIAL_ADMIN_EMAIL || 'dvrmercadinho@gmail.com').trim().toLowerCase();
 
 // Official Catalog Reference Map (For strict O(1) price, product existence & addon verification)
@@ -157,7 +165,7 @@ const sentNotificationOrderIds = new Set<string>();
 // Cross-device Deleted Order Tombstone Registry (Server-backed + Admin/REST Firestore)
 const TOMBSTONES_CACHE_FILE = process.env.VERCEL
   ? '/tmp/.deleted_orders_cache.json'
-  : path.resolve(__dirname, '.deleted_orders_cache.json');
+  : path.resolve(SERVER_DIR, '.deleted_orders_cache.json');
 const serverDeletedOrderIds = new Set<string>();
 try {
   if (fs.existsSync(TOMBSTONES_CACHE_FILE)) {
@@ -172,51 +180,15 @@ try {
 } catch {}
 
 // ---------------------------------------------------------------------------
-// Firebase Server Instances Setup
+// Firebase Server Instances Setup (Unified via src/server/firebaseAdmin.ts)
 // ---------------------------------------------------------------------------
-let adminDb: FirebaseFirestore.Firestore | null = null;
-let adminAuth: ReturnType<typeof getAdminAuth> | null = null;
-try {
-  let credential = null;
-  const rawServiceAccount = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
-  if (rawServiceAccount) {
-    try {
-      const normalizedJson =
-        (rawServiceAccount.startsWith("'") && rawServiceAccount.endsWith("'")) ||
-        (rawServiceAccount.startsWith('"') && rawServiceAccount.endsWith('"') && !rawServiceAccount.startsWith('{"'))
-          ? rawServiceAccount.slice(1, -1)
-          : rawServiceAccount;
-      const parsed = JSON.parse(normalizedJson);
-      if (parsed && typeof parsed.private_key === 'string') {
-        parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
-      }
-      credential = cert(parsed);
-    } catch (parseErr) {
-      console.warn('[Server Admin] Falha ao analisar FIREBASE_SERVICE_ACCOUNT JSON:', parseErr);
-    }
-  } else if (process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-    credential = cert({
-      projectId: PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL.trim(),
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.trim().replace(/^["']|["']$/g, '').replace(/\\n/g, '\n'),
-    });
-  }
-
-  if (credential) {
-    const adminApps = getAdminApps();
-    const adminApp = adminApps.length > 0 ? adminApps[0] : initAdminApp({ credential, projectId: PROJECT_ID }, 'server-admin');
-    adminDb = getAdminFirestore(adminApp);
-    adminAuth = getAdminAuth(adminApp);
-    console.log('[Server Firebase] Firebase Admin SDK inicializado com credenciais administrativas seguras.');
-  }
-} catch (adminErr) {
-  console.warn('[Server Firebase] Admin SDK indisponível sem service account:', adminErr instanceof Error ? adminErr.message : adminErr);
-}
+let adminDb: FirebaseFirestore.Firestore | null = firebaseServer.adminDb;
+let adminAuth: AdminAuth | null = firebaseServer.adminAuth;
 
 // Strictly gated test harness hook (only active when both DISABLE_AUTO_LISTEN=1 and ALLOW_TEST_FIREBASE_OVERRIDES=1)
 export function __setTestFirebaseAdminServices(overrides: {
   adminDb?: FirebaseFirestore.Firestore | null;
-  adminAuth?: ReturnType<typeof getAdminAuth> | null;
+  adminAuth?: AdminAuth | null;
 }): void {
   if (process.env.DISABLE_AUTO_LISTEN !== '1' || process.env.ALLOW_TEST_FIREBASE_OVERRIDES !== '1') {
     throw new Error('Test Firebase admin overrides are strictly disabled outside test harness.');
@@ -297,26 +269,8 @@ async function getOrderTombstonesServer(staffToken?: string | null): Promise<str
   return Array.from(serverDeletedOrderIds);
 }
 
-// Initialize Client SDK on server for standard verified transactions
-let clientDb: ReturnType<typeof getClientFirestore> | null = null;
-if (API_KEY) {
-  try {
-    const existingApps = getClientApps();
-    const clientApp = existingApps.length > 0
-      ? getClientApp()
-      : initClientApp({
-          apiKey: API_KEY,
-          authDomain: AUTH_DOMAIN,
-          projectId: PROJECT_ID,
-          storageBucket: STORAGE_BUCKET,
-          messagingSenderId: SENDER_ID,
-          appId: APP_ID,
-        }, 'server-client');
-    clientDb = getClientFirestore(clientApp);
-  } catch (clientErr) {
-    console.warn('[Server Firebase] Client SDK init notice:', clientErr instanceof Error ? clientErr.message : clientErr);
-  }
-}
+// Shared Client SDK instance for standard verified transactions
+const clientDb = firebaseServer.clientDb;
 
 // ---------------------------------------------------------------------------
 // Helper: Serialization to Firestore REST Document Format
@@ -553,7 +507,9 @@ async function deletePushSubscription(endpoint: string, staffToken?: string): Pr
 // Persistent Push Dispatch Idempotency (Cross-Instance / Multi-Worker Safe)
 // Prevents duplicate notifications for the same order and event across Vercel serverless containers
 // ---------------------------------------------------------------------------
-const DISPATCHES_CACHE_FILE = path.join(process.cwd(), '.push_dispatches_cache.json');
+const DISPATCHES_CACHE_FILE = process.env.VERCEL
+  ? path.join('/tmp', '.push_dispatches_cache.json')
+  : path.join(process.cwd(), '.push_dispatches_cache.json');
 let pushDispatchesCache: Set<string> = new Set();
 try {
   if (fs.existsSync(DISPATCHES_CACHE_FILE)) {
@@ -1478,7 +1434,9 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
   // instantaneamente para computadores, clientes e outros dispositivos.
   // ---------------------------------------------------------------------------
   let activeDailyMenuCache: any = null;
-  const DAILY_MENU_FILE = path.join(process.cwd(), '.daily_menu_cache.json');
+  const DAILY_MENU_FILE = process.env.VERCEL
+    ? path.join('/tmp', '.daily_menu_cache.json')
+    : path.join(process.cwd(), '.daily_menu_cache.json');
 
   try {
     if (fs.existsSync(DAILY_MENU_FILE)) {
@@ -5170,9 +5128,9 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     const PORT = 3000;
 
     if (process.env.NODE_ENV === 'production') {
-      app.use(express.static(path.resolve(__dirname, 'dist')));
+      app.use(express.static(path.resolve(SERVER_DIR, 'dist')));
       app.get('*', (_req: Request, res: Response) => {
-        res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+        res.sendFile(path.resolve(SERVER_DIR, 'dist', 'index.html'));
       });
     } else {
       const { createServer: createViteServer } = await import('vite');

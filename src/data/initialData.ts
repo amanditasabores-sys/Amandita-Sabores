@@ -1,4 +1,4 @@
-import { MenuItem, RestaurantConfig, User, Order, MenuItemAddon, Combo, DailyMenuConfig } from '../types/index';
+import type { MenuItem, RestaurantConfig, User, Order, MenuItemAddon, Combo, DailyMenuConfig } from '../types/index.ts';
 import {
   DEFAULT_OPERATING_HOURS,
   DEFAULT_CLOSED_PRIMARY_MESSAGE,
