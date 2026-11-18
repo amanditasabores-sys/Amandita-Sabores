@@ -1,5 +1,5 @@
-import { sendOrderPushNotification } from '../../src/server/pushBackendService';
-import { sendJson } from '../../src/server/pushConfig';
+import { sendOrderPushNotification } from '../../src/server/pushBackendService.js';
+import { sendJson } from '../../src/server/pushConfig.js';
 
 function readJsonBody(req: any): Promise<any> {
   if (req.body && typeof req.body === 'object') {

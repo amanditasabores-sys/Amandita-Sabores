@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from '../src/server/firebaseAdmin';
+import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from '../src/server/firebaseAdmin.js';
 
 // Standalone Vercel Serverless Function for /api/health
 // Strictly independent of server.ts, Express, Vite, and Firebase Client SDK.

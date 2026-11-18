@@ -1,9 +1,9 @@
-import type { MenuItem, RestaurantConfig, User, Order, MenuItemAddon, Combo, DailyMenuConfig } from '../types/index';
+import type { MenuItem, RestaurantConfig, User, Order, MenuItemAddon, Combo, DailyMenuConfig } from '../types/index.js';
 import {
   DEFAULT_OPERATING_HOURS,
   DEFAULT_CLOSED_PRIMARY_MESSAGE,
   DEFAULT_CLOSED_SECONDARY_MESSAGE,
-} from '../utils/storeHours';
+} from '../utils/storeHours.js';
 
 // Oficial additions as shown in the cardápio image:
 // "ADICIONAIS - R$ 3,00: Escolha qualquer um dos recheios abaixo:

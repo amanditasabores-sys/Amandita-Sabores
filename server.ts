@@ -1,6 +1,6 @@
 import express, { type Request, type Response } from 'express';
 import path from 'path';
-import { app, __setTestFirebaseAdminServices } from './src/server/app';
+import { app, __setTestFirebaseAdminServices } from './src/server/app.js';
 
 export { app, __setTestFirebaseAdminServices };
 

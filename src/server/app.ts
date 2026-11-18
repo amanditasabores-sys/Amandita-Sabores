@@ -3,10 +3,10 @@ import fs from 'fs';
 import path from 'path';
 import webpush from 'web-push';
 import crypto from 'crypto';
-import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from './firebaseAdmin';
+import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from './firebaseAdmin.js';
 import type { Auth as AdminAuth } from 'firebase-admin/auth';
-import { INITIAL_MENU, OFFICIAL_ADDONS } from '../data/initialData';
-import { getVapidConfig } from './pushConfig';
+import { INITIAL_MENU, OFFICIAL_ADDONS } from '../data/initialData.js';
+import { getVapidConfig } from './pushConfig.js';
 import {
   DEFAULT_CLOSED_PRIMARY_MESSAGE,
   DEFAULT_CLOSED_SECONDARY_MESSAGE,
@@ -14,7 +14,7 @@ import {
   normalizeClosedSettings,
   validateOperatingHours,
   validateWhatsAppNumber,
-} from '../utils/storeHours';
+} from '../utils/storeHours.js';
 
 // Shared Firebase Admin & Client Env Config (Client SDK is never loaded in serverless backend)
 const firebaseAdmin = getFirebaseAdminInstances();

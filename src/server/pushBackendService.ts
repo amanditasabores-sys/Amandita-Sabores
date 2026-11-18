@@ -1,7 +1,7 @@
 import webpush from 'web-push';
 import crypto from 'crypto';
-import { getVapidConfig } from './pushConfig';
-import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from './firebaseAdmin';
+import { getVapidConfig } from './pushConfig.js';
+import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from './firebaseAdmin.js';
 
 const adminInstances = getFirebaseAdminInstances();
 const clientConfig = getFirebaseClientConfigStatus(adminInstances.projectId);

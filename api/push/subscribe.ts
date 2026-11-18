@@ -1,5 +1,5 @@
-import { savePushSubscription } from '../../src/server/pushBackendService';
-import { sendJson } from '../../src/server/pushConfig';
+import { savePushSubscription } from '../../src/server/pushBackendService.js';
+import { sendJson } from '../../src/server/pushConfig.js';
 
 function readJsonBody(req: any): Promise<any> {
   if (req.body && typeof req.body === 'object') {

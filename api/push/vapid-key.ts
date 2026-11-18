@@ -1,4 +1,4 @@
-import { getVapidConfig, sendJson } from '../../src/server/pushConfig';
+import { getVapidConfig, sendJson } from '../../src/server/pushConfig.js';
 
 export default function handler(req: any, res: any) {
   if (req.method === 'OPTIONS') {
