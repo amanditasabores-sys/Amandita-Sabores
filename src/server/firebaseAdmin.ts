@@ -1,3 +1,4 @@
+import { createPrivateKey } from 'crypto';
 import {
   initializeApp as initAdminApp,
   cert,
@@ -40,34 +41,177 @@ interface ParsedServiceAccountResult {
   parseError: string | null;
 }
 
-function normalizePrivateKey(rawKey: string): string {
-  return rawKey
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .replace(/\\r\\n/g, '\n')
-    .replace(/\\n/g, '\n')
-    .replace(/\r\n/g, '\n');
+function unwrapQuotes(value: string): string {
+  let current = value.replace(/^\uFEFF/, '').trim();
+  for (let i = 0; i < 3; i++) {
+    if (current.startsWith('"') && current.endsWith('"')) {
+      try {
+        const parsed = JSON.parse(current);
+        if (typeof parsed === 'string') {
+          current = parsed.trim();
+          continue;
+        }
+      } catch {
+        // Fall through to simple quote stripping
+      }
+      current = current.slice(1, -1).trim();
+      continue;
+    }
+    if (current.startsWith("'") && current.endsWith("'")) {
+      current = current.slice(1, -1).trim();
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+function canonicalizePem(text: string): string {
+  const pemMatch = text.match(
+    /-{4,5}\s*BEGIN\s+([A-Z0-9 ]+?)\s*-{4,5}([\s\S]*?)-{4,5}\s*END\s+([A-Z0-9 ]+?)\s*-{4,5}/
+  );
+  if (!pemMatch) {
+    return text;
+  }
+
+  const beginLabel = pemMatch[1].replace(/\s+/g, ' ').trim();
+  const endLabel = pemMatch[3].replace(/\s+/g, ' ').trim();
+  let body = pemMatch[2];
+
+  // Remove any leftover escaped line breaks (\n, \r, \\n, \\r) and all whitespace inside the base64 body
+  body = body.replace(/\\+[rn]/g, '');
+  body = body.replace(/[\s\u00A0\uFEFF]+/g, '');
+  body = body.replace(/[\\'"]/g, '');
+
+  if (!body) {
+    return text;
+  }
+
+  // Fix missing base64 '=' padding if slightly trimmed
+  const mod4 = body.length % 4;
+  if (mod4 === 2) body += '==';
+  else if (mod4 === 3) body += '=';
+
+  const wrappedBody = body.match(/.{1,64}/g)?.join('\n') || body;
+  return `-----BEGIN ${beginLabel}-----\n${wrappedBody}\n-----END ${endLabel}-----\n`;
+}
+
+export function normalizePrivateKey(rawKey: string): string {
+  if (!rawKey) return '';
+  let current = unwrapQuotes(rawKey);
+
+  // Support URL-encoded PEM strings if pasted from an encoded query/env source
+  if (!current.includes('PRIVATE KEY') && current.includes('%20') && current.includes('PRIVATE%20KEY')) {
+    try {
+      current = decodeURIComponent(current);
+    } catch {
+      // ignore invalid URI encoding
+    }
+  } else if (current.includes('-----BEGIN') && /%[0-9A-Fa-f]{2}/.test(current)) {
+    try {
+      current = decodeURIComponent(current);
+    } catch {
+      // ignore
+    }
+  }
+
+  // Convert escaped newlines (including double-escaped \\n or \\r\\n) into actual newlines
+  current = current
+    .replace(/\\+r\\+n/g, '\n')
+    .replace(/\\+n/g, '\n')
+    .replace(/\\+r/g, '\n')
+    .replace(/\r\n?/g, '\n')
+    .trim();
+
+  // Support base64-encoded PEM passed in FIREBASE_PRIVATE_KEY or private_key
+  if (!current.includes('PRIVATE KEY')) {
+    const compact = current.replace(/\s+/g, '');
+    if (compact.length > 64 && /^[A-Za-z0-9+/=_-]+$/.test(compact)) {
+      try {
+        const normalizedB64 = compact.replace(/-/g, '+').replace(/_/g, '/');
+        const decoded = Buffer.from(normalizedB64, 'base64').toString('utf8').trim();
+        if (decoded.includes('PRIVATE KEY')) {
+          current = decoded
+            .replace(/\\+r\\+n/g, '\n')
+            .replace(/\\+n/g, '\n')
+            .replace(/\\+r/g, '\n')
+            .replace(/\r\n?/g, '\n')
+            .trim();
+        }
+      } catch {
+        // Ignore base64 decode failure
+      }
+    }
+  }
+
+  const canonical = canonicalizePem(current);
+  try {
+    createPrivateKey(canonical);
+    return canonical;
+  } catch {
+    // Attempt DER recovery when PEM headers are mismatched (e.g. PKCS#1 key labeled as PRIVATE KEY)
+    const pemMatch = canonical.match(/-----BEGIN [^-]+-----([\s\S]*?)-----END [^-]+-----/);
+    const b64 = (pemMatch ? pemMatch[1] : canonical).replace(/[^A-Za-z0-9+/=]/g, '');
+    if (b64.length >= 64) {
+      try {
+        const derBuf = Buffer.from(b64, 'base64');
+        for (const keyType of ['pkcs8', 'pkcs1', 'sec1'] as const) {
+          try {
+            const keyObj = createPrivateKey({ key: derBuf, format: 'der', type: keyType });
+            return keyObj.export({ type: 'pkcs8', format: 'pem' }).toString();
+          } catch {
+            // Try next DER private key type
+          }
+        }
+      } catch {
+        // Ignore DER decode failure
+      }
+    }
+    return canonical;
+  }
+}
+
+function validatePrivateKeyParseable(pemKey: string): string | null {
+  try {
+    createPrivateKey(pemKey);
+    return null;
+  } catch (err: unknown) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 function tryParseJsonObject(raw: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // Fallback for multi-line private_key pasted with literal unescaped newlines inside JSON string
+  const candidates = [raw];
+  if (raw.includes('\\"') && !raw.startsWith('{"')) {
+    candidates.push(raw.replace(/\\"/g, '"'));
+  }
+
+  for (const candidate of candidates) {
     try {
-      const sanitized = raw.replace(
-        /"private_key"\s*:\s*"([\s\S]*?)"(?=\s*[,}])/,
-        (_match, keyBody: string) => `"private_key":"${keyBody.replace(/\r?\n/g, '\\n')}"`
-      );
-      const parsed = JSON.parse(sanitized);
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === 'string') {
+        const inner = JSON.parse(parsed);
+        if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+          return inner as Record<string, unknown>;
+        }
+      }
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         return parsed as Record<string, unknown>;
       }
     } catch {
-      return null;
+      // Fallback for multi-line private_key pasted with literal unescaped newlines inside JSON string
+      try {
+        const sanitized = candidate.replace(
+          /"private_key"\s*:\s*"([\s\S]*?)"(?=\s*[,}])/,
+          (_match, keyBody: string) => `"private_key":"${keyBody.replace(/\r\n|\r|\n/g, '\\n')}"`
+        );
+        const parsed = JSON.parse(sanitized);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Continue to next candidate
+      }
     }
   }
   return null;
@@ -79,18 +223,14 @@ function parseServiceAccountFromEnv(rawInput: string): ParsedServiceAccountResul
     return { serviceAccount: null, projectIdFromAccount: '', parseError: null };
   }
 
-  const unwrapped =
-    (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
-    (trimmed.startsWith('"') && trimmed.endsWith('"') && !trimmed.startsWith('{"'))
-      ? trimmed.slice(1, -1).trim()
-      : trimmed;
-
+  const unwrapped = unwrapQuotes(trimmed);
   let parsed = unwrapped.startsWith('{') ? tryParseJsonObject(unwrapped) : null;
 
   // Optional base64-encoded service account JSON support
   if (!parsed && !unwrapped.startsWith('{') && /^[A-Za-z0-9+/=_-]+$/.test(unwrapped)) {
     try {
-      const decoded = Buffer.from(unwrapped, 'base64').toString('utf8').trim();
+      const normalizedB64 = unwrapped.replace(/-/g, '+').replace(/_/g, '/');
+      const decoded = Buffer.from(normalizedB64, 'base64').toString('utf8').trim();
       if (decoded.startsWith('{')) {
         parsed = tryParseJsonObject(decoded);
       }
@@ -181,22 +321,43 @@ export function getFirebaseAdminInstances(): FirebaseAdminInstances {
       adminError = null;
     } else {
       let credential = null;
+      const candidates: Array<{ source: string; account: ServiceAccount }> = [];
+
       if (parsedAccount.serviceAccount) {
-        credential = cert({
-          ...parsedAccount.serviceAccount,
-          projectId: parsedAccount.serviceAccount.projectId || projectId,
+        candidates.push({
+          source: 'FIREBASE_SERVICE_ACCOUNT',
+          account: {
+            ...parsedAccount.serviceAccount,
+            projectId: parsedAccount.serviceAccount.projectId || projectId,
+          },
         });
-      } else if (rawClientEmail && rawPrivateKey) {
+      }
+      if (rawClientEmail && rawPrivateKey) {
         const privateKey = normalizePrivateKey(rawPrivateKey);
         if (privateKey && privateKey.includes('PRIVATE KEY')) {
-          credential = cert({
-            projectId,
-            clientEmail: rawClientEmail,
-            privateKey,
+          candidates.push({
+            source: 'FIREBASE_PRIVATE_KEY',
+            account: {
+              projectId,
+              clientEmail: rawClientEmail,
+              privateKey,
+            },
           });
-        } else {
+        } else if (!adminError) {
           adminError = 'Variável FIREBASE_PRIVATE_KEY inválida ou incompleta.';
         }
+      }
+
+      for (const candidate of candidates) {
+        const keyPem = candidate.account.privateKey || '';
+        const keyErr = validatePrivateKeyParseable(keyPem);
+        if (keyErr) {
+          adminError = `Falha ao validar private key (${candidate.source}): ${keyErr}`;
+          continue;
+        }
+        credential = cert(candidate.account);
+        adminError = null;
+        break;
       }
 
       if (credential) {

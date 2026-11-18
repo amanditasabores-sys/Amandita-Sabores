@@ -4,7 +4,7 @@ import { MenuItem, MenuItemAddon, OrderItem, PaymentMethod, FulfillmentType, Ord
 import { formatCurrency, generateWhatsAppOrderMessage, formatCustomerAddress } from '../../utils/formatters';
 import { getPublicAppUrl } from '../../utils/url';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
-import { generatePurchasePixPayload } from '../../utils/pix';
+import { generatePurchasePixPayload, inferPixKeyType } from '../../utils/pix';
 import { 
   Search, 
   ShoppingBag, 
@@ -48,6 +48,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   onNavigateToTracking,
 }) => {
   const [config, setConfig] = useState(() => store.getRestaurantConfig());
+  const [pixConfigState, setPixConfigState] = useState(() => store.getOfficialPixConfigState());
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
   const [combos, setCombos] = useState<Combo[]>(() => store.getCombos());
   const [dailyConfig, setDailyConfig] = useState<DailyMenuConfig>(() => store.getDailyMenuConfig());
@@ -76,6 +77,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         if (!isMounted) return;
         setAvailability(res);
         setConfig(store.getRestaurantConfig());
+        setPixConfigState(store.getOfficialPixConfigState());
         setIsCheckingAvailability(false);
         if (!res.verified || !res.isOpen) {
           setSelectedItemForModal(null);
@@ -131,6 +133,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [createdOrderNumber, setCreatedOrderNumber] = useState<string>('');
   const [whatsappShareUrl, setWhatsappShareUrl] = useState<string>('');
   const [pixQrDataUrl, setPixQrDataUrl] = useState<string>('');
+  const [pixQrError, setPixQrError] = useState<string | null>(null);
   const [copiedPixCode, setCopiedPixCode] = useState(false);
 
   // Sync state & immediate remote open/close transition
@@ -143,6 +146,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       setCombos(store.getCombos());
       setDailyConfig(store.getDailyMenuConfig());
       setConfig(store.getRestaurantConfig());
+      setPixConfigState(store.getOfficialPixConfigState());
 
       if (eventType === 'STORE_AVAILABILITY_UPDATED' && detail?.payload) {
         const nextAvail = detail.payload as PublicStoreAvailability;
@@ -161,6 +165,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
           store.fetchPublicStoreAvailability().then((res) => {
             setAvailability(res);
             setConfig(store.getRestaurantConfig());
+            setPixConfigState(store.getOfficialPixConfigState());
             setIsCheckingAvailability(false);
             if (!res.verified || !res.isOpen) {
               setSelectedItemForModal(null);
@@ -497,10 +502,41 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       return;
     }
 
+    const liveConfig = store.getRestaurantConfig();
+
+    if (paymentMethod === 'PIX') {
+      const livePixState = store.getOfficialPixConfigState();
+      setPixConfigState(livePixState);
+      if (!livePixState.hasValidPixKey) {
+        setFormError(
+          livePixState.status === 'LOADING'
+            ? 'Aguarde alguns segundos o carregamento da configuração oficial do PIX ou escolha Dinheiro/Cartão.'
+            : livePixState.message ||
+                'Pagamento via PIX indisponível no momento. Selecione Dinheiro ou Cartão para finalizar seu pedido.'
+        );
+        return;
+      }
+
+      const pixPrecheck = generatePurchasePixPayload({
+        pixKey: liveConfig.pixKey,
+        keyType: liveConfig.pixKeyType || inferPixKeyType(liveConfig.pixKey || ''),
+        receiverName: liveConfig.pixReceiverName,
+        receiverCity: liveConfig.pixReceiverCity,
+        storeName: liveConfig.name,
+        amount: cartTotal,
+        description: 'Pedido Amandita',
+      });
+      if (!pixPrecheck.success) {
+        setFormError(
+          pixPrecheck.error ||
+            'Não foi possível validar os dados do PIX para este pedido. Selecione Dinheiro ou Cartão.'
+        );
+        return;
+      }
+    }
+
     submittingOrderRef.current = true;
     setIsSubmittingOrder(true);
-
-    const liveConfig = store.getRestaurantConfig();
     let formattedAddress = undefined;
     if (!isRetirada) {
       const hasPresetCondo = condoType === 'Eco Way' || condoType === 'Eco Fit';
@@ -610,6 +646,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       draftOrderIdentityRef.current = null;
 
       setPixQrDataUrl('');
+      setPixQrError(null);
       setCopiedPixCode(false);
 
       // If order has PIX code, generate QR Code data URL directly from the exact BR Code payload
@@ -617,7 +654,11 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         try {
           const qrUrl = await generateQRCodeDataUrl(order.pixCode, { width: 360, margin: 1 });
           setPixQrDataUrl(qrUrl);
-        } catch {}
+        } catch {
+          setPixQrError(
+            'Não foi possível exibir a imagem do QR Code neste aparelho. Utilize o código PIX Copia e Cola abaixo.'
+          );
+        }
       }
 
       const trackingUrl = getPublicAppUrl('rastreio', order.id, order.trackingCode);
@@ -1730,9 +1771,30 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                       )}
 
                       {paymentMethod === 'PIX' && (() => {
+                        if (!pixConfigState.hasValidPixKey) {
+                          return (
+                            <div className="mt-2 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-900 leading-relaxed space-y-1.5">
+                              <p>
+                                {pixConfigState.status === 'LOADING'
+                                  ? 'Carregando configuração oficial do PIX... Aguarde um instante ou selecione Dinheiro/Cartão.'
+                                  : pixConfigState.message ||
+                                    'Pagamento via PIX indisponível no momento. Selecione Dinheiro ou Cartão para finalizar seu pedido.'}
+                              </p>
+                              {pixConfigState.status === 'UNAVAILABLE' && (
+                                <button
+                                  type="button"
+                                  onClick={() => store.refreshPublicConfigFromServer()}
+                                  className="px-2.5 py-1 bg-white hover:bg-amber-100 text-amber-950 border border-amber-300 rounded-lg text-[11px] font-bold transition cursor-pointer"
+                                >
+                                  Tentar carregar PIX novamente
+                                </button>
+                              )}
+                            </div>
+                          );
+                        }
                         const pixAvailability = generatePurchasePixPayload({
                           pixKey: config.pixKey,
-                          keyType: config.pixKeyType,
+                          keyType: config.pixKeyType || inferPixKeyType(config.pixKey || ''),
                           receiverName: config.pixReceiverName,
                           receiverCity: config.pixReceiverCity,
                           storeName: config.name,
@@ -1744,7 +1806,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                           </div>
                         ) : (
                           <div className="mt-2 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-900 leading-relaxed">
-                            Chave PIX do estabelecimento indisponível no momento. Você ainda pode enviar o pedido e combinar o pagamento pelo WhatsApp.
+                            {pixAvailability.error || 'Pagamento via PIX indisponível no momento. Selecione Dinheiro ou Cartão para finalizar seu pedido.'}
                           </div>
                         );
                       })()}
@@ -1833,7 +1895,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   </p>
                 </div>
 
-                {pixQrDataUrl && (
+                {pixQrDataUrl ? (
                   <div className="p-2 bg-white rounded-xl shadow-xs inline-block mx-auto border border-[#E8DFD5]">
                     <img
                       src={pixQrDataUrl}
@@ -1841,7 +1903,11 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                       className="w-44 h-44 object-contain mx-auto"
                     />
                   </div>
-                )}
+                ) : pixQrError ? (
+                  <div className="p-2.5 bg-amber-50 border border-amber-200 text-amber-900 rounded-xl text-[11px] text-left">
+                    {pixQrError}
+                  </div>
+                ) : null}
 
                 {createdOrder.pixCode ? (
                   <div className="space-y-2">

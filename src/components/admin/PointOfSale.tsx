@@ -5,7 +5,7 @@ import { thermalPrinterService } from '../../services/thermalPrinter';
 import { MenuItem, Order, OrderItem, PaymentMethod, User, MenuItemAddon } from '../../types';
 import { formatCurrency, formatDateTime, formatTime, getPaymentMethodLabel, formatAddressDetails } from '../../utils/formatters';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
-import { generatePurchasePixPayload, generateOrderPixTxId } from '../../utils/pix';
+import { generatePurchasePixPayload, generateOrderPixTxId, inferPixKeyType } from '../../utils/pix';
 import { 
   ShoppingBag, 
   Search, 
@@ -59,6 +59,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [currentShift, setCurrentShift] = useState(() => store.getCurrentCashShift());
   const [cashSyncState, setCashSyncState] = useState(() => store.getCashShiftSyncState());
   const [config, setConfig] = useState(() => store.getRestaurantConfig());
+  const [pixConfigState, setPixConfigState] = useState(() => store.getOfficialPixConfigState());
 
   useEffect(() => {
     const handleUpdate = () => {
@@ -67,6 +68,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       setCurrentShift(store.getCurrentCashShift());
       setCashSyncState(store.getCashShiftSyncState());
       setConfig(store.getRestaurantConfig());
+      setPixConfigState(store.getOfficialPixConfigState());
     };
     window.addEventListener('gestaofood_state_changed', handleUpdate);
     return () => window.removeEventListener('gestaofood_state_changed', handleUpdate);
@@ -146,6 +148,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     setCurrentShift(store.getCurrentCashShift());
     setCashSyncState(store.getCashShiftSyncState());
     setConfig(store.getRestaurantConfig());
+    setPixConfigState(store.getOfficialPixConfigState());
   };
 
   // Categories list
@@ -198,9 +201,17 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
   const posPixPreview = useMemo(() => {
     if (paymentMethod !== 'PIX' || totalAmount <= 0) return null;
+    if (!pixConfigState.hasValidPixKey) {
+      return {
+        success: false as const,
+        error:
+          pixConfigState.message ||
+          'Configuração oficial do PIX não disponível. Selecione outra forma de pagamento ou tente recarregar.',
+      };
+    }
     return generatePurchasePixPayload({
       pixKey: config.pixKey,
-      keyType: config.pixKeyType,
+      keyType: config.pixKeyType || inferPixKeyType(config.pixKey || ''),
       receiverName: config.pixReceiverName,
       receiverCity: config.pixReceiverCity,
       storeName: config.name,
@@ -208,7 +219,19 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       txId: pdvPixTxId,
       description: 'Venda PDV Amandita',
     });
-  }, [paymentMethod, totalAmount, pdvPixTxId, config.pixKey, config.pixKeyType, config.pixReceiverName, config.pixReceiverCity, config.name]);
+  }, [
+    paymentMethod,
+    totalAmount,
+    pdvPixTxId,
+    pixConfigState.status,
+    pixConfigState.hasValidPixKey,
+    pixConfigState.message,
+    config.pixKey,
+    config.pixKeyType,
+    config.pixReceiverName,
+    config.pixReceiverCity,
+    config.name,
+  ]);
 
   const posPixCode = posPixPreview?.success ? posPixPreview.payload : '';
   const posPixError = posPixPreview && !posPixPreview.success ? posPixPreview.error : posPixQrError;
@@ -345,9 +368,16 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const handleFinalizeSale = async () => {
     if (cart.length === 0 || isSubmitting || submittingRef.current) return;
 
-    if (paymentMethod === 'PIX' && (Boolean(posPixError) || !posPixCode)) {
-      setSaleError(posPixError || 'Não foi possível gerar o código PIX. Verifique a chave PIX nas configurações da loja.');
-      return;
+    if (paymentMethod === 'PIX') {
+      const livePixState = store.getOfficialPixConfigState();
+      if (!livePixState.hasValidPixKey || Boolean(posPixError) || !posPixCode) {
+        setSaleError(
+          livePixState.message ||
+            posPixError ||
+            'Configuração oficial do PIX não carregada ou inválida. Escolha Dinheiro ou Cartão para concluir a venda.'
+        );
+        return;
+      }
     }
 
     if (paymentMethod === 'DINHEIRO') {
@@ -976,40 +1006,49 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                 </span>
               </div>
 
-              {posPixError ? (
-                <div className="p-2 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-[11px] font-medium">
-                  {posPixError}
+              {posPixError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-[11px] font-medium space-y-2">
+                  <p>{posPixError}</p>
+                  {pixConfigState.status === 'UNAVAILABLE' && (
+                    <button
+                      type="button"
+                      onClick={() => store.refreshPublicConfigFromServer()}
+                      className="px-2.5 py-1 bg-white hover:bg-rose-100 text-rose-900 border border-rose-300 rounded-md text-[11px] font-bold transition cursor-pointer"
+                    >
+                      Tentar recarregar PIX oficial
+                    </button>
+                  )}
                 </div>
-              ) : (
+              )}
+
+              {posPixCode && (
                 <>
-                  {posPixQrDataUrl && (
+                  {posPixQrDataUrl && !posPixQrError && (
                     <div className="flex justify-center bg-white p-2 rounded-xl border border-cyan-100">
                       <img src={posPixQrDataUrl} alt="QR Code PIX PDV" className="w-36 h-36 object-contain" />
                     </div>
                   )}
-                  {posPixCode && (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-[10px] text-cyan-900 font-mono">
-                        <span>TXID: <strong>{pdvPixTxId}</strong></span>
-                        <span>Valor exato</span>
-                      </div>
-                      <div className="p-2 bg-white border border-cyan-200 rounded-lg font-mono text-[10px] text-slate-700 break-all max-h-16 overflow-y-auto select-all">
-                        {posPixCode}
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          navigator.clipboard.writeText(posPixCode);
-                          setCopiedPosPix(true);
-                          setTimeout(() => setCopiedPosPix(false), 2000);
-                        }}
-                        className="w-full py-1.5 px-2.5 bg-white hover:bg-cyan-50 text-cyan-950 border border-cyan-300 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
-                      >
-                        {copiedPosPix ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                        <span>{copiedPosPix ? 'Código PIX Copiado!' : 'Copiar PIX Copia e Cola'}</span>
-                      </button>
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] text-cyan-900 font-mono">
+                      <span>TXID: <strong>{pdvPixTxId}</strong></span>
+                      <span>Valor exato</span>
                     </div>
-                  )}
+                    <div className="p-2 bg-white border border-cyan-200 rounded-lg font-mono text-[10px] text-slate-700 break-all max-h-16 overflow-y-auto select-all">
+                      {posPixCode}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(posPixCode);
+                        setCopiedPosPix(true);
+                        setTimeout(() => setCopiedPosPix(false), 2000);
+                      }}
+                      className="w-full py-1.5 px-2.5 bg-white hover:bg-cyan-50 text-cyan-950 border border-cyan-300 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      {copiedPosPix ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{copiedPosPix ? 'Código PIX Copiado!' : 'Copiar PIX Copia e Cola'}</span>
+                    </button>
+                  </div>
                   <p className="text-[10px] text-cyan-950 leading-tight bg-cyan-100/70 p-2 rounded-lg border border-cyan-200">
                     <strong>Conferência manual:</strong> gerar o QR Code não confirma o recebimento automaticamente. Verifique no app do banco antes de marcar como pago.
                   </p>

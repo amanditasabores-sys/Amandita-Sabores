@@ -26,7 +26,7 @@ import {
 import { formatCurrency, getFortalezaDateKey } from '../utils/formatters';
 import { soundService } from './audio';
 import { thermalPrinterService } from './thermalPrinter';
-import { generatePurchasePixPayload, generateOrderPixTxId, validatePixKey, validatePixReceiver, validatePixPayload } from '../utils/pix';
+import { generatePurchasePixPayload, generateOrderPixTxId, validatePixKey, validatePixReceiver, validatePixPayload, inferPixKeyType, type PixKeyType } from '../utils/pix';
 import {
   DEFAULT_CLOSED_PRIMARY_MESSAGE,
   DEFAULT_CLOSED_SECONDARY_MESSAGE,
@@ -101,6 +101,17 @@ export interface CashShiftSyncState {
   error: string | null;
 }
 
+export type OfficialPixConfigStatus = 'LOADING' | 'READY' | 'MISSING' | 'UNAVAILABLE';
+
+export interface OfficialPixConfigState {
+  status: OfficialPixConfigStatus;
+  source: 'firestore' | 'local_contingency' | 'none';
+  hasValidPixKey: boolean;
+  error: string | null;
+  message: string | null;
+  lastSyncedAt: string | null;
+}
+
 class StoreService {
   private broadcastChannel: BroadcastChannel | null = null;
   private publicUnsubscribers: Unsubscribe[] = [];
@@ -124,6 +135,15 @@ class StoreService {
     source: 'none',
     error: null,
   };
+  private hasReceivedFirestoreConfig = false;
+  private officialPixState: OfficialPixConfigState = {
+    status: 'LOADING',
+    source: 'none',
+    hasValidPixKey: false,
+    error: null,
+    message: 'Carregando configuração oficial do PIX...',
+    lastSyncedAt: null,
+  };
   private lastPublicAvailability: PublicStoreAvailability | null = null;
   private uncertainServerOps = new Map<string, number>();
   private lastUncertainOpenShiftId: string | null = null;
@@ -136,6 +156,68 @@ class StoreService {
     lastSyncedAt: null,
     lastError: null,
   };
+
+  private evaluatePixConfigValidity(cfg: Partial<RestaurantConfig>): {
+    valid: boolean;
+    keyType?: PixKeyType;
+    normalizedKey?: string;
+    error?: string;
+  } {
+    const rawKey = (cfg.pixKey || '').trim();
+    if (!rawKey) {
+      return { valid: false, error: 'Chave PIX oficial não configurada nas Configurações da loja.' };
+    }
+    const resolvedType = cfg.pixKeyType || inferPixKeyType(rawKey);
+    if (!resolvedType) {
+      return { valid: false, error: 'Tipo de chave PIX inválido ou não identificado.' };
+    }
+    const keyCheck = validatePixKey(rawKey, resolvedType);
+    if (!keyCheck.valid) {
+      return { valid: false, keyType: resolvedType, error: keyCheck.error || 'Chave PIX configurada é inválida.' };
+    }
+    const receiverCheck = validatePixReceiver(cfg.pixReceiverName, cfg.pixReceiverCity);
+    if (!receiverCheck.valid) {
+      return { valid: false, keyType: resolvedType, error: receiverCheck.error || 'Nome ou cidade do recebedor PIX inválidos.' };
+    }
+    return { valid: true, keyType: resolvedType, normalizedKey: keyCheck.normalized };
+  }
+
+  private syncOfficialPixStateFromFirestore(cfg: Partial<RestaurantConfig>, docExists: boolean): void {
+    this.hasReceivedFirestoreConfig = true;
+    const now = new Date().toISOString();
+    if (!docExists) {
+      this.officialPixState = {
+        status: 'MISSING',
+        source: 'firestore',
+        hasValidPixKey: false,
+        error: 'Documento configs/restaurant não encontrado no Firestore.',
+        message: 'Configuração oficial do PIX não encontrada no Firestore. Cadastre a chave em Configurações ou selecione outra forma de pagamento.',
+        lastSyncedAt: now,
+      };
+      return;
+    }
+
+    const check = this.evaluatePixConfigValidity(cfg);
+    if (check.valid) {
+      this.officialPixState = {
+        status: 'READY',
+        source: 'firestore',
+        hasValidPixKey: true,
+        error: null,
+        message: null,
+        lastSyncedAt: now,
+      };
+    } else {
+      this.officialPixState = {
+        status: 'MISSING',
+        source: 'firestore',
+        hasValidPixKey: false,
+        error: check.error || 'Configuração oficial do PIX incompleta.',
+        message: check.error || 'Configuração oficial do PIX indisponível no momento. Escolha outra forma de pagamento.',
+        lastSyncedAt: now,
+      };
+    }
+  }
 
   public getCloudSyncState() {
     return { ...this.cloudSyncState };
@@ -1787,10 +1869,22 @@ class StoreService {
         localStorage.setItem('gf_orders', JSON.stringify(INITIAL_ORDERS));
       }
 
-      // Restaurant config migration check
+      // Restaurant config migration check (also purge legacy demo PIX key if cached locally)
       const currentConfigData = localStorage.getItem('gf_restaurant_config');
       if (!currentConfigData || currentConfigData.includes('Brasa & Sabor')) {
         localStorage.setItem('gf_restaurant_config', JSON.stringify(INITIAL_CONFIG));
+      } else if (currentConfigData.includes('contato@amanditasabores.com.br')) {
+        try {
+          const parsedCfg = JSON.parse(currentConfigData) as Partial<RestaurantConfig>;
+          if ((parsedCfg.pixKey || '').trim().toLowerCase() === 'contato@amanditasabores.com.br') {
+            localStorage.setItem(
+              'gf_restaurant_config',
+              JSON.stringify({ ...parsedCfg, pixKey: '', pixKeyType: undefined })
+            );
+          }
+        } catch {
+          localStorage.setItem('gf_restaurant_config', JSON.stringify(INITIAL_CONFIG));
+        }
       }
 
       // Users and permissions migration check
@@ -2269,6 +2363,16 @@ class StoreService {
     if (!db || this.isPublicSyncActive) return;
 
     this.teardownPublicListenersOnly();
+    if (!this.hasReceivedFirestoreConfig) {
+      this.officialPixState = {
+        status: 'LOADING',
+        source: 'none',
+        hasValidPixKey: false,
+        error: null,
+        message: 'Carregando configuração oficial do PIX do Firebase...',
+        lastSyncedAt: null,
+      };
+    }
 
     try {
       this.isPublicSyncActive = true;
@@ -2308,16 +2412,36 @@ class StoreService {
       // Merges into existing config so internal/private fields (receiptFooterText, defaultDeliveryPersonId, notify*) are never wiped.
       const applyRemotePublicConfig = (remotePublic: Partial<RestaurantConfig>) => {
         const currentLocal = this.getRestaurantConfig();
+        const remoteKey = typeof remotePublic.pixKey === 'string' ? remotePublic.pixKey.trim() : undefined;
+        const resolvedRemoteType =
+          remotePublic.pixKeyType || (remoteKey ? inferPixKeyType(remoteKey) : undefined);
         const mergedConfig: RestaurantConfig = {
           ...currentLocal,
           ...remotePublic,
+          ...(remoteKey !== undefined ? { pixKey: remoteKey } : {}),
+          ...(resolvedRemoteType ? { pixKeyType: resolvedRemoteType } : {}),
         };
         try {
           localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
         } catch (storageErr) {
           console.warn('[Firestore Public Sync] Falha ao gravar config local:', storageErr);
         }
+        this.syncOfficialPixStateFromFirestore(mergedConfig, true);
         this.notify('CONFIG_UPDATED', mergedConfig);
+      };
+
+      const markConfigUnavailable = (errMsg: string) => {
+        if (!this.hasReceivedFirestoreConfig) {
+          this.officialPixState = {
+            status: 'UNAVAILABLE',
+            source: 'none',
+            hasValidPixKey: false,
+            error: errMsg,
+            message: 'Não foi possível carregar a configuração oficial do PIX no Firebase. Use outra forma de pagamento ou tente novamente.',
+            lastSyncedAt: null,
+          };
+          this.notify('CONFIG_UPDATED', this.getRestaurantConfig());
+        }
       };
 
       const unsubConfig = onSnapshot(
@@ -2325,10 +2449,14 @@ class StoreService {
         (docSnap) => {
           if (docSnap.exists()) {
             applyRemotePublicConfig(docSnap.data() as Partial<RestaurantConfig>);
+          } else {
+            this.syncOfficialPixStateFromFirestore(this.getRestaurantConfig(), false);
+            this.notify('CONFIG_UPDATED', this.getRestaurantConfig());
           }
         },
         (error) => {
           console.warn('[Firestore Public Sync] Config listener notice:', error.message);
+          markConfigUnavailable(error.message || 'Falha ao escutar configs/restaurant no Firestore.');
         }
       );
       this.publicUnsubscribers.push(unsubConfig);
@@ -2338,12 +2466,29 @@ class StoreService {
         .then((serverSnap) => {
           if (serverSnap.exists()) {
             applyRemotePublicConfig(serverSnap.data() as Partial<RestaurantConfig>);
+          } else {
+            this.syncOfficialPixStateFromFirestore(this.getRestaurantConfig(), false);
+            this.notify('CONFIG_UPDATED', this.getRestaurantConfig());
           }
         })
-        .catch(() => {});
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          markConfigUnavailable(msg || 'Falha ao consultar configs/restaurant no servidor.');
+        });
 
     } catch (err) {
       console.warn('[Firestore Public Sync Setup Error]:', err);
+      if (!this.hasReceivedFirestoreConfig) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.officialPixState = {
+          status: 'UNAVAILABLE',
+          source: 'none',
+          hasValidPixKey: false,
+          error: msg,
+          message: 'Não foi possível conectar ao Firebase para carregar o PIX oficial. Utilize outra forma de pagamento.',
+          lastSyncedAt: null,
+        };
+      }
       this.teardownPublicListenersOnly();
       this.schedulePublicSyncRetry(5000);
     }
@@ -2764,6 +2909,7 @@ class StoreService {
       const configSnap = await getDoc(configRef);
       if (!configSnap.exists()) {
         const config = this.getRestaurantConfig();
+        const resolvedPixKeyType = config.pixKeyType || inferPixKeyType(config.pixKey || '');
         const publicPayload = {
           name: config.name,
           phone: config.phone,
@@ -2771,7 +2917,7 @@ class StoreService {
           address: config.address,
           city: config.city,
           pixKey: config.pixKey,
-          pixKeyType: config.pixKeyType || 'EMAIL',
+          ...(resolvedPixKeyType ? { pixKeyType: resolvedPixKeyType } : {}),
           pixReceiverName: config.pixReceiverName || config.name,
           pixReceiverCity: config.pixReceiverCity || 'CAMPINA GRANDE',
           deliveryFeeBase: config.deliveryFeeBase ?? 5.0,
@@ -3333,6 +3479,7 @@ class StoreService {
       const configRef = doc(db, 'configs', 'restaurant');
       const configSnap = await getDoc(configRef);
       if (!configSnap.exists()) {
+        const resolvedPixKeyType = config.pixKeyType || inferPixKeyType(config.pixKey || '');
         const publicPayload = {
           name: config.name,
           phone: config.phone,
@@ -3340,7 +3487,7 @@ class StoreService {
           address: config.address,
           city: config.city,
           pixKey: config.pixKey,
-          pixKeyType: config.pixKeyType || 'EMAIL',
+          ...(resolvedPixKeyType ? { pixKeyType: resolvedPixKeyType } : {}),
           pixReceiverName: config.pixReceiverName || config.name,
           pixReceiverCity: config.pixReceiverCity || 'CAMPINA GRANDE',
           deliveryFeeBase: config.deliveryFeeBase ?? 5.0,
@@ -3710,44 +3857,51 @@ class StoreService {
     };
 
     if (newOrder.paymentMethod === 'PIX') {
-      let reusedValidPreview = false;
-      if (cleanOrderInput.pixCode && cleanOrderInput.pixTxId && cfg.pixKey) {
-        const previewAudit = validatePixPayload(cleanOrderInput.pixCode);
-        const keyCheck = cfg.pixKeyType ? validatePixKey(cfg.pixKey, cfg.pixKeyType) : null;
-        const expectedNormalizedKey = keyCheck?.valid ? keyCheck.normalized : undefined;
-        const previewAmount = roundCurrency(parseFloat(previewAudit.amount || '0'));
-        if (
-          previewAudit.valid &&
-          previewAudit.txId === cleanOrderInput.pixTxId &&
-          (!expectedNormalizedKey || previewAudit.pixKey === expectedNormalizedKey) &&
-          previewAmount === effectiveTotal
-        ) {
-          newOrder.pixCode = cleanOrderInput.pixCode;
-          newOrder.pixTxId = cleanOrderInput.pixTxId;
-          reusedValidPreview = true;
+      const officialPixState = this.getOfficialPixConfigState();
+      if (!officialPixState.hasValidPixKey) {
+        delete newOrder.pixCode;
+        delete newOrder.pixTxId;
+      } else {
+        const effectiveKeyType = cfg.pixKeyType || inferPixKeyType(cfg.pixKey || '');
+        let reusedValidPreview = false;
+        if (cleanOrderInput.pixCode && cleanOrderInput.pixTxId && cfg.pixKey) {
+          const previewAudit = validatePixPayload(cleanOrderInput.pixCode);
+          const keyCheck = effectiveKeyType ? validatePixKey(cfg.pixKey, effectiveKeyType) : null;
+          const expectedNormalizedKey = keyCheck?.valid ? keyCheck.normalized : undefined;
+          const previewAmount = roundCurrency(parseFloat(previewAudit.amount || '0'));
+          if (
+            previewAudit.valid &&
+            previewAudit.txId === cleanOrderInput.pixTxId &&
+            (!expectedNormalizedKey || previewAudit.pixKey === expectedNormalizedKey) &&
+            previewAmount === effectiveTotal
+          ) {
+            newOrder.pixCode = cleanOrderInput.pixCode;
+            newOrder.pixTxId = cleanOrderInput.pixTxId;
+            reusedValidPreview = true;
+          }
         }
-      }
 
-      if (!reusedValidPreview) {
-        const txId = cleanOrderInput.pixTxId || generateOrderPixTxId(newOrder.orderNumber, newOrder.id);
-        const pixResult = generatePurchasePixPayload({
-          pixKey: cfg.pixKey,
-          keyType: cfg.pixKeyType,
-          receiverName: cfg.pixReceiverName,
-          receiverCity: cfg.pixReceiverCity,
-          storeName: cfg.name,
-          amount: newOrder.totalAmount,
-          txId,
-          orderNumber: newOrder.orderNumber,
-          orderId: newOrder.id,
-          description: pixDescription || `Pedido ${newOrder.orderNumber}`,
-        });
-        if (pixResult.success) {
-          newOrder.pixCode = pixResult.payload;
-          newOrder.pixTxId = pixResult.txId;
-        } else {
-          delete newOrder.pixCode;
-          delete newOrder.pixTxId;
+        if (!reusedValidPreview) {
+          const txId = cleanOrderInput.pixTxId || generateOrderPixTxId(newOrder.orderNumber, newOrder.id);
+          const pixResult = generatePurchasePixPayload({
+            pixKey: cfg.pixKey,
+            keyType: effectiveKeyType,
+            receiverName: cfg.pixReceiverName,
+            receiverCity: cfg.pixReceiverCity,
+            storeName: cfg.name,
+            amount: newOrder.totalAmount,
+            txId,
+            orderNumber: newOrder.orderNumber,
+            orderId: newOrder.id,
+            description: pixDescription || `Pedido ${newOrder.orderNumber}`,
+          });
+          if (pixResult.success) {
+            newOrder.pixCode = pixResult.payload;
+            newOrder.pixTxId = pixResult.txId;
+          } else {
+            delete newOrder.pixCode;
+            delete newOrder.pixTxId;
+          }
         }
       }
     }
@@ -7820,9 +7974,13 @@ class StoreService {
       const data = localStorage.getItem('gf_restaurant_config');
       const parsed = data ? (JSON.parse(data) as RestaurantConfig) : INITIAL_CONFIG;
       const closedNormalized = normalizeClosedSettings(parsed);
+      const rawKey = (parsed.pixKey || '').trim();
+      const resolvedKeyType = parsed.pixKeyType || (rawKey ? inferPixKeyType(rawKey) : undefined);
       return {
         ...INITIAL_CONFIG,
         ...parsed,
+        pixKey: rawKey,
+        pixKeyType: resolvedKeyType,
         operatingHours: closedNormalized.operatingHours,
         closedPrimaryMessage: closedNormalized.closedPrimaryMessage,
         closedSecondaryMessage: closedNormalized.closedSecondaryMessage,
@@ -7830,6 +7988,106 @@ class StoreService {
     } catch {
       return INITIAL_CONFIG;
     }
+  }
+
+  public getOfficialPixConfigState(): OfficialPixConfigState {
+    if (isFirebaseReady() && db) {
+      if (!this.hasReceivedFirestoreConfig) {
+        if (this.officialPixState.status === 'UNAVAILABLE') {
+          return { ...this.officialPixState };
+        }
+        return {
+          status: 'LOADING',
+          source: 'none',
+          hasValidPixKey: false,
+          error: null,
+          message: 'Carregando configuração oficial do PIX do Firebase...',
+          lastSyncedAt: null,
+        };
+      }
+      return { ...this.officialPixState };
+    }
+
+    if (this.officialPixState.status === 'UNAVAILABLE') {
+      return { ...this.officialPixState };
+    }
+
+    const cfg = this.getRestaurantConfig();
+    const check = this.evaluatePixConfigValidity(cfg);
+    if (check.valid) {
+      return {
+        status: 'READY',
+        source: this.hasReceivedFirestoreConfig ? 'firestore' : 'local_contingency',
+        hasValidPixKey: true,
+        error: null,
+        message: null,
+        lastSyncedAt: this.officialPixState.lastSyncedAt,
+      };
+    }
+
+    return {
+      status: 'MISSING',
+      source: 'none',
+      hasValidPixKey: false,
+      error: check.error || 'Configuração oficial do PIX não disponível.',
+      message:
+        check.error ||
+        'Configuração oficial do PIX indisponível no momento. Cadastre a chave em Configurações ou escolha outra forma de pagamento.',
+      lastSyncedAt: null,
+    };
+  }
+
+  public async refreshPublicConfigFromServer(): Promise<OfficialPixConfigState> {
+    if (!isFirebaseReady() || !db) {
+      return this.getOfficialPixConfigState();
+    }
+    if (!this.hasReceivedFirestoreConfig) {
+      this.officialPixState = {
+        status: 'LOADING',
+        source: 'none',
+        hasValidPixKey: false,
+        error: null,
+        message: 'Carregando configuração oficial do PIX do Firebase...',
+        lastSyncedAt: null,
+      };
+      this.notify('CONFIG_UPDATED', this.getRestaurantConfig());
+    }
+    try {
+      const serverSnap = await getDocFromServer(doc(db, 'configs', 'restaurant'));
+      if (serverSnap.exists()) {
+        const remotePublic = serverSnap.data() as Partial<RestaurantConfig>;
+        const currentLocal = this.getRestaurantConfig();
+        const remoteKey = typeof remotePublic.pixKey === 'string' ? remotePublic.pixKey.trim() : undefined;
+        const resolvedRemoteType =
+          remotePublic.pixKeyType || (remoteKey ? inferPixKeyType(remoteKey) : undefined);
+        const mergedConfig: RestaurantConfig = {
+          ...currentLocal,
+          ...remotePublic,
+          ...(remoteKey !== undefined ? { pixKey: remoteKey } : {}),
+          ...(resolvedRemoteType ? { pixKeyType: resolvedRemoteType } : {}),
+        };
+        localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+        this.syncOfficialPixStateFromFirestore(mergedConfig, true);
+        this.notify('CONFIG_UPDATED', mergedConfig);
+      } else {
+        this.syncOfficialPixStateFromFirestore(this.getRestaurantConfig(), false);
+        this.notify('CONFIG_UPDATED', this.getRestaurantConfig());
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!this.hasReceivedFirestoreConfig) {
+        this.officialPixState = {
+          status: 'UNAVAILABLE',
+          source: 'none',
+          hasValidPixKey: false,
+          error: msg,
+          message: 'Não foi possível carregar a configuração oficial do PIX no Firebase. Use outra forma de pagamento ou tente novamente.',
+          lastSyncedAt: null,
+        };
+        this.notify('CONFIG_UPDATED', this.getRestaurantConfig());
+      }
+    }
+    return this.getOfficialPixConfigState();
   }
 
   public getLastPublicStoreAvailability(): PublicStoreAvailability | null {
@@ -8035,6 +8293,7 @@ class StoreService {
         };
 
         localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+        this.syncOfficialPixStateFromFirestore(mergedConfig, restSnap.exists());
         this.notify('CONFIG_UPDATED', mergedConfig);
         return {
           success: true,
@@ -8044,6 +8303,17 @@ class StoreService {
         };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (!this.hasReceivedFirestoreConfig) {
+          this.officialPixState = {
+            status: 'UNAVAILABLE',
+            source: 'none',
+            hasValidPixKey: false,
+            error: msg,
+            message: 'Não foi possível carregar a configuração oficial do PIX no Firebase.',
+            lastSyncedAt: null,
+          };
+          this.notify('CONFIG_UPDATED', currentLocal);
+        }
         return {
           success: false,
           error: `Falha ao carregar configurações persistidas no Cloud Firestore: ${msg}`,
@@ -8078,6 +8348,7 @@ class StoreService {
           };
 
           localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+          this.syncOfficialPixStateFromFirestore(mergedConfig, Boolean(data.hasRestaurantDoc));
           this.notify('CONFIG_UPDATED', mergedConfig);
           return {
             success: true,
@@ -8139,8 +8410,16 @@ class StoreService {
       return { success: false, synced: false, message: errMsg, error: errMsg };
     }
 
-    const keyType = config.pixKeyType || 'EMAIL';
     const rawPixKey = (config.pixKey || '').trim();
+    const keyType = config.pixKeyType || inferPixKeyType(rawPixKey);
+    if (!rawPixKey) {
+      const errMsg = 'Informe a chave PIX oficial antes de salvar as configurações.';
+      return { success: false, synced: false, message: errMsg, error: errMsg };
+    }
+    if (!keyType) {
+      const errMsg = 'Tipo de chave PIX não identificado. Selecione CPF, CNPJ, Telefone, E-mail ou Aleatória.';
+      return { success: false, synced: false, message: errMsg, error: errMsg };
+    }
     const pixValidation = validatePixKey(rawPixKey, keyType);
     if (!pixValidation.valid) {
       const errMsg = pixValidation.error || 'Chave PIX inválida para o tipo selecionado.';
@@ -8303,6 +8582,7 @@ class StoreService {
       }
 
       localStorage.setItem('gf_restaurant_config', JSON.stringify(normalizedConfig));
+      this.syncOfficialPixStateFromFirestore(normalizedConfig, true);
       this.notify('CONFIG_UPDATED', normalizedConfig);
       return {
         success: true,
@@ -8341,6 +8621,7 @@ class StoreService {
           return { success: false, synced: false, message: errMsg, error: errMsg };
         }
         localStorage.setItem('gf_restaurant_config', JSON.stringify(normalizedConfig));
+        this.syncOfficialPixStateFromFirestore(normalizedConfig, true);
         this.notify('CONFIG_UPDATED', normalizedConfig);
         return {
           success: true,
@@ -8356,6 +8637,14 @@ class StoreService {
 
     // Local contingency mode (Firebase not configured)
     localStorage.setItem('gf_restaurant_config', JSON.stringify(normalizedConfig));
+    this.officialPixState = {
+      status: 'READY',
+      source: 'local_contingency',
+      hasValidPixKey: true,
+      error: null,
+      message: null,
+      lastSyncedAt: new Date().toISOString(),
+    };
     this.notify('CONFIG_UPDATED', normalizedConfig);
     return {
       success: true,
@@ -9798,6 +10087,17 @@ class StoreService {
     localStorage.setItem('gf_restaurant_config', JSON.stringify(INITIAL_CONFIG));
     localStorage.setItem('gf_users', JSON.stringify(INITIAL_USERS));
     localStorage.setItem('gf_current_user', JSON.stringify(INITIAL_USERS[0]));
+    this.hasReceivedFirestoreConfig = false;
+    this.officialPixState = {
+      status: isFirebaseReady() && db ? 'LOADING' : 'MISSING',
+      source: 'none',
+      hasValidPixKey: false,
+      error: null,
+      message: isFirebaseReady() && db
+        ? 'Carregando configuração oficial do PIX do Firebase...'
+        : 'Chave PIX oficial não configurada.',
+      lastSyncedAt: null,
+    };
     
     const defaultPasswords: Record<string, string> = {
       'user-admin': '123456',

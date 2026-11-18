@@ -402,10 +402,20 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
 
   const handlePrintReceipt = async (order: Order) => {
     setPrintableOrder(order);
-    // Generate public QR code for delivery driver to scan without 403 error
-    const deliveryUrl = getPublicAppUrl('entregador', order.id);
-    const qrData = await generateQRCodeDataUrl(deliveryUrl, { width: 220, margin: 1 });
-    setReceiptQrCode(qrData);
+    setReceiptQrCode('');
+    try {
+      // Generate public QR code for delivery driver to scan without 403 error
+      const deliveryUrl = getPublicAppUrl('entregador', order.id);
+      const qrData = await generateQRCodeDataUrl(deliveryUrl, { width: 220, margin: 1 });
+      setReceiptQrCode(qrData);
+    } catch {
+      setReceiptQrCode('');
+      setThermalPrintNotice({
+        message: 'Não foi possível gerar o QR Code do entregador para o recibo; impressão iniciada sem o QR Code.',
+        success: false,
+      });
+      setTimeout(() => setThermalPrintNotice(null), 5000);
+    }
 
     setTimeout(() => {
       window.print();

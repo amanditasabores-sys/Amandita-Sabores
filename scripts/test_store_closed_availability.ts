@@ -331,6 +331,11 @@ async function runTests() {
   const { default: app, __setTestFirebaseAdminServices } = await import('../server');
   const { store } = await import('../src/services/store');
   const { INITIAL_MENU, INITIAL_CONFIG } = await import('../src/data/initialData');
+  const TEST_RESTAURANT_CONFIG = {
+    ...INITIAL_CONFIG,
+    pixKey: 'pix-teste@amandita.local',
+    pixKeyType: 'EMAIL' as const,
+  };
 
   const simDb = new TransactionalFirestoreSimulator();
   const tokenUserMap: Record<string, { uid: string; email: string; role: string; name: string }> = {
@@ -666,16 +671,16 @@ async function runTests() {
 
       // 7a. Validação rejeita WhatsApp inválido e horário inválido
       setClientStaffRole('token-admin');
-      const badWa = await store.updateRestaurantConfigAsync({ ...INITIAL_CONFIG, whatsapp: '123' });
+      const badWa = await store.updateRestaurantConfigAsync({ ...TEST_RESTAURANT_CONFIG, whatsapp: '123' });
       assert.strictEqual(badWa.success, false);
 
       const badHours = DEFAULT_OPERATING_HOURS.map((d) =>
         d.dayKey === 'seg' ? { ...d, isOpen: true, openTime: '18:00', closeTime: '10:00' } : d
       );
-      const badHoursRes = await store.updateRestaurantConfigAsync({ ...INITIAL_CONFIG, operatingHours: badHours });
+      const badHoursRes = await store.updateRestaurantConfigAsync({ ...TEST_RESTAURANT_CONFIG, operatingHours: badHours });
       assert.strictEqual(badHoursRes.success, false);
 
-      const emptyMsgRes = await store.updateRestaurantConfigAsync({ ...INITIAL_CONFIG, closedPrimaryMessage: '   ' });
+      const emptyMsgRes = await store.updateRestaurantConfigAsync({ ...TEST_RESTAURANT_CONFIG, closedPrimaryMessage: '   ' });
       assert.strictEqual(emptyMsgRes.success, false);
 
       // 7b. RBAC: CAIXA e ATENDENTE recebem 403 em /api/store/schedule
@@ -699,7 +704,7 @@ async function runTests() {
           : { ...d, isOpen: false }
       );
       const saveRes = await store.updateRestaurantConfigAsync({
-        ...INITIAL_CONFIG,
+        ...TEST_RESTAURANT_CONFIG,
         whatsapp: '5583998765432',
         operatingHours: customHours,
         closedPrimaryMessage: 'Voltamos amanhã às 07h30!',
@@ -889,7 +894,7 @@ async function runTests() {
         d.dayKey === 'sex' ? { ...d, isOpen: true, openTime: '14:00', closeTime: '22:00' } : { ...d, isOpen: false }
       );
       simDb.seedDoc('configs', 'restaurant', {
-        ...INITIAL_CONFIG,
+        ...TEST_RESTAURANT_CONFIG,
         whatsapp: '5583991112233',
         deliveryFeeBase: 7.5,
         isOpen: false,
@@ -987,7 +992,7 @@ async function runTests() {
       assert.strictEqual(failSaveBody.persistedToFirestore, false);
 
       const failStoreSave = await store.updateRestaurantConfigAsync({
-        ...INITIAL_CONFIG,
+        ...TEST_RESTAURANT_CONFIG,
         whatsapp: '5583999998888',
         closedPrimaryMessage: 'Não pode dar falso positivo',
       });
@@ -1000,7 +1005,7 @@ async function runTests() {
       // 13b. Falha atômica dentro de runTransaction (configs/store_schedule falha após preparar escrita em configs/restaurant)
       applyAdminMode(true);
       simDb.seedDoc('configs', 'restaurant', {
-        ...INITIAL_CONFIG,
+        ...TEST_RESTAURANT_CONFIG,
         name: 'Amandita Sabores',
         whatsapp: '5583999990001',
         deliveryFeeBase: 5.0,
@@ -1016,7 +1021,7 @@ async function runTests() {
 
       simDb.failWriteOnceOnPath = 'configs/store_schedule';
       const atomicFailRes = await store.updateRestaurantConfigAsync({
-        ...INITIAL_CONFIG,
+        ...TEST_RESTAURANT_CONFIG,
         name: 'Nome Alterado Parcialmente',
         whatsapp: '5583999997777',
         deliveryFeeBase: 19.0,
@@ -1036,7 +1041,7 @@ async function runTests() {
       await store.openCashRegisterAsync(100, 'Operador Caixa');
       setClientStaffRole('token-admin');
       const saveWhileOpen = await store.updateRestaurantConfigAsync({
-        ...INITIAL_CONFIG,
+        ...TEST_RESTAURANT_CONFIG,
         whatsapp: '5583999991234',
         isOpen: false, // mesmo se cliente mandar isOpen: false, transação consulta cash_shifts ABERTO
       });

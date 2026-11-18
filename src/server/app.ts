@@ -15,6 +15,14 @@ import {
   validateOperatingHours,
   validateWhatsAppNumber,
 } from '../utils/storeHours.js';
+import {
+  type PixKeyType,
+  inferPixKeyType,
+  sanitizeTxId,
+  validatePixKey,
+  validatePixPayload,
+  validatePixReceiver,
+} from '../utils/pix.js';
 
 // Shared Firebase Admin & Client Env Config (Client SDK is never loaded in serverless backend)
 const firebaseAdmin = getFirebaseAdminInstances();
@@ -1986,11 +1994,59 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
         }
         rawRest.name = rawRest.name.trim().slice(0, 150);
 
-        if (typeof rawRest.pixKey !== 'string' || !rawRest.pixKey.trim()) {
+        const VALID_PIX_TYPES = new Set<PixKeyType>(['CPF', 'CNPJ', 'EMAIL', 'TELEFONE', 'ALEATORIA']);
+        const rawPixKey = typeof rawRest.pixKey === 'string' ? rawRest.pixKey.trim() : '';
+        if (!rawPixKey) {
           res.status(400).json({
             success: false,
             persistedToFirestore: false,
             message: 'Chave PIX é obrigatória.',
+          });
+          return;
+        }
+
+        const requestedType =
+          typeof rawRest.pixKeyType === 'string' && rawRest.pixKeyType.trim()
+            ? rawRest.pixKeyType.trim().toUpperCase()
+            : undefined;
+        if (requestedType && !VALID_PIX_TYPES.has(requestedType as PixKeyType)) {
+          res.status(400).json({
+            success: false,
+            persistedToFirestore: false,
+            message: 'Tipo de chave PIX inválido.',
+          });
+          return;
+        }
+
+        const resolvedPixType = (requestedType as PixKeyType | undefined) || inferPixKeyType(rawPixKey);
+        if (!resolvedPixType) {
+          res.status(400).json({
+            success: false,
+            persistedToFirestore: false,
+            message: 'Tipo de chave PIX não reconhecido para a chave informada.',
+          });
+          return;
+        }
+
+        const pixKeyCheck = validatePixKey(rawPixKey, resolvedPixType);
+        if (!pixKeyCheck.valid) {
+          res.status(400).json({
+            success: false,
+            persistedToFirestore: false,
+            message: pixKeyCheck.error || 'Chave PIX inválida para o tipo selecionado.',
+          });
+          return;
+        }
+
+        const receiverCheck = validatePixReceiver(
+          typeof rawRest.pixReceiverName === 'string' ? rawRest.pixReceiverName : '',
+          typeof rawRest.pixReceiverCity === 'string' ? rawRest.pixReceiverCity : ''
+        );
+        if (!receiverCheck.valid) {
+          res.status(400).json({
+            success: false,
+            persistedToFirestore: false,
+            message: receiverCheck.error || 'Nome e cidade do recebedor PIX são obrigatórios.',
           });
           return;
         }
@@ -2013,10 +2069,10 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
           whatsapp: rawRest.whatsapp ?? normalizedWhatsapp ?? '',
           address: typeof rawRest.address === 'string' ? rawRest.address.trim() : '',
           city: typeof rawRest.city === 'string' ? rawRest.city.trim() : '',
-          pixKey: rawRest.pixKey.trim(),
-          pixKeyType: typeof rawRest.pixKeyType === 'string' ? rawRest.pixKeyType : 'EMAIL',
-          pixReceiverName: typeof rawRest.pixReceiverName === 'string' ? rawRest.pixReceiverName.trim() : '',
-          pixReceiverCity: typeof rawRest.pixReceiverCity === 'string' ? rawRest.pixReceiverCity.trim() : '',
+          pixKey: pixKeyCheck.normalized,
+          pixKeyType: resolvedPixType,
+          pixReceiverName: receiverCheck.receiverName,
+          pixReceiverCity: receiverCheck.receiverCity,
           deliveryFeeBase: roundCurrencyServer(fee),
           avgPrepTimeMinutes: Math.round(prepMin),
           avgDeliveryTimeMinutes: Math.round(delivMin),
@@ -2375,6 +2431,76 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     const expectedTotal = roundCurrencyServer(calculatedSubtotal + expectedDeliveryFee - effectiveDiscount);
     if (Math.abs((Number(order.totalAmount) || 0) - expectedTotal) > 0.01) {
       return { ok: false, status: 400, message: 'Valor total do pedido não confere matematicamente.' };
+    }
+
+    if (String(order.paymentMethod) === 'PIX' && order.pixCode !== undefined && order.pixCode !== null) {
+      if (typeof order.pixCode !== 'string' || !order.pixCode.trim()) {
+        return { ok: false, status: 400, message: 'Código PIX informado no pedido é inválido.' };
+      }
+
+      const pixAudit = validatePixPayload(order.pixCode.trim());
+      if (!pixAudit.valid) {
+        return {
+          ok: false,
+          status: 400,
+          message: `Código PIX (BR Code) inválido: ${pixAudit.error || 'estrutura ou CRC16 incorreto'}.`,
+        };
+      }
+
+      if (!pixAudit.amount) {
+        return {
+          ok: false,
+          status: 400,
+          message: 'Código PIX do pedido não contém o valor exato da cobrança.',
+        };
+      }
+
+      const pixAmount = roundCurrencyServer(Number(pixAudit.amount));
+      if (!Number.isFinite(pixAmount) || Math.abs(pixAmount - expectedTotal) > 0.01) {
+        return {
+          ok: false,
+          status: 400,
+          message: `Valor do código PIX (R$ ${pixAudit.amount}) diverge do total do pedido (R$ ${expectedTotal.toFixed(2)}).`,
+        };
+      }
+
+      if (order.pixTxId !== undefined && order.pixTxId !== null && String(order.pixTxId).trim() !== '') {
+        if (!pixAudit.txId || sanitizeTxId(String(order.pixTxId)) !== pixAudit.txId) {
+          return {
+            ok: false,
+            status: 400,
+            message: 'TXID do pedido diverge do payload PIX informado.',
+          };
+        }
+      }
+
+      if (adminDb) {
+        try {
+          const restSnap = await adminDb.collection('configs').doc('restaurant').get();
+          if (restSnap.exists) {
+            const restData = (restSnap.data() || {}) as Record<string, any>;
+            const officialRawKey = typeof restData.pixKey === 'string' ? restData.pixKey.trim() : '';
+            if (officialRawKey) {
+              const officialType =
+                (typeof restData.pixKeyType === 'string' && restData.pixKeyType.trim()
+                  ? (restData.pixKeyType.trim().toUpperCase() as PixKeyType)
+                  : undefined) || inferPixKeyType(officialRawKey);
+              if (officialType) {
+                const officialKeyCheck = validatePixKey(officialRawKey, officialType);
+                if (officialKeyCheck.valid && pixAudit.pixKey !== officialKeyCheck.normalized) {
+                  return {
+                    ok: false,
+                    status: 400,
+                    message: 'A chave PIX do payload não corresponde à chave oficial cadastrada no estabelecimento.',
+                  };
+                }
+              }
+            }
+          }
+        } catch {
+          // Do not mask Firestore read errors here when order persistence itself checks Firestore atomically
+        }
+      }
     }
 
     const cleanOrder: Record<string, any> = {};

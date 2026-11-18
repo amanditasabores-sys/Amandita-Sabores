@@ -8,6 +8,8 @@ import {
   validatePixKey,
   validatePixReceiver,
   getPixKeyHint,
+  inferPixKeyType,
+  roundPixAmount,
 } from '../../utils/pix';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { formatCurrency } from '../../utils/formatters';
@@ -364,13 +366,30 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
   const [testAmount, setTestAmount] = useState('25.00');
   const [testPixCode, setTestPixCode] = useState('');
   const [testQrDataUrl, setTestQrDataUrl] = useState('');
+  const [testQrError, setTestQrError] = useState<string | null>(null);
   const [copiedTestCode, setCopiedTestCode] = useState(false);
 
+  const parsedTestAmountRaw = parseFloat(String(testAmount).replace(',', '.'));
+  const parsedTestAmount =
+    Number.isFinite(parsedTestAmountRaw) && parsedTestAmountRaw > 0
+      ? roundPixAmount(parsedTestAmountRaw)
+      : 0;
+
+  const effectivePixKeyType = config.pixKeyType || inferPixKeyType(config.pixKey || '');
+
   const generateTestPix = async () => {
+    setTestQrError(null);
     const rawKey = (config.pixKey || '').trim();
-    const keyType = config.pixKeyType || 'EMAIL';
     if (!rawKey) {
       setPixValidationError(null);
+      setTestPixCode('');
+      setTestQrDataUrl('');
+      return;
+    }
+
+    const keyType = config.pixKeyType || inferPixKeyType(rawKey);
+    if (!keyType) {
+      setPixValidationError('Selecione o tipo da chave PIX antes de gerar o QR Code.');
       setTestPixCode('');
       setTestQrDataUrl('');
       return;
@@ -386,20 +405,29 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
 
     const receiverCheck = validatePixReceiver(config.pixReceiverName, config.pixReceiverCity);
     if (!receiverCheck.valid) {
-      setPixValidationError(null);
+      setPixValidationError(
+        receiverCheck.error || 'Informe Nome e Cidade do Titular da conta PIX para gerar o QR Code.'
+      );
       setTestPixCode('');
       setTestQrDataUrl('');
       return;
     }
 
-    const amt = parseFloat(testAmount) || 1.00;
+    if (!Number.isFinite(parsedTestAmountRaw) || parsedTestAmount <= 0) {
+      setPixValidationError(null);
+      setTestQrError('Informe um valor de simulação maior que R$ 0,00.');
+      setTestPixCode('');
+      setTestQrDataUrl('');
+      return;
+    }
+
     const pixRes = generatePurchasePixPayload({
       pixKey: validation.normalized,
       keyType,
       receiverName: receiverCheck.receiverName,
       receiverCity: receiverCheck.receiverCity,
       storeName: config.name,
-      amount: amt,
+      amount: parsedTestAmount,
       txId: 'TESTEPIX',
       description: 'Amandita Sabores',
     });
@@ -412,13 +440,14 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     }
 
     setPixValidationError(null);
+    setTestPixCode(pixRes.payload);
     try {
-      setTestPixCode(pixRes.payload);
       const qr = await generateQRCodeDataUrl(pixRes.payload, { width: 260, margin: 1 });
       setTestQrDataUrl(qr);
+      setTestQrError(null);
     } catch {
-      setTestPixCode('');
       setTestQrDataUrl('');
+      setTestQrError('Não foi possível gerar a imagem do QR Code PIX. Utilize o Copia e Cola abaixo.');
     }
   };
 
@@ -454,8 +483,23 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
       return;
     }
 
-    const keyType = config.pixKeyType || 'EMAIL';
-    const validation = validatePixKey(config.pixKey || '', keyType);
+    const rawKey = (config.pixKey || '').trim();
+    if (!rawKey) {
+      const msg = 'Informe a chave PIX oficial do estabelecimento.';
+      setPixValidationError(msg);
+      setSaveStatus({ type: 'error', message: msg });
+      return;
+    }
+
+    const keyType = config.pixKeyType || inferPixKeyType(rawKey);
+    if (!keyType) {
+      const msg = 'Selecione o tipo da chave PIX (Telefone, CPF, CNPJ, E-mail ou Aleatória).';
+      setPixValidationError(msg);
+      setSaveStatus({ type: 'error', message: msg });
+      return;
+    }
+
+    const validation = validatePixKey(rawKey, keyType);
     if (!validation.valid) {
       const msg = validation.error || 'Chave PIX inválida para o tipo selecionado.';
       setPixValidationError(msg);
@@ -504,6 +548,8 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     try {
       const payloadToSave: RestaurantConfig = {
         ...config,
+        pixKey: validation.normalized,
+        pixKeyType: keyType,
         whatsapp: waCheck.normalized,
         operatingHours: hoursCheck.hours,
         closedPrimaryMessage: primaryMsg,
@@ -689,7 +735,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   Tipo da Chave PIX
                 </label>
                 <select
-                  value={config.pixKeyType || 'EMAIL'}
+                  value={effectivePixKeyType || ''}
                   disabled={isLoadingCloudConfig}
                   onChange={(e) => {
                     const nextType = e.target.value as RestaurantConfig['pixKeyType'];
@@ -698,6 +744,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   }}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:opacity-60 disabled:cursor-not-allowed"
                 >
+                  <option value="" disabled>Selecione o tipo da chave PIX...</option>
                   <option value="CPF">CPF (11 dígitos)</option>
                   <option value="CNPJ">CNPJ (14 dígitos)</option>
                   <option value="TELEFONE">Telefone Celular (com DDD)</option>
@@ -705,7 +752,9 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   <option value="ALEATORIA">Chave Aleatória (EVP)</option>
                 </select>
                 <span className="text-[10px] text-slate-400 mt-1 block">
-                  {getPixKeyHint(config.pixKeyType || 'EMAIL')}
+                  {effectivePixKeyType
+                    ? getPixKeyHint(effectivePixKeyType)
+                    : 'Selecione o tipo da chave PIX (Telefone, CPF, CNPJ, E-mail ou Aleatória).'}
                 </span>
               </div>
 
@@ -720,15 +769,17 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   value={config.pixKey ?? ''}
                   onChange={(e) => updateConfigField({ pixKey: e.target.value })}
                   placeholder={
-                    config.pixKeyType === 'TELEFONE'
+                    effectivePixKeyType === 'TELEFONE'
                       ? 'Ex: (83) 99123-4567'
-                      : config.pixKeyType === 'CPF'
+                      : effectivePixKeyType === 'CPF'
                       ? 'Ex: 123.456.789-00'
-                      : config.pixKeyType === 'CNPJ'
+                      : effectivePixKeyType === 'CNPJ'
                       ? 'Ex: 12.345.678/0001-90'
-                      : config.pixKeyType === 'ALEATORIA'
+                      : effectivePixKeyType === 'ALEATORIA'
                       ? 'Ex: 123e4567-e89b-12d3-a456-426614174000'
-                      : 'Ex: contato@amanditasabores.com.br'
+                      : effectivePixKeyType === 'EMAIL'
+                      ? 'Ex: financeiro@sualoja.com.br'
+                      : 'Informe a chave PIX oficial'
                   }
                   className={`w-full px-3.5 py-2.5 bg-slate-50 border rounded-xl text-xs font-mono font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 disabled:opacity-60 disabled:cursor-not-allowed ${
                     pixValidationError ? 'border-rose-400 focus:ring-rose-500' : 'border-slate-200 focus:ring-amber-500'
@@ -740,7 +791,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   </span>
                 ) : (
                   <span className="text-[10px] text-slate-400 mt-1 block">
-                    Formatada para BACEN: <strong className="font-mono text-emerald-700">{sanitizePixKey(config.pixKey || '', config.pixKeyType) || '—'}</strong>
+                    Formatada para BACEN: <strong className="font-mono text-emerald-700">{sanitizePixKey(config.pixKey || '', effectivePixKeyType) || '—'}</strong>
                   </span>
                 )}
               </div>
@@ -1111,6 +1162,10 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                   alt="QR Code PIX de Teste"
                   className="w-48 h-48 rounded-xl shadow-xs border border-white"
                 />
+              ) : (testQrError || pixValidationError) ? (
+                <div className="w-48 min-h-36 p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-center justify-center text-center text-rose-700 text-[11px] font-semibold leading-snug">
+                  {testQrError || pixValidationError}
+                </div>
               ) : (
                 <div className="w-48 h-48 bg-slate-200 animate-pulse rounded-xl flex items-center justify-center text-slate-400 text-xs">
                   Cadastre a chave PIX
@@ -1119,7 +1174,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
 
               <div className="text-center mt-2.5">
                 <span className="text-xs font-bold text-emerald-700 font-mono">
-                  {formatCurrency(parseFloat(testAmount) || 0)}
+                  {formatCurrency(parsedTestAmount)}
                 </span>
                 <p className="text-[10px] text-slate-400">Beneficiário: {config.pixReceiverName || config.name}</p>
               </div>

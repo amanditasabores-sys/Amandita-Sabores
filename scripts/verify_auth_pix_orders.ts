@@ -396,7 +396,11 @@ async function run() {
     generatePurchasePixPayload,
     generateOrderPixTxId,
     validatePixPayload,
+    parseTLVFields,
+    formatField,
     calculateCRC16,
+    getUtf8ByteLength,
+    inferPixKeyType,
   } = await import('../src/utils/pix');
   const { generateQRCodeDataUrl } = await import('../src/utils/qrcode');
   const { store } = await import('../src/services/store');
@@ -968,6 +972,396 @@ async function run() {
       assert.strictEqual(audit.valid, true);
       assert.strictEqual(audit.amount, expectedTotal.toFixed(2));
       assert.strictEqual(audit.merchantAccountInfo?.['02'], 'Venda PDV Amandita');
+    });
+
+    // 10. Etapa 2: UTF-8 TLV lengths, multibyte CRC16, >99 bytes rejection & duplicate TLV tags
+    await check('10. BR Code UTF-8: comprimento TLV em bytes, CRC16 multibyte, rejeição > 99 bytes e tags duplicadas', () => {
+      // 1) Comprimento TLV em bytes UTF-8
+      assert.strictEqual(getUtf8ByteLength('João'), 5, 'João tem 4 chars UTF-16 mas 5 bytes UTF-8');
+      assert.strictEqual(formatField('59', 'João'), '5905João', 'TLV deve usar comprimento 05 em bytes UTF-8');
+
+      // 2) CRC16 sobre conteúdo ASCII e multibyte UTF-8
+      assert.strictEqual(calculateCRC16('123456789'), '29B1', 'Vetor padrão CRC16-CCITT-FALSE para ASCII 123456789 deve ser 29B1');
+      assert.notStrictEqual(
+        calculateCRC16('5905João'),
+        calculateCRC16('5905Joao'),
+        'CRC16 deve variar entre UTF-8 multibyte e ASCII'
+      );
+      const utf8TlvPayload =
+        formatField('00', '01') +
+        formatField('01', '11') +
+        formatField('26', formatField('00', 'br.gov.bcb.pix') + formatField('01', 'pix@amandita.com')) +
+        formatField('52', '0000') +
+        formatField('53', '986') +
+        formatField('54', '10.50') +
+        formatField('58', 'BR') +
+        formatField('59', 'Padaria João') +
+        formatField('60', 'São Paulo') +
+        formatField('62', formatField('05', 'UTF8TEST')) +
+        '6304';
+      const fullUtf8Payload = `${utf8TlvPayload}${calculateCRC16(utf8TlvPayload)}`;
+      const utf8Audit = validatePixPayload(fullUtf8Payload);
+      assert.strictEqual(utf8Audit.valid, true, `Payload UTF-8 válido falhou: ${utf8Audit.error}`);
+      assert.strictEqual(utf8Audit.receiverName, 'Padaria João');
+      assert.strictEqual(utf8Audit.receiverCity, 'São Paulo');
+
+      // 3) Rejeitar campo TLV acima de 99 bytes
+      assert.throws(
+        () => formatField('02', 'A'.repeat(100)),
+        /99 bytes/,
+        'formatField deve rejeitar valor com > 99 bytes'
+      );
+      assert.throws(
+        () => formatField('02', 'é'.repeat(50)), // 50 chars = 100 UTF-8 bytes!
+        /99 bytes/,
+        'formatField deve rejeitar valor multibyte com > 99 bytes UTF-8'
+      );
+
+      // 4) Detectar tags TLV duplicadas (raiz e subcampo)
+      const bodyWithDupTag =
+        formatField('00', '01') +
+        formatField('01', '11') +
+        formatField('26', formatField('00', 'br.gov.bcb.pix') + formatField('01', 'pix@amandita.com')) +
+        formatField('52', '0000') +
+        formatField('53', '986') +
+        formatField('54', '10.00') +
+        formatField('54', '99.00') + // tag duplicada!
+        formatField('58', 'BR') +
+        formatField('59', 'AMANDITA') +
+        formatField('60', 'CAMPINA') +
+        formatField('62', formatField('05', 'DUP1')) +
+        '6304';
+      const dupPayload = `${bodyWithDupTag}${calculateCRC16(bodyWithDupTag)}`;
+      const dupAudit = validatePixPayload(dupPayload);
+      assert.strictEqual(dupAudit.valid, false, 'Tag TLV 54 duplicada deve ser rejeitada');
+      assert(dupAudit.error?.includes('duplicada'));
+
+      const parsedNestedDup = parseTLVFields(
+        formatField('00', 'br.gov.bcb.pix') + formatField('01', 'a@b.com') + formatField('01', 'c@d.com')
+      );
+      assert.strictEqual(parsedNestedDup.valid, false, 'Subtag duplicada dentro do Campo 26 deve ser rejeitada');
+    });
+
+    // 11. Etapa 2: Acentos/caracteres especiais, todos os 5 tipos de chave e validação de e-mail ASCII
+    await check('11. Chaves PIX (5 tipos) + acentos/caracteres especiais + rejeição de recebedor/cidade/chave inválidos', () => {
+      // Todos os 5 tipos com recebedor/cidade/descrição acentuados
+      const allFiveKeys: Array<{ type: 'TELEFONE' | 'CPF' | 'CNPJ' | 'EMAIL' | 'ALEATORIA'; key: string }> = [
+        { type: 'TELEFONE', key: '(83) 99123-4567' },
+        { type: 'CPF', key: '529.982.247-25' },
+        { type: 'CNPJ', key: '11.222.333/0001-81' },
+        { type: 'EMAIL', key: 'vendas@amanditasabores.com.br' },
+        { type: 'ALEATORIA', key: '123e4567-e89b-12d3-a456-426614174000' },
+      ];
+
+      for (const sample of allFiveKeys) {
+        const res = generatePurchasePixPayload({
+          pixKey: sample.key,
+          keyType: sample.type,
+          receiverName: 'São João & Cia — Café D’Ávila!',
+          receiverCity: 'João Pessoa/PB',
+          amount: 19.9,
+          txId: `TX${sample.type}`,
+          description: 'Cuscuz nº 1 — Promoção!',
+        });
+        assert.strictEqual(res.success, true, `Falha no tipo ${sample.type}: ${res.success ? '' : res.error}`);
+        if (res.success) {
+          const audit = validatePixPayload(res.payload);
+          assert.strictEqual(audit.valid, true, `Payload inválido para ${sample.type}: ${audit.error}`);
+          assert.strictEqual(audit.amount, '19.90');
+          assert.strictEqual(audit.receiverName, 'SAO JOAO CIA CAFE D AVILA'.slice(0, 25).trim());
+          assert.strictEqual(audit.receiverCity, 'JOAO PESSOA PB');
+        }
+      }
+
+      // E-mail com acento ou espaço não é aceito pelo padrão PIX/BACEN
+      assert.strictEqual(validatePixKey('josé@domínio.com', 'EMAIL').valid, false);
+      assert.strictEqual(validatePixKey('joao silva@dominio.com', 'EMAIL').valid, false);
+
+      // Rejeição sem fallback quando recebedor, cidade ou chave são inválidos
+      const missingName = generatePurchasePixPayload({
+        pixKey: 'vendas@amandita.com',
+        keyType: 'EMAIL',
+        receiverName: '',
+        receiverCity: 'Campina Grande',
+        storeName: 'Loja Ignorada',
+        amount: 25,
+      });
+      assert.strictEqual(missingName.success, false, 'Não pode usar fallback quando receiverName está vazio');
+
+      const missingCity = generatePurchasePixPayload({
+        pixKey: 'vendas@amandita.com',
+        keyType: 'EMAIL',
+        receiverName: 'Amandita Sabores',
+        receiverCity: '',
+        amount: 25,
+      });
+      assert.strictEqual(missingCity.success, false, 'Não pode usar fallback quando receiverCity está vazio');
+
+      assert.throws(() =>
+        generatePixCopiaECola({
+          pixKey: 'vendas@amandita.com',
+          keyType: 'EMAIL',
+          receiverName: 'A', // < 2 chars
+          receiverCity: 'Campina Grande',
+          amount: 25,
+        })
+      );
+
+      // Telefone sem pixKeyType nunca cai para EMAIL
+      assert.strictEqual(inferPixKeyType('(83) 99123-4567'), 'TELEFONE');
+    });
+
+    // 12. Etapa 2: Valores monetários exatos e inválidos (0.01, 1.005, 10.50, 1999.99, 0, negativo, NaN)
+    await check('12. Valores monetários: 0.01, 1.005->1.01, 10.50, 1999.99 e rejeição de 0, negativo, NaN', () => {
+      const validCases: Array<[number, string]> = [
+        [0.01, '0.01'],
+        [1.005, '1.01'],
+        [10.5, '10.50'],
+        [1999.99, '1999.99'],
+      ];
+      for (const [amount, expectedStr] of validCases) {
+        const res = generatePurchasePixPayload({
+          pixKey: '11222333000181',
+          keyType: 'CNPJ',
+          receiverName: 'Amandita Sabores',
+          receiverCity: 'Campina Grande',
+          amount,
+          txId: 'VALTEST',
+        });
+        assert.strictEqual(res.success, true, `Valor ${amount} deve gerar payload válido`);
+        if (res.success) {
+          const audit = validatePixPayload(res.payload);
+          assert.strictEqual(audit.valid, true);
+          assert.strictEqual(audit.amount, expectedStr, `Valor ${amount} deve gerar Campo 54 = ${expectedStr}`);
+        }
+      }
+
+      for (const invalidAmount of [0, -1, -0.01, Number.NaN, Infinity]) {
+        const badRes = generatePurchasePixPayload({
+          pixKey: '11222333000181',
+          keyType: 'CNPJ',
+          receiverName: 'Amandita Sabores',
+          receiverCity: 'Campina Grande',
+          amount: invalidAmount,
+        });
+        assert.strictEqual(badRes.success, false, `Valor inválido ${invalidAmount} deve ser rejeitado`);
+      }
+    });
+
+    // 13. Etapa 2: Erro explícito no QR Code + Bloqueio no PDV + StoreSettings sem fallback silencioso
+    await check('13. QR Code: erro propagado sem string vazia + PDV bloqueia finalização preservando Copia e Cola', async () => {
+      await assert.rejects(
+        () => generateQRCodeDataUrl(''),
+        /vazio|inválido/,
+        'generateQRCodeDataUrl deve rejeitar com Error em vez de retornar string vazia'
+      );
+
+      const posCode = fs.readFileSync(path.resolve(process.cwd(), 'src/components/admin/PointOfSale.tsx'), 'utf8');
+      assert(posCode.includes("setPosPixQrError('Não foi possível gerar o QR Code PIX.')"));
+      assert(posCode.includes('Boolean(posPixError) || !posPixCode'));
+      assert(posCode.includes('{posPixCode && ('), 'PDV deve preservar Copia e Cola válido quando QR falhar');
+
+      const settingsCode = fs.readFileSync(path.resolve(process.cwd(), 'src/components/admin/StoreSettings.tsx'), 'utf8');
+      assert(settingsCode.includes('setTestQrError('), 'Simulador deve reportar erro explícito de QR');
+      assert(!settingsCode.includes('parseFloat(testAmount) || 1.00'), 'Simulador não deve mascarar 0/NaN como 1.00');
+
+      const menuCode = fs.readFileSync(path.resolve(process.cwd(), 'src/components/menu/CustomerMenu.tsx'), 'utf8');
+      assert(menuCode.includes('setPixQrError('), 'Cardápio público deve exibir aviso caso imagem do QR falhe');
+      assert(menuCode.includes('pixPrecheck'), 'Cardápio público deve pré-validar geração PIX antes de enviar pedido');
+    });
+
+    // 14. Etapa 2: Servidor valida config PIX (/api/store/schedule) e payload PIX (/api/orders)
+    await check('14. Servidor: /api/store/schedule e /api/orders rejeitam config/BR Code adulterado e mantêm PIX PENDENTE', async () => {
+      // 14a) /api/store/schedule rejeita chave inválida e recebedor inválido
+      const badScheduleKeyRes = await realFetch(`${expressBaseUrl}/api/store/schedule`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-admin' },
+        body: JSON.stringify({
+          operatingHours: [],
+          closedPrimaryMessage: 'Fechado',
+          restaurantConfig: {
+            name: 'Amandita Sabores',
+            whatsapp: '5583991234567',
+            pixKey: '111.111.111-11',
+            pixKeyType: 'CPF',
+            pixReceiverName: 'Amandita Sabores',
+            pixReceiverCity: 'Campina Grande',
+          },
+        }),
+      });
+      assert.strictEqual(badScheduleKeyRes.status, 400, 'CPF inválido deve ser rejeitado em /api/store/schedule');
+
+      const badScheduleReceiverRes = await realFetch(`${expressBaseUrl}/api/store/schedule`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-admin' },
+        body: JSON.stringify({
+          operatingHours: [],
+          closedPrimaryMessage: 'Fechado',
+          restaurantConfig: {
+            name: 'Amandita Sabores',
+            whatsapp: '5583991234567',
+            pixKey: '(83) 99123-4567',
+            // omit pixKeyType: servidor deve inferir TELEFONE, mas rejeitar cidade vazia
+            pixReceiverName: 'Amandita Sabores',
+            pixReceiverCity: '',
+          },
+        }),
+      });
+      assert.strictEqual(badScheduleReceiverRes.status, 400, 'Cidade recebedora vazia deve ser rejeitada no servidor');
+
+      // 14b) /api/orders rejeita código PIX adulterado ou com valor divergente
+      const validOrderPix = generatePurchasePixPayload({
+        pixKey: '(83) 99123-4567',
+        keyType: 'TELEFONE',
+        receiverName: 'Amandita Sabores',
+        receiverCity: 'Campina Grande',
+        amount: 14.0,
+        txId: 'ORDPIXVALID1',
+      });
+      if (!validOrderPix.success) throw new Error(validOrderPix.error);
+
+      // Valor divergente (BR Code válido para R$ 1.00 em pedido de R$ 14.00)
+      const mismatchedAmountPix = generatePurchasePixPayload({
+        pixKey: '(83) 99123-4567',
+        keyType: 'TELEFONE',
+        receiverName: 'Amandita Sabores',
+        receiverCity: 'Campina Grande',
+        amount: 1.0,
+        txId: 'ORDPIXMISMATCH1',
+      });
+      if (!mismatchedAmountPix.success) throw new Error(mismatchedAmountPix.error);
+
+      const baseHttpOrder = {
+        id: `ord-srv-pix-${Date.now()}`,
+        orderNumber: '#9010',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        fulfillmentType: 'RETIRADA',
+        status: 'NOVO',
+        paymentStatus: 'PENDENTE',
+        paymentMethod: 'PIX',
+        customer: { name: 'Cliente Server PIX', phone: '83991234567' },
+        items: [
+          {
+            id: 'it-srv-1',
+            menuItemId: 'cuscuz-carne-sol-queijo',
+            name: 'Cuscuz',
+            quantity: 1,
+            unitPrice: 14.0,
+            subtotal: 14.0,
+          },
+        ],
+        subtotal: 14.0,
+        deliveryFee: 0,
+        discount: 0,
+        totalAmount: 14.0,
+        trackingCode: 'tk_srv_pix_validation_12345678901234',
+      };
+
+      // Tampered CRC16 must return 400 even without staff auth (validated before persistence)
+      const badCrcRes = await realFetch(`${expressBaseUrl}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          order: {
+            ...baseHttpOrder,
+            id: `${baseHttpOrder.id}-badcrc`,
+            pixCode: `${validOrderPix.payload.slice(0, -4)}0000`,
+            pixTxId: 'ORDPIXVALID1',
+          },
+        }),
+      });
+      assert.strictEqual(badCrcRes.status, 400, 'BR Code com CRC16 adulterado deve ser rejeitado com 400');
+
+      const mismatchRes = await realFetch(`${expressBaseUrl}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-atendente' },
+        body: JSON.stringify({
+          order: {
+            ...baseHttpOrder,
+            id: `${baseHttpOrder.id}-mismatch`,
+            pixCode: mismatchedAmountPix.payload,
+            pixTxId: 'ORDPIXMISMATCH1',
+          },
+        }),
+      });
+      assert.strictEqual(mismatchRes.status, 400, 'BR Code com valor divergente do pedido deve ser rejeitado com 400');
+
+      // Código PIX íntegro (staff PDV/Atendente) persiste e mantém pagamento PENDENTE (sem confirmação automática)
+      const validHttpRes = await realFetch(`${expressBaseUrl}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok-atendente' },
+        body: JSON.stringify({
+          order: {
+            ...baseHttpOrder,
+            id: `${baseHttpOrder.id}-ok`,
+            pixCode: validOrderPix.payload,
+            pixTxId: 'ORDPIXVALID1',
+          },
+        }),
+      });
+      assert.strictEqual(validHttpRes.status, 200, 'Pedido PIX válido deve ser persistido com sucesso');
+      const validHttpBody = await validHttpRes.json();
+      assert.strictEqual(validHttpBody.order.paymentStatus, 'PENDENTE', 'Pedido PIX deve permanecer PENDENTE até conferência manual');
+    });
+
+    // 15. Etapa 2: Não regressão de Dinheiro, Cartão e Fluxo de Caixa (abrir, movimentar, fechar)
+    await check('15. Não regressão: Dinheiro e Cartão + abertura, movimentação e fechamento de caixa intactos', async () => {
+      await store.login('caixa', '123456');
+
+      // Reset shift para testar abertura -> movimentação -> venda Dinheiro/Cartão -> fechamento
+      localStorage.setItem('gf_current_cash_shift', 'null');
+      const openedShift = store.openCashRegister(100, 'Operador Caixa');
+      assert(openedShift && openedShift.status === 'ABERTO', 'Abertura de caixa deve funcionar normalmente');
+
+      const suprimento = store.addCashMovement('SUPRIMENTO', 50, 'Troco inicial', 'Operador Caixa');
+      assert(suprimento && suprimento.amount === 50, 'Movimentação SUPRIMENTO no caixa deve funcionar normalmente');
+
+      const cashRes = await store.createAndConfirmPaidOrderAsync(
+        {
+          fulfillmentType: 'RETIRADA',
+          estimatedDeliveryMinutes: 15,
+          customer: { name: 'Cliente Dinheiro', phone: '83990001111' },
+          items: [{ id: 'it-cash', menuItemId: 'cuscuz-manteiga', name: 'Cuscuz com manteiga', quantity: 2, unitPrice: 5, subtotal: 10 }],
+          subtotal: 10,
+          deliveryFee: 0,
+          discount: 0,
+          totalAmount: 10,
+          paymentMethod: 'DINHEIRO',
+          paymentStatus: 'PAGO',
+        },
+        'Operador Caixa'
+      );
+      assert(cashRes.order, 'Venda em Dinheiro deve ser criada');
+      assert.strictEqual(cashRes.order!.paymentMethod, 'DINHEIRO');
+      assert.strictEqual(cashRes.order!.paymentStatus, 'PAGO');
+      assert.strictEqual(cashRes.order!.pixCode, undefined);
+
+      const cardRes = await store.createAndConfirmPaidOrderAsync(
+        {
+          fulfillmentType: 'RETIRADA',
+          estimatedDeliveryMinutes: 15,
+          customer: { name: 'Cliente Cartão', phone: '83990002222' },
+          items: [{ id: 'it-card', menuItemId: 'cuscuz-manteiga', name: 'Cuscuz com manteiga', quantity: 3, unitPrice: 5, subtotal: 15 }],
+          subtotal: 15,
+          deliveryFee: 0,
+          discount: 0,
+          totalAmount: 15,
+          paymentMethod: 'CARTAO_CREDITO',
+          paymentStatus: 'PAGO',
+        },
+        'Operador Caixa'
+      );
+      assert(cardRes.order, 'Venda em Cartão deve ser criada');
+      assert.strictEqual(cardRes.order!.paymentMethod, 'CARTAO_CREDITO');
+      assert.strictEqual(cardRes.order!.paymentStatus, 'PAGO');
+      assert.strictEqual(cardRes.order!.pixCode, undefined);
+
+      // Dinheiro: 100 abertura + 50 suprimento + 10 venda em dinheiro = 160 esperado em espécie (cartão não soma gaveta)
+      const closedShift = store.closeCashRegister(160, 'Operador Caixa', 'Conferido');
+      assert(closedShift && closedShift.status === 'FECHADO', 'Fechamento de caixa deve funcionar normalmente');
+      assert.strictEqual(closedShift!.finalCalculatedBalance, 160);
+      assert.strictEqual(closedShift!.difference, 0);
     });
 
     console.log(`\n============================================================`);

@@ -47,12 +47,47 @@ export const QrCodeManager: React.FC<QrCodeManagerProps> = ({ onNavigateToView }
 
   const [menuQrData, setMenuQrData] = useState<string>('');
   const [deliveryQrData, setDeliveryQrData] = useState<string>('');
+  const [menuQrError, setMenuQrError] = useState<string | null>(null);
+  const [deliveryQrError, setDeliveryQrError] = useState<string | null>(null);
   const [copiedMenu, setCopiedMenu] = useState(false);
   const [copiedDelivery, setCopiedDelivery] = useState(false);
 
   useEffect(() => {
-    generateQRCodeDataUrl(menuUrl, { width: 400, margin: 2 }).then(setMenuQrData);
-    generateQRCodeDataUrl(deliveryUrl, { width: 400, margin: 2 }).then(setDeliveryQrData);
+    let cancelled = false;
+    setMenuQrError(null);
+    setDeliveryQrError(null);
+
+    generateQRCodeDataUrl(menuUrl, { width: 400, margin: 2 })
+      .then((data) => {
+        if (!cancelled) {
+          setMenuQrData(data);
+          setMenuQrError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMenuQrData('');
+          setMenuQrError('Não foi possível gerar o QR Code do cardápio.');
+        }
+      });
+
+    generateQRCodeDataUrl(deliveryUrl, { width: 400, margin: 2 })
+      .then((data) => {
+        if (!cancelled) {
+          setDeliveryQrData(data);
+          setDeliveryQrError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDeliveryQrData('');
+          setDeliveryQrError('Não foi possível gerar o QR Code do entregador.');
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [menuUrl, deliveryUrl]);
 
   const copyToClipboard = (text: string, isMenu: boolean) => {
@@ -67,6 +102,7 @@ export const QrCodeManager: React.FC<QrCodeManagerProps> = ({ onNavigateToView }
   };
 
   const downloadQrCode = (dataUrl: string, filename: string) => {
+    if (!dataUrl) return;
     const a = document.createElement('a');
     a.href = dataUrl;
     a.download = filename;
@@ -206,6 +242,10 @@ export const QrCodeManager: React.FC<QrCodeManagerProps> = ({ onNavigateToView }
                   alt="QR Code Cardápio"
                   className="w-44 h-44 rounded-xl shadow-xs border border-white"
                 />
+              ) : menuQrError ? (
+                <div className="w-44 h-44 bg-rose-50 border border-rose-200 rounded-xl flex items-center justify-center p-3 text-center text-xs font-semibold text-rose-700">
+                  {menuQrError}
+                </div>
               ) : (
                 <div className="w-44 h-44 bg-slate-200 animate-pulse rounded-xl" />
               )}
@@ -301,6 +341,10 @@ export const QrCodeManager: React.FC<QrCodeManagerProps> = ({ onNavigateToView }
                   alt="QR Code Entregador"
                   className="w-44 h-44 rounded-xl shadow-xs border border-white"
                 />
+              ) : deliveryQrError ? (
+                <div className="w-44 h-44 bg-rose-50 border border-rose-200 rounded-xl flex items-center justify-center p-3 text-center text-xs font-semibold text-rose-700">
+                  {deliveryQrError}
+                </div>
               ) : (
                 <div className="w-44 h-44 bg-slate-200 animate-pulse rounded-xl" />
               )}

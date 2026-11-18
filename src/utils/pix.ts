@@ -34,17 +34,76 @@ export interface PixPayloadParams {
   description?: string;
 }
 
+const MAX_PIX_AMOUNT = 999999999.99;
+
+const utf8Encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+const utf8Decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8', { fatal: true }) : null;
+
+export function encodeUtf8(value: string): Uint8Array {
+  if (utf8Encoder) {
+    return utf8Encoder.encode(value);
+  }
+  const encoded = unescape(encodeURIComponent(value));
+  const bytes = new Uint8Array(encoded.length);
+  for (let i = 0; i < encoded.length; i++) {
+    bytes[i] = encoded.charCodeAt(i);
+  }
+  return bytes;
+}
+
+export function decodeUtf8(bytes: Uint8Array): string {
+  if (utf8Decoder) {
+    return utf8Decoder.decode(bytes);
+  }
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return decodeURIComponent(escape(bin));
+}
+
+export function getUtf8ByteLength(value: string): number {
+  return encodeUtf8(value).length;
+}
+
+function sliceToMaxUtf8Bytes(value: string, maxBytes: number): string {
+  if (maxBytes <= 0 || !value) return '';
+  if (getUtf8ByteLength(value) <= maxBytes) return value;
+  let result = '';
+  let usedBytes = 0;
+  for (const ch of value) {
+    const chBytes = getUtf8ByteLength(ch);
+    if (usedBytes + chBytes > maxBytes) break;
+    result += ch;
+    usedBytes += chBytes;
+  }
+  return result;
+}
+
+export function roundPixAmount(amount: number): number {
+  if (!Number.isFinite(amount)) return NaN;
+  return Math.round((amount + Number.EPSILON) * 100) / 100;
+}
+
 export function formatField(id: string, value: string): string {
-  const len = value.length.toString().padStart(2, '0');
+  if (!/^\d{2}$/.test(id)) {
+    throw new Error(`Tag TLV inválida: '${id}'.`);
+  }
+  const byteLength = getUtf8ByteLength(value);
+  if (byteLength > 99) {
+    throw new Error(`Campo TLV '${id}' excede o limite de 99 bytes UTF-8 (${byteLength} bytes).`);
+  }
+  const len = byteLength.toString().padStart(2, '0');
   return `${id}${len}${value}`;
 }
 
 export function calculateCRC16(payload: string): string {
   let crc = 0xffff;
   const polynomial = 0x1021;
+  const bytes = encodeUtf8(payload);
 
-  for (let i = 0; i < payload.length; i++) {
-    crc ^= payload.charCodeAt(i) << 8;
+  for (let i = 0; i < bytes.length; i++) {
+    crc ^= bytes[i] << 8;
     for (let j = 0; j < 8; j++) {
       if ((crc & 0x8000) !== 0) {
         crc = ((crc << 1) ^ polynomial) & 0xffff;
@@ -96,7 +155,7 @@ export function sanitizePixKey(rawKey: string, keyType?: PixKeyType): string {
   }
 
   if (keyType === 'EMAIL' || trimmed.includes('@')) {
-    return trimmed.toLowerCase().replace(/\s+/g, '');
+    return trimmed.toLowerCase();
   }
 
   if (keyType === 'ALEATORIA') {
@@ -178,9 +237,17 @@ export function validatePixKey(rawKey: string, keyType: PixKeyType): PixValidati
     }
 
     case 'EMAIL': {
-      const normalized = trimmed.toLowerCase().replace(/\s+/g, '');
-      if (normalized.length > 77 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(normalized)) {
-        return { valid: false, normalized, error: 'E-mail PIX inválido. Informe um endereço completo (ex: loja@dominio.com).' };
+      const normalized = trimmed.toLowerCase();
+      if (
+        getUtf8ByteLength(normalized) > 77 ||
+        /\s/.test(normalized) ||
+        !/^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(normalized)
+      ) {
+        return {
+          valid: false,
+          normalized,
+          error: 'E-mail PIX inválido. Informe um endereço ASCII completo sem espaços ou acentos (ex: loja@dominio.com).',
+        };
       }
       return { valid: true, normalized };
     }
@@ -315,7 +382,7 @@ export function validatePixReceiver(
  * BACEN EMVCo spec: Max 25 chars, uppercase ASCII alphanumeric and spaces only, no diacritics.
  */
 export function sanitizeMerchantName(rawName?: string): string {
-  return cleanMerchantText(rawName, 25) || 'AMANDITA SABORES';
+  return cleanMerchantText(rawName, 25);
 }
 
 /**
@@ -323,7 +390,7 @@ export function sanitizeMerchantName(rawName?: string): string {
  * BACEN EMVCo spec: Max 15 chars, uppercase ASCII alphanumeric and spaces only, no diacritics.
  */
 export function sanitizeMerchantCity(rawCity?: string): string {
-  return cleanMerchantText(rawCity, 15) || 'CAMPINA GRANDE';
+  return cleanMerchantText(rawCity, 15);
 }
 
 /**
@@ -403,6 +470,7 @@ export function sanitizeDescription(rawDesc?: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
     .slice(0, 20)
     .trim();
 }
@@ -412,25 +480,30 @@ export function sanitizeDescription(rawDesc?: string): string {
  */
 export function generatePixCopiaECola(params: PixPayloadParams): string {
   const effectiveType = params.keyType || inferPixKeyType(params.pixKey);
-  let cleanKey = '';
-  if (effectiveType) {
-    const check = validatePixKey(params.pixKey, effectiveType);
-    if (!check.valid) {
-      throw new Error(check.error || 'Chave PIX inválida ou não informada');
-    }
-    cleanKey = check.normalized;
-  } else {
-    cleanKey = sanitizePixKey(params.pixKey);
-    if (!cleanKey) {
-      throw new Error('Chave PIX inválida ou não informada');
-    }
+  if (!effectiveType) {
+    throw new Error('Tipo de chave PIX não reconhecido ou chave inválida.');
   }
 
-  const cleanName = sanitizeMerchantName(params.receiverName);
-  const cleanCity = sanitizeMerchantCity(params.receiverCity);
-  const roundedAmount = Number.isFinite(params.amount)
-    ? Math.round(params.amount * 100) / 100
-    : 0;
+  const keyCheck = validatePixKey(params.pixKey, effectiveType);
+  if (!keyCheck.valid) {
+    throw new Error(keyCheck.error || 'Chave PIX inválida ou não informada.');
+  }
+  const cleanKey = keyCheck.normalized;
+
+  const receiverCheck = validatePixReceiver(params.receiverName, params.receiverCity);
+  if (!receiverCheck.valid) {
+    throw new Error(receiverCheck.error || 'Nome e cidade do recebedor PIX inválidos.');
+  }
+  const cleanName = receiverCheck.receiverName;
+  const cleanCity = receiverCheck.receiverCity;
+
+  if (!Number.isFinite(params.amount) || params.amount < 0) {
+    throw new Error('Valor PIX inválido.');
+  }
+  const roundedAmount = roundPixAmount(params.amount);
+  if (!Number.isFinite(roundedAmount) || roundedAmount > MAX_PIX_AMOUNT) {
+    throw new Error('Valor PIX excede o limite suportado pelo BR Code.');
+  }
   const cleanAmount = roundedAmount > 0 ? roundedAmount.toFixed(2) : '';
   const txId = sanitizeTxId(params.txId);
   const cleanDesc = params.description ? sanitizeDescription(params.description) : '';
@@ -442,16 +515,20 @@ export function generatePixCopiaECola(params: PixPayloadParams): string {
   // '11' = Static BR Code (allows raw Pix Key + fixed purchase amount + TxID across all Brazilian banks)
   const pointOfInitiation = formatField('01', '11');
 
-  // Field 26: Merchant Account Information (max total value length 99 chars per EMVCo TLV)
+  // Field 26: Merchant Account Information (max total value length 99 UTF-8 bytes per EMVCo TLV)
   const gui = formatField('00', 'br.gov.bcb.pix');
   const key = formatField('01', cleanKey);
-  const maxRemainingForDesc = 99 - (gui.length + key.length) - 4;
+  const maxRemainingForDesc = 99 - (getUtf8ByteLength(gui) + getUtf8ByteLength(key)) - 4;
   const trimmedDesc =
     cleanDesc && maxRemainingForDesc >= 1
-      ? cleanDesc.slice(0, maxRemainingForDesc).trim()
+      ? sliceToMaxUtf8Bytes(cleanDesc, maxRemainingForDesc).trim()
       : '';
   const desc = trimmedDesc ? formatField('02', trimmedDesc) : '';
-  const merchantAccountInfo = formatField('26', `${gui}${key}${desc}`);
+  const merchantAccountValue = `${gui}${key}${desc}`;
+  if (getUtf8ByteLength(merchantAccountValue) > 99) {
+    throw new Error('Campo 26 (Merchant Account Info) excede 99 bytes UTF-8.');
+  }
+  const merchantAccountInfo = formatField('26', merchantAccountValue);
 
   // Field 52: Merchant Category Code (0000 = ISO 18245 default)
   const merchantCategory = formatField('52', '0000');
@@ -477,10 +554,17 @@ export function generatePixCopiaECola(params: PixPayloadParams): string {
   // Assemble payload before CRC
   const rawPayload = `${payloadFormat}${pointOfInitiation}${merchantAccountInfo}${merchantCategory}${transactionCurrency}${transactionAmount}${countryCode}${merchantName}${merchantCity}${additionalDataField}6304`;
 
-  // Calculate CRC16 checksum
+  // Calculate CRC16 checksum over UTF-8 bytes
   const crc16 = calculateCRC16(rawPayload);
+  const finalPayload = `${rawPayload}${crc16}`;
 
-  return `${rawPayload}${crc16}`;
+  // Self-audit final EMV/BR Code before returning
+  const audit = validatePixPayload(finalPayload);
+  if (!audit.valid) {
+    throw new Error(audit.error || 'Falha na auditoria interna do payload PIX gerado.');
+  }
+
+  return finalPayload;
 }
 
 export interface GeneratePurchasePixInput {
@@ -542,18 +626,28 @@ export function generatePurchasePixPayload(
     };
   }
 
-  const roundedAmount = Number.isFinite(input.amount)
-    ? Math.round(input.amount * 100) / 100
-    : 0;
-  if (roundedAmount <= 0) {
+  const roundedAmount = roundPixAmount(input.amount);
+  if (!Number.isFinite(roundedAmount) || roundedAmount <= 0) {
     return {
       success: false,
       error: 'O valor do pedido deve ser maior que zero para gerar o PIX.',
     };
   }
+  if (roundedAmount > MAX_PIX_AMOUNT) {
+    return {
+      success: false,
+      error: 'O valor do pedido excede o limite suportado pelo PIX.',
+    };
+  }
 
-  const receiverName = sanitizeMerchantName(input.receiverName || input.storeName);
-  const receiverCity = sanitizeMerchantCity(input.receiverCity);
+  const receiverCheck = validatePixReceiver(input.receiverName, input.receiverCity);
+  if (!receiverCheck.valid) {
+    return {
+      success: false,
+      error: receiverCheck.error || 'Nome e cidade do titular da conta PIX são obrigatórios.',
+    };
+  }
+
   const txId = input.txId
     ? sanitizeTxId(input.txId)
     : generateOrderPixTxId(input.orderNumber, input.orderId);
@@ -562,20 +656,28 @@ export function generatePurchasePixPayload(
     const payload = generatePixCopiaECola({
       pixKey: keyCheck.normalized,
       keyType: effectiveType,
-      receiverName,
-      receiverCity,
+      receiverName: receiverCheck.receiverName,
+      receiverCity: receiverCheck.receiverCity,
       amount: roundedAmount,
       txId,
       description: input.description,
     });
+
+    const audit = validatePixPayload(payload);
+    if (!audit.valid) {
+      return {
+        success: false,
+        error: audit.error || 'Payload PIX gerado falhou na validação estrutural.',
+      };
+    }
 
     return {
       success: true,
       payload,
       txId,
       normalizedKey: keyCheck.normalized,
-      receiverName,
-      receiverCity,
+      receiverName: receiverCheck.receiverName,
+      receiverCity: receiverCheck.receiverCity,
       amount: roundedAmount,
     };
   } catch (err: unknown) {
@@ -591,29 +693,65 @@ export interface ParsedPixTLV {
 }
 
 /**
- * Parses an EMVCo / BACEN BR Code TLV sequence strictly by declared lengths.
+ * Parses an EMVCo / BACEN BR Code TLV sequence strictly by declared UTF-8 byte lengths,
+ * rejecting malformed tags, truncated blocks, and duplicate tags.
  */
 export function parseTLVFields(raw: string): { valid: boolean; fields: ParsedPixTLV; error?: string } {
   const fields: ParsedPixTLV = {};
-  let index = 0;
+  const rawBytes = encodeUtf8(raw);
+  let byteIndex = 0;
 
-  while (index < raw.length) {
-    if (index + 4 > raw.length) {
-      return { valid: false, fields, error: `Cabeçalho TLV truncado na posição ${index}.` };
+  while (byteIndex < rawBytes.length) {
+    if (byteIndex + 4 > rawBytes.length) {
+      return { valid: false, fields, error: `Cabeçalho TLV truncado na posição de byte ${byteIndex}.` };
     }
-    const tag = raw.slice(index, index + 2);
-    const lenStr = raw.slice(index + 2, index + 4);
+    let headerStr = '';
+    try {
+      headerStr = decodeUtf8(rawBytes.slice(byteIndex, byteIndex + 4));
+    } catch {
+      return { valid: false, fields, error: `Cabeçalho TLV com UTF-8 inválido na posição ${byteIndex}.` };
+    }
+    const tag = headerStr.slice(0, 2);
+    const lenStr = headerStr.slice(2, 4);
     if (!/^\d{2}$/.test(tag) || !/^\d{2}$/.test(lenStr)) {
-      return { valid: false, fields, error: `Tag ou comprimento inválido na posição ${index}: '${tag}${lenStr}'.` };
+      return {
+        valid: false,
+        fields,
+        error: `Tag ou comprimento inválido na posição de byte ${byteIndex}: '${tag}${lenStr}'.`,
+      };
     }
+    if (Object.prototype.hasOwnProperty.call(fields, tag)) {
+      return {
+        valid: false,
+        fields,
+        error: `Tag TLV duplicada detectada: '${tag}'.`,
+      };
+    }
+
     const len = parseInt(lenStr, 10);
-    const valStart = index + 4;
+    const valStart = byteIndex + 4;
     const valEnd = valStart + len;
-    if (valEnd > raw.length) {
-      return { valid: false, fields, error: `Campo '${tag}' declara tamanho ${len}, mas excede o payload.` };
+    if (valEnd > rawBytes.length) {
+      return {
+        valid: false,
+        fields,
+        error: `Campo '${tag}' declara tamanho ${len} bytes, mas excede o payload.`,
+      };
     }
-    fields[tag] = raw.slice(valStart, valEnd);
-    index = valEnd;
+
+    let val = '';
+    try {
+      val = decodeUtf8(rawBytes.slice(valStart, valEnd));
+    } catch {
+      return {
+        valid: false,
+        fields,
+        error: `Valor do campo '${tag}' contém sequência UTF-8 inválida.`,
+      };
+    }
+
+    fields[tag] = val;
+    byteIndex = valEnd;
   }
 
   return { valid: true, fields };
@@ -638,7 +776,7 @@ export interface PixPayloadAuditResult {
  * Validates the complete EMV/BR Code structure and CRC16-CCITT checksum of a generated PIX string.
  */
 export function validatePixPayload(payload: string): PixPayloadAuditResult {
-  if (!payload || payload.length < 16) {
+  if (!payload || getUtf8ByteLength(payload) < 16) {
     return { valid: false, error: 'Payload PIX vazio ou muito curto.' };
   }
 
@@ -649,31 +787,63 @@ export function validatePixPayload(payload: string): PixPayloadAuditResult {
 
   const f = parsed.fields;
   if (f['00'] !== '01') return { valid: false, error: 'Campo 00 (Format Indicator) deve ser 01.' };
+  if (f['01'] !== undefined && f['01'] !== '11' && f['01'] !== '12') {
+    return { valid: false, error: 'Campo 01 (Point of Initiation) deve ser 11 ou 12.' };
+  }
   if (f['52'] !== '0000') return { valid: false, error: 'Campo 52 (MCC) deve ser 0000.' };
   if (f['53'] !== '986') return { valid: false, error: 'Campo 53 (Moeda BRL) deve ser 986.' };
+
+  if (f['54'] !== undefined) {
+    if (!/^\d+\.\d{2}$/.test(f['54']) || getUtf8ByteLength(f['54']) > 13) {
+      return { valid: false, error: 'Campo 54 (Valor) possui formato inválido.' };
+    }
+    const parsedAmount = Number(f['54']);
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0 || parsedAmount > MAX_PIX_AMOUNT) {
+      return { valid: false, error: 'Campo 54 (Valor) deve ser maior que zero e dentro do limite.' };
+    }
+  }
+
   if (f['58'] !== 'BR') return { valid: false, error: 'Campo 58 (País) deve ser BR.' };
-  if (!f['59'] || f['59'].length > 25) return { valid: false, error: 'Campo 59 (Recebedor) ausente ou > 25 chars.' };
-  if (!f['60'] || f['60'].length > 15) return { valid: false, error: 'Campo 60 (Cidade) ausente ou > 15 chars.' };
+  const nameBytes = f['59'] ? getUtf8ByteLength(f['59']) : 0;
+  if (!f['59'] || nameBytes < 1 || nameBytes > 25) {
+    return { valid: false, error: 'Campo 59 (Recebedor) ausente ou > 25 bytes.' };
+  }
+  const cityBytes = f['60'] ? getUtf8ByteLength(f['60']) : 0;
+  if (!f['60'] || cityBytes < 1 || cityBytes > 15) {
+    return { valid: false, error: 'Campo 60 (Cidade) ausente ou > 15 bytes.' };
+  }
 
   if (!f['26']) return { valid: false, error: 'Campo 26 (Merchant Account Info) ausente.' };
+  if (getUtf8ByteLength(f['26']) > 99) {
+    return { valid: false, error: 'Campo 26 (Merchant Account Info) excede 99 bytes.' };
+  }
   const mai = parseTLVFields(f['26']);
   if (!mai.valid) return { valid: false, error: `Campo 26 inválido: ${mai.error}` };
   if (mai.fields['00'] !== 'br.gov.bcb.pix') {
     return { valid: false, error: 'Subcampo 26.00 deve ser br.gov.bcb.pix.' };
   }
-  if (!mai.fields['01']) {
-    return { valid: false, error: 'Subcampo 26.01 (Chave PIX) ausente.' };
+  if (!mai.fields['01'] || getUtf8ByteLength(mai.fields['01']) > 77) {
+    return { valid: false, error: 'Subcampo 26.01 (Chave PIX) ausente ou inválido.' };
   }
 
   let addData: ParsedPixTLV | undefined;
   if (f['62']) {
+    if (getUtf8ByteLength(f['62']) > 99) {
+      return { valid: false, error: 'Campo 62 (Additional Data) excede 99 bytes.' };
+    }
     const parsed62 = parseTLVFields(f['62']);
     if (!parsed62.valid) return { valid: false, error: `Campo 62 inválido: ${parsed62.error}` };
+    if (
+      parsed62.fields['05'] !== undefined &&
+      (parsed62.fields['05'].length === 0 || getUtf8ByteLength(parsed62.fields['05']) > 25)
+    ) {
+      return { valid: false, error: 'Subcampo 62.05 (TXID) vazio ou > 25 bytes.' };
+    }
     addData = parsed62.fields;
   }
 
   const crcProvided = f['63'];
-  if (!crcProvided || crcProvided.length !== 4 || !payload.endsWith(`6304${crcProvided}`)) {
+  if (!crcProvided || !/^[0-9A-F]{4}$/.test(crcProvided) || !payload.endsWith(`6304${crcProvided}`)) {
     return { valid: false, error: 'Campo 63 (CRC16) ausente ou mal posicionado.' };
   }
 
