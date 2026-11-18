@@ -43,6 +43,57 @@ interface DeliverySupervisorDashboardProps {
   initialOrderId?: string;
 }
 
+export function doesDeliveryBelongToDriver(ord: Order, driver: User): boolean {
+  const driverId = driver.id;
+  if (
+    ord.deliveryPersonId &&
+    (ord.deliveryPersonId === driverId || ord.deliveryPersonId === `driver-${driverId}`)
+  ) {
+    return true;
+  }
+  if (
+    ord.deliveryPerson?.id &&
+    (ord.deliveryPerson.id === driverId || ord.deliveryPerson.id === `driver-${driverId}`)
+  ) {
+    return true;
+  }
+  const cleanDriverName = (driver.name || driver.username || '')
+    .toLowerCase()
+    .replace(/entregador\s*/g, '')
+    .trim();
+  const orderDriverName = (ord.deliveryPerson?.name || ord.deliveryPersonName || '')
+    .toLowerCase()
+    .replace(/entregador\s*/g, '')
+    .trim();
+  return Boolean(
+    orderDriverName &&
+      cleanDriverName &&
+      (orderDriverName === cleanDriverName ||
+        orderDriverName.includes(cleanDriverName) ||
+        cleanDriverName.includes(orderDriverName))
+  );
+}
+
+export function getDriverDeliveriesForDate(
+  deliveryOrders: Order[],
+  driver: User,
+  dateKey: string
+): Order[] {
+  const targetDateKey = dateKey || getFortalezaDateKey();
+  return deliveryOrders
+    .filter((ord) => {
+      if (!doesDeliveryBelongToDriver(ord, driver)) return false;
+      return getFortalezaDateKey(ord.createdAt) === targetDateKey;
+    })
+    .sort((a, b) => {
+      const timeA = Date.parse(a.createdAt);
+      const timeB = Date.parse(b.createdAt);
+      const safeA = Number.isFinite(timeA) ? timeA : 0;
+      const safeB = Number.isFinite(timeB) ? timeB : 0;
+      return safeB - safeA;
+    });
+}
+
 export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardProps> = ({
   currentUser,
   adminUser,
@@ -63,6 +114,7 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
   const [deliveryFilter, setDeliveryFilter] = useState<'todas' | 'aguardando' | 'em_rota' | 'prontas' | 'concluidas' | 'pendencias_anteriores'>('todas');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDriver, setSelectedDriver] = useState<User | null>(null);
+  const [driverHistoryDate, setDriverHistoryDate] = useState<string>(() => getFortalezaDateKey());
 
   // Modals
   const [assignModalOrder, setAssignModalOrder] = useState<Order | null>(() => {
@@ -157,15 +209,7 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
 
   // Driver metrics calculation helper
   const getDriverMetrics = (driver: User) => {
-    const driverId = driver.id;
-    const cleanDriverName = (driver.name || driver.username).toLowerCase().replace(/entregador\s*/g, '').trim();
-
-    const isMatch = (ord: Order) => {
-      if (ord.deliveryPersonId && (ord.deliveryPersonId === driverId || ord.deliveryPersonId === `driver-${driverId}`)) return true;
-      if (ord.deliveryPerson?.id && (ord.deliveryPerson.id === driverId || ord.deliveryPerson.id === `driver-${driverId}`)) return true;
-      const orderDriverName = (ord.deliveryPerson?.name || ord.deliveryPersonName || '').toLowerCase().replace(/entregador\s*/g, '').trim();
-      return orderDriverName && cleanDriverName && (orderDriverName === cleanDriverName || orderDriverName.includes(cleanDriverName) || cleanDriverName.includes(orderDriverName));
-    };
+    const isMatch = (ord: Order) => doesDeliveryBelongToDriver(ord, driver);
 
     const assignedToday = todayDeliveryOrders.filter(isMatch);
     const completed = assignedToday.filter((o) => o.status === 'ENTREGUE');
@@ -1064,7 +1108,10 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
 
                       {/* Consult details button */}
                       <button
-                        onClick={() => setSelectedDriver(driver)}
+                        onClick={() => {
+                          setDriverHistoryDate(getFortalezaDateKey());
+                          setSelectedDriver(driver);
+                        }}
                         className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-amber-400 font-bold rounded-xl text-xs transition border border-slate-700 flex items-center justify-center gap-1.5 cursor-pointer"
                       >
                         <span>Ver Entregas deste Entregador</span>
@@ -1605,62 +1652,115 @@ export const DeliverySupervisorDashboard: React.FC<DeliverySupervisorDashboardPr
               </div>
             </div>
 
-            {/* Driver Linked Orders List */}
-            <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
-              <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
-                Entregas Vinculadas a Este Entregador:
-              </h4>
+            {(() => {
+              const linkedOrders = getDriverDeliveriesForDate(
+                deliveryOrders,
+                selectedDriver,
+                driverHistoryDate
+              );
+              const isViewingToday = driverHistoryDate === todayStr;
 
-              {(() => {
-                const driverMetrics = getDriverMetrics(selectedDriver);
-                const linkedOrders = driverMetrics.recentHistory;
-
-                if (linkedOrders.length === 0) {
-                  return (
-                    <p className="text-xs text-slate-500 italic text-center py-8">
-                      Nenhuma entrega vinculada a este entregador até o momento.
-                    </p>
-                  );
-                }
-
-                return linkedOrders.map((ord) => (
-                  <div
-                    key={ord.id}
-                    className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl flex items-center justify-between gap-3 text-xs"
-                  >
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-white font-mono">{ord.orderNumber}</span>
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                          ord.status === 'ENTREGUE'
-                            ? 'bg-emerald-500/20 text-emerald-300'
-                            : ord.status === 'EM_ROTA'
-                            ? 'bg-indigo-500/20 text-indigo-300'
-                            : 'bg-amber-500/20 text-amber-300'
-                        }`}>
-                          {ord.status}
+              return (
+                <>
+                  {/* Date Filter Controls & Summary */}
+                  <div className="mb-3 p-3 bg-slate-950/70 border border-slate-800 rounded-2xl flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <Calendar className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span className="text-xs font-bold text-white">
+                          Data: {formatFortalezaDateLabel(driverHistoryDate)}
                         </span>
+                        {isViewingToday && (
+                          <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/30">
+                            Hoje
+                          </span>
+                        )}
                       </div>
-                      <p className="text-slate-300 mt-0.5">{ord.customer.name}</p>
-                      <p className="text-[10px] text-slate-400 font-mono">
-                        {formatDateTime(ord.createdAt)} · {formatCurrency(ord.totalAmount)}
+                      <p className="text-[11px] text-slate-400">
+                        <strong className="text-amber-400 font-mono">{linkedOrders.length}</strong>{' '}
+                        {linkedOrders.length === 1 ? 'entrega encontrada' : 'entregas encontradas'}
                       </p>
                     </div>
 
-                    <button
-                      onClick={() => {
-                        setSelectedDriver(null);
-                        setAssignModalOrder(ord);
-                        setSelectedNewDriverId(ord.deliveryPersonId || '');
-                      }}
-                      className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg text-xs font-semibold border border-slate-700 cursor-pointer"
-                    >
-                      Reatribuir
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        aria-label="Filtrar entregas do entregador por data"
+                        value={driverHistoryDate}
+                        onChange={(e) => {
+                          const nextDate = e.target.value;
+                          setDriverHistoryDate(
+                            /^\d{4}-\d{2}-\d{2}$/.test(nextDate) ? nextDate : getFortalezaDateKey()
+                          );
+                        }}
+                        className="px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setDriverHistoryDate(getFortalezaDateKey())}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition border cursor-pointer shrink-0 ${
+                          isViewingToday
+                            ? 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+                            : 'bg-amber-500 hover:bg-amber-400 text-slate-950 border-amber-400'
+                        }`}
+                      >
+                        Hoje
+                      </button>
+                    </div>
                   </div>
-                ));
-              })()}
-            </div>
+
+                  {/* Driver Linked Orders List */}
+                  <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
+                    <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                      Entregas Vinculadas a Este Entregador ({formatFortalezaDateLabel(driverHistoryDate)}):
+                    </h4>
+
+                    {linkedOrders.length === 0 ? (
+                      <p className="text-xs text-slate-500 italic text-center py-8">
+                        Nenhuma entrega vinculada a este entregador em {formatFortalezaDateLabel(driverHistoryDate)}.
+                      </p>
+                    ) : (
+                      linkedOrders.map((ord) => (
+                        <div
+                          key={ord.id}
+                          className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl flex items-center justify-between gap-3 text-xs"
+                        >
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-white font-mono">{ord.orderNumber}</span>
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                ord.status === 'ENTREGUE'
+                                  ? 'bg-emerald-500/20 text-emerald-300'
+                                  : ord.status === 'EM_ROTA'
+                                  ? 'bg-indigo-500/20 text-indigo-300'
+                                  : 'bg-amber-500/20 text-amber-300'
+                              }`}>
+                                {ord.status}
+                              </span>
+                            </div>
+                            <p className="text-slate-300 mt-0.5">{ord.customer.name}</p>
+                            <p className="text-[10px] text-slate-400 font-mono">
+                              {formatDateTime(ord.createdAt)} · {formatCurrency(ord.totalAmount)}
+                            </p>
+                          </div>
+
+                          <button
+                            onClick={() => {
+                              setSelectedDriver(null);
+                              setAssignModalOrder(ord);
+                              setSelectedNewDriverId(ord.deliveryPersonId || '');
+                            }}
+                            className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg text-xs font-semibold border border-slate-700 cursor-pointer"
+                          >
+                            Reatribuir
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </>
+              );
+            })()}
 
             <div className="pt-4 border-t border-slate-800 flex justify-end">
               <button

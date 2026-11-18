@@ -7,3 +7,4 @@ coverage/
 *.log
 .env*
 !.env.example
+/.daily_menu_cache.json
