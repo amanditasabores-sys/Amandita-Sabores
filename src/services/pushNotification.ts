@@ -3,7 +3,7 @@
  * Manages Service Worker push registration, browser permissions, and backend subscription syncing.
  */
 
-import { getCurrentFirebaseUser } from './firebase.ts';
+import { getCurrentFirebaseUser } from './firebase';
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const cleanBase64 = base64String.trim().replace(/\s+/g, '');

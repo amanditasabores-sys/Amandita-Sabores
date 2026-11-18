@@ -147,7 +147,7 @@ export default defineConfig(({ mode }) => {
             return {
               code: code.replace(
                 'transport.connect(createHMRHandler(handleMessage));',
-                '/* HMR WebSocket disabled */',
+                '/* HMR WebSocket disabled */\ntransport.connect = async () => {};\ntransport.disconnect = async () => {};\ntransport.send = async () => {};\ntransport.invoke = async () => {};',
               ),
               map: null,
             };

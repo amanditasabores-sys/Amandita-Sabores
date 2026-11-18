@@ -326,8 +326,8 @@ async function runFirebaseModeChecks() {
     return new Response(JSON.stringify({ error: { message: 'SIMULATED_OFFLINE_OR_DENIED' } }), { status: 403 });
   };
 
-  const { isFirebaseReady } = await import('../src/services/firebase.ts');
-  const { store } = await import('../src/services/store.ts');
+  const { isFirebaseReady } = await import('../src/services/firebase');
+  const { store } = await import('../src/services/store');
 
   assert.strictEqual(isFirebaseReady(), true, 'Firebase deve estar marcado como configurado');
   const loginFail = await store.login('admin', '123456');
@@ -397,12 +397,12 @@ async function run() {
     generateOrderPixTxId,
     validatePixPayload,
     calculateCRC16,
-  } = await import('../src/utils/pix.ts');
-  const { generateQRCodeDataUrl } = await import('../src/utils/qrcode.ts');
-  const { store } = await import('../src/services/store.ts');
-  // Enable API key before importing server.ts so server verifies tokens via Identity Toolkit mock
+  } = await import('../src/utils/pix');
+  const { generateQRCodeDataUrl } = await import('../src/utils/qrcode');
+  const { store } = await import('../src/services/store');
+  // Enable API key before importing server so server verifies tokens via Identity Toolkit mock
   process.env.VITE_FIREBASE_API_KEY = 'test-fake-api-key';
-  const { default: app } = await import('../server.ts');
+  const { default: app } = await import('../server');
 
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));

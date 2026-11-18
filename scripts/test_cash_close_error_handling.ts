@@ -253,7 +253,7 @@ async function run() {
     },
   };
 
-  const { default: app, __setTestFirebaseAdminServices } = await import('../server.ts');
+  const { default: app, __setTestFirebaseAdminServices } = await import('../server');
   __setTestFirebaseAdminServices({
     adminDb: simDb as any,
     adminAuth: mockAdminAuth as any,
@@ -292,7 +292,7 @@ async function run() {
     return realFetch(fullUrl, { ...init, headers });
   };
 
-  const { store } = await import('../src/services/store.ts');
+  const { store } = await import('../src/services/store');
   store.setServerAtomicPaymentMode(true);
 
   const seedDefaultUsers = () => {

@@ -19,7 +19,7 @@ import assert from 'node:assert';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { validatePixPayload } from '../src/utils/pix.ts';
+import { validatePixPayload } from '../src/utils/pix';
 
 process.env.DISABLE_AUTO_LISTEN = '1';
 process.env.ALLOW_TEST_FIREBASE_OVERRIDES = '1';
@@ -399,8 +399,8 @@ async function run() {
     },
   };
 
-  const { store } = await import('../src/services/store.ts');
-  const { default: app, __setTestFirebaseAdminServices } = await import('../server.ts');
+  const { store } = await import('../src/services/store');
+  const { default: app, __setTestFirebaseAdminServices } = await import('../server');
 
   __setTestFirebaseAdminServices({
     adminDb: simDb as any,

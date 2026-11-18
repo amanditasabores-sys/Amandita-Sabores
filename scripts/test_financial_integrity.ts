@@ -442,8 +442,8 @@ async function run() {
     },
   };
 
-  const { store } = await import('../src/services/store.ts');
-  const { default: app, __setTestFirebaseAdminServices } = await import('../server.ts');
+  const { store } = await import('../src/services/store');
+  const { default: app, __setTestFirebaseAdminServices } = await import('../server');
 
   __setTestFirebaseAdminServices({
     adminDb: simDb as any,

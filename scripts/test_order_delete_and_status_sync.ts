@@ -287,8 +287,8 @@ let expressBaseUrl = '';
 };
 
 async function run() {
-  const { default: app } = await import('../server.ts');
-  const { store } = await import('../src/services/store.ts');
+  const { default: app } = await import('../server');
+  const { store } = await import('../src/services/store');
 
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));

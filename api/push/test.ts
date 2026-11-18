@@ -1,5 +1,5 @@
-import { sendTestPushNotification } from '../../src/server/pushBackendService.ts';
-import { sendJson } from '../../src/server/pushConfig.ts';
+import { sendTestPushNotification } from '../../src/server/pushBackendService';
+import { sendJson } from '../../src/server/pushConfig';
 
 export default async function handler(req: any, res: any) {
   if (req.method === 'OPTIONS') {

@@ -20,7 +20,7 @@ import {
   buildWhatsAppUrl,
   validateOperatingHours,
   validateWhatsAppNumber,
-} from '../src/utils/storeHours.ts';
+} from '../src/utils/storeHours';
 
 process.env.DISABLE_AUTO_LISTEN = '1';
 process.env.ALLOW_TEST_FIREBASE_OVERRIDES = '1';
@@ -328,9 +328,9 @@ class TransactionalFirestoreSimulator {
 }
 
 async function runTests() {
-  const { default: app, __setTestFirebaseAdminServices } = await import('../server.ts');
-  const { store } = await import('../src/services/store.ts');
-  const { INITIAL_MENU, INITIAL_CONFIG } = await import('../src/data/initialData.ts');
+  const { default: app, __setTestFirebaseAdminServices } = await import('../server');
+  const { store } = await import('../src/services/store');
+  const { INITIAL_MENU, INITIAL_CONFIG } = await import('../src/data/initialData');
 
   const simDb = new TransactionalFirestoreSimulator();
   const tokenUserMap: Record<string, { uid: string; email: string; role: string; name: string }> = {

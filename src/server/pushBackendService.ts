@@ -1,21 +1,13 @@
 import webpush from 'web-push';
 import crypto from 'crypto';
-import {
-  doc as clientDoc,
-  setDoc as clientSetDoc,
-  getDocs as clientGetDocs,
-  collection as clientCollection,
-  deleteDoc as clientDeleteDoc,
-} from 'firebase/firestore';
-import { getVapidConfig } from './pushConfig.ts';
-import { getFirebaseServerInstances } from './firebaseAdmin.ts';
+import { getVapidConfig } from './pushConfig';
+import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from './firebaseAdmin';
 
-const {
-  projectId: PROJECT_ID,
-  apiKey: API_KEY,
-  adminDb,
-  clientDb,
-} = getFirebaseServerInstances();
+const adminInstances = getFirebaseAdminInstances();
+const clientConfig = getFirebaseClientConfigStatus(adminInstances.projectId);
+const PROJECT_ID = adminInstances.projectId;
+const API_KEY = clientConfig.apiKey;
+const adminDb = adminInstances.adminDb;
 
 export interface PushSubscriptionData {
   subscription: webpush.PushSubscription;

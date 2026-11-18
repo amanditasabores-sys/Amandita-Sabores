@@ -1,8 +1,8 @@
 import type { Request, Response } from 'express';
-import app from '../server.ts';
+import app from '../src/server/app';
 
 // Vercel Serverless Function entry point
-// Bridges Vercel edge/serverless requests to the Express application
+// Bridges Vercel serverless requests to the pure Express backend (without Vite dev dependencies)
 export default function handler(req: Request, res: Response) {
   // Normalize request path if rewritten by Vercel without clobbering real subpaths with bare '/api'
   const originalUrl =
