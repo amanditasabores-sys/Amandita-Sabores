@@ -31,6 +31,7 @@ interface CashRegisterManagerProps {
 
 export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStateChanged }) => {
   const [currentShift, setCurrentShift] = useState<CashRegisterShift | null>(() => store.getCurrentCashShift());
+  const [cashSyncState, setCashSyncState] = useState(() => store.getCashShiftSyncState());
   const [historyShifts, setHistoryShifts] = useState<CashRegisterShift[]>(() => store.getCashShiftHistory());
   const [selectedHistoryShift, setSelectedHistoryShift] = useState<CashRegisterShift | null>(null);
 
@@ -74,6 +75,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
 
   const reloadData = () => {
     setCurrentShift(store.getCurrentCashShift());
+    setCashSyncState(store.getCashShiftSyncState());
     setHistoryShifts(store.getCashShiftHistory());
     onStateChanged();
   };
@@ -380,16 +382,38 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
             <div className="flex items-center gap-2">
               <h2 className="text-lg font-black text-slate-900">Controle de Frente de Caixa</h2>
               <span className={`px-2.5 py-0.5 rounded-full text-xs font-bold border flex items-center gap-1.5 ${
-                currentShift?.status === 'ABERTO'
+                cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                  ? 'bg-amber-50 text-amber-700 border-amber-200'
+                  : cashSyncState.status === 'ERROR'
+                  ? 'bg-rose-50 text-rose-700 border-rose-200'
+                  : currentShift?.status === 'ABERTO'
                   ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                   : 'bg-rose-50 text-rose-700 border-rose-200'
               }`}>
-                <span className={`w-2 h-2 rounded-full ${currentShift?.status === 'ABERTO' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} />
-                {currentShift?.status === 'ABERTO' ? 'CAIXA ABERTO' : 'CAIXA FECHADO'}
+                <span className={`w-2 h-2 rounded-full ${
+                  cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                    ? 'bg-amber-500 animate-pulse'
+                    : cashSyncState.status === 'ERROR'
+                    ? 'bg-rose-500'
+                    : currentShift?.status === 'ABERTO'
+                    ? 'bg-emerald-500 animate-pulse'
+                    : 'bg-rose-500'
+                }`} />
+                {cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                  ? 'SINCRONIZANDO CAIXA...'
+                  : cashSyncState.status === 'ERROR'
+                  ? 'ERRO DE SINCRONIZAÇÃO'
+                  : currentShift?.status === 'ABERTO'
+                  ? 'CAIXA ABERTO'
+                  : 'CAIXA FECHADO'}
               </span>
             </div>
             <p className="text-xs text-slate-500 mt-0.5">
-              {currentShift?.status === 'ABERTO' ? (
+              {cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE' ? (
+                <span>Aguardando confirmação real do turno de caixa no servidor...</span>
+              ) : cashSyncState.status === 'ERROR' ? (
+                <span>{cashSyncState.error || 'Não foi possível confirmar o estado do caixa com o servidor.'}</span>
+              ) : currentShift?.status === 'ABERTO' ? (
                 <span>Aberto em <strong className="text-slate-700">{formatDateTime(currentShift.openedAt)}</strong> pelo operador <strong className="text-slate-700">{currentShift.openedBy}</strong></span>
               ) : (
                 <span>Nenhum turno de caixa aberto no momento. Abra o caixa para registrar sangrias, suprimentos e conferência.</span>
@@ -460,10 +484,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 setShiftActionError(null);
                 setIsOpenModalActive(true);
               }}
-              className="flex items-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+              disabled={cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'}
+              className="flex items-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
             >
               <Unlock className="w-4 h-4" />
-              <span>Abrir Novo Caixa</span>
+              <span>{cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE' ? 'Sincronizando...' : 'Abrir Novo Caixa'}</span>
             </button>
           )}
 

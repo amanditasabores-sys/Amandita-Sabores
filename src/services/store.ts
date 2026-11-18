@@ -92,6 +92,15 @@ export function isOrderPrepStaffRole(role?: string | null): boolean {
   return ['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'COZINHA', 'ATENDENTE'].includes(normalized);
 }
 
+export type CashShiftSyncStatus = 'IDLE' | 'SYNCING' | 'CONFIRMED' | 'ERROR';
+
+export interface CashShiftSyncState {
+  status: CashShiftSyncStatus;
+  confirmedAt: string | null;
+  source: 'firestore_snapshot' | 'server_api' | 'local_contingency' | 'none';
+  error: string | null;
+}
+
 class StoreService {
   private broadcastChannel: BroadcastChannel | null = null;
   private publicUnsubscribers: Unsubscribe[] = [];
@@ -104,7 +113,17 @@ class StoreService {
   private pendingOrderRewrites = new Set<string>();
   private orderWriteChains = new Map<string, Promise<any>>();
   private staffSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private publicSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastPublicMenuRefreshAt = 0;
   private serverAtomicPaymentTestOverride = false;
+  private requireExplicitCashConfirmationTestOverride = false;
+  private cashShiftSyncPromise: Promise<boolean> | null = null;
+  private cashShiftSyncState: CashShiftSyncState = {
+    status: 'IDLE',
+    confirmedAt: null,
+    source: 'none',
+    error: null,
+  };
   private lastPublicAvailability: PublicStoreAvailability | null = null;
   private uncertainServerOps = new Map<string, number>();
   private lastUncertainOpenShiftId: string | null = null;
@@ -120,6 +139,41 @@ class StoreService {
 
   public getCloudSyncState() {
     return { ...this.cloudSyncState };
+  }
+
+  private isCloudCashConfirmationRequired(): boolean {
+    return isFirebaseReady() || Boolean(db) || this.requireExplicitCashConfirmationTestOverride;
+  }
+
+  public getCashShiftSyncState(): CashShiftSyncState {
+    if (!this.shouldUseServerAtomicPayment()) {
+      return {
+        status: 'CONFIRMED',
+        confirmedAt: null,
+        source: 'local_contingency',
+        error: null,
+      };
+    }
+    if (!this.isCloudCashConfirmationRequired()) {
+      try {
+        const raw = localStorage.getItem('gf_current_cash_shift');
+        if (raw) {
+          return {
+            status: 'CONFIRMED',
+            confirmedAt: null,
+            source: 'server_api',
+            error: null,
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return { ...this.cashShiftSyncState };
+  }
+
+  public isCashShiftConfirmed(): boolean {
+    return this.getCashShiftSyncState().status === 'CONFIRMED';
   }
 
   public getAuthSessionMode(): 'firebase_cloud' | 'local_contingency' | 'unauthenticated' {
@@ -1595,11 +1649,12 @@ class StoreService {
     this.initPublicFirestoreSync();
     this.syncDailyMenuWithServer(true).catch(() => {});
 
-    // Reconnection listener to flush pending orders and sync daily menu automatically
+    // Reconnection listener to flush pending orders and sync daily menu / public catalog automatically
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => {
         console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes e sincronizando cardápio...');
         this.flushPendingSyncQueue();
+        this.refreshPublicMenuSync(true).catch(() => {});
         this.syncDailyMenuWithServer(true).catch(() => {});
         const current = this.getCurrentUser();
         if (current && this.isAuthorizedStaffRole(current.role)) {
@@ -1608,6 +1663,7 @@ class StoreService {
       });
 
       window.addEventListener('focus', () => {
+        this.refreshPublicMenuSync(false).catch(() => {});
         this.syncDailyMenuWithServer().catch(() => {});
       });
 
@@ -1616,6 +1672,7 @@ class StoreService {
           if (document.visibilityState === 'visible') {
             console.info('[Store Sync] Retorno do segundo plano: verificando conexões e cardápio...');
             this.flushPendingSyncQueue();
+            this.refreshPublicMenuSync(true).catch(() => {});
             this.syncDailyMenuWithServer(true).catch(() => {});
             const current = this.getCurrentUser();
             if (current && this.isAuthorizedStaffRole(current.role)) {
@@ -1625,9 +1682,12 @@ class StoreService {
         });
       }
 
-      // Background heartbeat to retry pending sync queue and keep daily menu synced across all devices
+      // Background heartbeat to retry pending sync queue and keep daily menu & public listener alive across all devices
       setInterval(() => {
         this.flushPendingSyncQueue();
+        if (!this.isPublicSyncActive && !this.publicSyncRetryTimer) {
+          this.initPublicFirestoreSync();
+        }
         this.syncDailyMenuWithServer().catch(() => {});
       }, 10000);
     }
@@ -1864,6 +1924,55 @@ class StoreService {
     this.serverAtomicPaymentTestOverride = enabled;
     this.uncertainServerOps.clear();
     this.lastUncertainOpenShiftId = null;
+    this.cashShiftSyncPromise = null;
+    this.cashShiftSyncState = {
+      status: 'IDLE',
+      confirmedAt: null,
+      source: 'none',
+      error: null,
+    };
+  }
+
+  public setExplicitCashConfirmationModeForTest(enabled: boolean): void {
+    this.requireExplicitCashConfirmationTestOverride = enabled;
+    this.cashShiftSyncPromise = null;
+    this.cashShiftSyncState = {
+      status: 'IDLE',
+      confirmedAt: null,
+      source: 'none',
+      error: null,
+    };
+  }
+
+  public beginCashShiftSyncForTest(): void {
+    this.cashShiftSyncState = {
+      status: 'SYNCING',
+      confirmedAt: null,
+      source: 'none',
+      error: null,
+    };
+    this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState());
+  }
+
+  public simulateFirestoreCashShiftSnapshotForTest(
+    shifts: CashRegisterShift[],
+    options?: { fromCache?: boolean; isFullCollection?: boolean }
+  ): void {
+    this.applyFirestoreCashShiftSnapshot(shifts, {
+      fromCache: Boolean(options?.fromCache),
+      isFullCollection: options?.isFullCollection ?? true,
+      skipServerReconcileOnCache: true,
+    });
+  }
+
+  public simulateFirestoreCashShiftErrorForTest(message = 'Falha simulada na sincronização do caixa.'): void {
+    this.cashShiftSyncState = {
+      status: 'ERROR',
+      confirmedAt: null,
+      source: 'none',
+      error: message,
+    };
+    this.notify('CASH_SHIFT_UPDATED', null);
   }
 
   private shouldUseServerAtomicPayment(): boolean {
@@ -2043,12 +2152,123 @@ class StoreService {
     this.initPublicFirestoreSync();
   }
 
+  private teardownPublicListenersOnly(): void {
+    if (this.publicSyncRetryTimer) {
+      clearTimeout(this.publicSyncRetryTimer);
+      this.publicSyncRetryTimer = null;
+    }
+    this.publicUnsubscribers.forEach((unsub) => {
+      try {
+        unsub();
+      } catch {
+        // ignore unsubscribe errors
+      }
+    });
+    this.publicUnsubscribers = [];
+    this.isPublicSyncActive = false;
+  }
+
+  private schedulePublicSyncRetry(delayMs = 5000): void {
+    if (!db || this.publicSyncRetryTimer || this.isPublicSyncActive) return;
+    this.publicSyncRetryTimer = setTimeout(() => {
+      this.publicSyncRetryTimer = null;
+      if (!this.isPublicSyncActive) {
+        this.initPublicFirestoreSync();
+      }
+    }, delayMs);
+  }
+
+  private applyRemoteMenuItems(remoteDocs: Array<{ id: string; data: Partial<MenuItem> }>): void {
+    if (!Array.isArray(remoteDocs) || remoteDocs.length === 0) return;
+
+    const currentList = this.getMenuItems();
+    const currentMap = new Map<string, MenuItem>();
+    for (const it of currentList) {
+      currentMap.set(it.id, it);
+    }
+
+    let validRemoteCount = 0;
+    for (const entry of remoteDocs) {
+      const d = entry.data;
+      if (entry.id && d && d.name) {
+        validRemoteCount++;
+        const base = currentMap.get(entry.id);
+        currentMap.set(entry.id, {
+          ...(base || {}),
+          ...d,
+          id: entry.id,
+          available: d.available !== false,
+        } as MenuItem);
+      }
+    }
+
+    if (validRemoteCount === 0) return;
+
+    const merged = Array.from(currentMap.values());
+    if (merged.length > 0) {
+      const nextJson = JSON.stringify(merged);
+      let prevJson: string | null = null;
+      try {
+        prevJson = localStorage.getItem('gf_menu_items');
+      } catch {
+        prevJson = null;
+      }
+
+      if (nextJson !== prevJson) {
+        try {
+          localStorage.setItem('gf_menu_items', nextJson);
+        } catch (storageErr) {
+          console.warn('[Firestore Public Sync] Falha ao gravar cache local do cardápio:', storageErr);
+        }
+        this.notify('FIRESTORE_MENU_SYNCED', { count: merged.length });
+      }
+    }
+  }
+
+  private async fetchPublicMenuFromServer(): Promise<void> {
+    if (!db) return;
+    this.lastPublicMenuRefreshAt = Date.now();
+    try {
+      const serverSnap = await getDocsFromServer(collection(db, 'menu_items'));
+      if (!serverSnap.empty) {
+        const remoteDocs: Array<{ id: string; data: Partial<MenuItem> }> = [];
+        serverSnap.forEach((docSnap) => {
+          remoteDocs.push({ id: docSnap.id, data: docSnap.data() as Partial<MenuItem> });
+        });
+        this.applyRemoteMenuItems(remoteDocs);
+      }
+    } catch (error: any) {
+      const code = String(error?.code || '');
+      const msg = String(error?.message || error || '');
+      if (code === 'permission-denied' || msg.includes('Missing or insufficient permissions')) {
+        console.warn('[Firestore Public Sync] Server menu fetch permission denied:', msg);
+      } else {
+        console.warn('[Firestore Public Sync] Server menu fetch notice:', msg);
+      }
+    }
+  }
+
+  public async refreshPublicMenuSync(forceServer = false): Promise<void> {
+    if (!db) return;
+    if (!this.isPublicSyncActive) {
+      this.initPublicFirestoreSync();
+      return;
+    }
+    const now = Date.now();
+    if (!forceServer && now - this.lastPublicMenuRefreshAt < 10000) {
+      return;
+    }
+    await this.fetchPublicMenuFromServer();
+  }
+
   /**
    * Public Firestore listeners: Only public resources that unauthenticated visitors are permitted to see
    * (Menu items and public restaurant config). Never touches internal orders or cash shifts.
    */
   public initPublicFirestoreSync(): void {
     if (!db || this.isPublicSyncActive) return;
+
+    this.teardownPublicListenersOnly();
 
     try {
       this.isPublicSyncActive = true;
@@ -2058,35 +2278,31 @@ class StoreService {
         collection(db, 'menu_items'),
         (snapshot) => {
           if (!snapshot.empty) {
-            const currentList = this.getMenuItems();
-            const currentMap = new Map<string, MenuItem>();
-            for (const it of currentList) {
-              currentMap.set(it.id, it);
-            }
+            const remoteDocs: Array<{ id: string; data: Partial<MenuItem> }> = [];
             snapshot.forEach((docSnap) => {
-              const d = docSnap.data() as MenuItem;
-              if (d && d.name) {
-                const base = currentMap.get(docSnap.id);
-                currentMap.set(docSnap.id, {
-                  ...(base || {}),
-                  ...d,
-                  id: docSnap.id,
-                  available: d.available !== false,
-                });
-              }
+              remoteDocs.push({ id: docSnap.id, data: docSnap.data() as Partial<MenuItem> });
             });
-            const merged = Array.from(currentMap.values());
-            if (merged.length > 0) {
-              localStorage.setItem('gf_menu_items', JSON.stringify(merged));
-              this.notify('FIRESTORE_MENU_SYNCED', { count: merged.length });
-            }
+            this.applyRemoteMenuItems(remoteDocs);
           }
         },
-        (error) => {
-          console.warn('[Firestore Public Sync] Menu listener notice:', error.message);
+        (error: any) => {
+          const code = String(error?.code || '');
+          const msg = String(error?.message || error || '');
+          const isPermissionError =
+            code === 'permission-denied' || msg.includes('Missing or insufficient permissions');
+          if (isPermissionError) {
+            console.warn('[Firestore Public Sync] Menu listener permission denied:', msg);
+          } else {
+            console.warn('[Firestore Public Sync] Menu listener notice:', msg);
+          }
+          this.teardownPublicListenersOnly();
+          this.schedulePublicSyncRetry(isPermissionError ? 15000 : 5000);
         }
       );
       this.publicUnsubscribers.push(unsubMenu);
+
+      // Ensure fresh server fetch on app open so updated menu items are recovered even if local IndexedDB cache is stale
+      this.fetchPublicMenuFromServer().catch(() => {});
 
       // 2. Synchronize Restaurant Config in Real Time (Public info: WhatsApp, PIX, store status)
       // Merges into existing config so internal/private fields (receiptFooterText, defaultDeliveryPersonId, notify*) are never wiped.
@@ -2096,7 +2312,11 @@ class StoreService {
           ...currentLocal,
           ...remotePublic,
         };
-        localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+        try {
+          localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+        } catch (storageErr) {
+          console.warn('[Firestore Public Sync] Falha ao gravar config local:', storageErr);
+        }
         this.notify('CONFIG_UPDATED', mergedConfig);
       };
 
@@ -2124,6 +2344,8 @@ class StoreService {
 
     } catch (err) {
       console.warn('[Firestore Public Sync Setup Error]:', err);
+      this.teardownPublicListenersOnly();
+      this.schedulePublicSyncRetry(5000);
     }
   }
 
@@ -2147,6 +2369,13 @@ class StoreService {
     const confirmedRole = await this.verifyStaffRole(auth.currentUser);
     if (!confirmedRole) {
       console.warn('[Firestore Security] Usuário autenticado no Firebase não possui confirmação de papel de colaborador autorizado para sincronizar dados internos.');
+      this.cashShiftSyncState = {
+        status: 'ERROR',
+        confirmedAt: null,
+        source: 'none',
+        error: 'Papel de colaborador não confirmado no Firestore.',
+      };
+      this.notify('CASH_SHIFT_UPDATED', null);
       return;
     }
 
@@ -2163,6 +2392,16 @@ class StoreService {
       const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA';
       const canAccessUsers = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('usuarios');
       const canManageMenu = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('menu') || allowedModules.includes('relatorios');
+
+      if (canAccessCash || role === 'ATENDENTE') {
+        this.cashShiftSyncState = {
+          status: 'SYNCING',
+          confirmedAt: null,
+          source: 'none',
+          error: null,
+        };
+        this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState());
+      }
 
       // Sync shared tombstones before attaching snapshot so deleted orders never resurrect
       this.syncTombstonesFromServer().catch(() => {});
@@ -2238,40 +2477,23 @@ class StoreService {
             snapshot.forEach((docSnap) => {
               shifts.push(docSnap.data() as CashRegisterShift);
             });
-
-            // Detect active open shifts deterministically and flag multiple open shifts
-            const openShifts = shifts
-              .filter((s) => s.status === 'ABERTO')
-              .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime());
-            if (openShifts.length > 1) {
-              console.warn(`[Firestore Staff Sync] ALERTA: Existem ${openShifts.length} turnos de caixa ABERTO simultaneamente.`);
-              try {
-                localStorage.setItem('gf_multiple_open_shifts_count', String(openShifts.length));
-              } catch {}
-            } else {
-              try {
-                localStorage.removeItem('gf_multiple_open_shifts_count');
-              } catch {}
-            }
-            const openShift = openShifts[0] || null;
-            if (openShift) {
-              localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
-            } else {
-              localStorage.setItem('gf_current_cash_shift', 'null');
-            }
-
-            // Detect closed shift history
-            const closedShifts = shifts
-              .filter((s) => s.status === 'FECHADO')
-              .sort((a, b) => new Date(b.closedAt || b.openedAt).getTime() - new Date(a.closedAt || a.openedAt).getTime());
-            if (closedShifts.length > 0) {
-              localStorage.setItem('gf_cash_shifts_history', JSON.stringify(closedShifts));
-            }
-
-            this.notify('CASH_SHIFT_UPDATED', openShift);
+            this.applyFirestoreCashShiftSnapshot(shifts, {
+              fromCache: snapshot.metadata.fromCache,
+              isFullCollection: true,
+            });
           },
           (error) => {
             console.warn('[Firestore Staff Sync] Cash shift notice:', error.message);
+            if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+              this.cashShiftSyncState = {
+                status: 'ERROR',
+                confirmedAt: null,
+                source: 'none',
+                error: error.message || 'Erro ao sincronizar turnos de caixa.',
+              };
+              this.notify('CASH_SHIFT_UPDATED', null);
+            }
+            this.reconcileCashShiftWithServerOnSync(true).catch(() => {});
           }
         );
         this.staffUnsubscribers.push(unsubShifts);
@@ -2281,22 +2503,28 @@ class StoreService {
         const unsubOpenShift = onSnapshot(
           openShiftsQuery,
           (snapshot) => {
-            let openShift: CashRegisterShift | null = null;
+            const shifts: CashRegisterShift[] = [];
             snapshot.forEach((docSnap) => {
               const data = docSnap.data() as CashRegisterShift;
-              if (data && data.status === 'ABERTO' && !openShift) {
-                openShift = data;
-              }
+              if (data) shifts.push(data);
             });
-            if (openShift) {
-              localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
-            } else {
-              localStorage.setItem('gf_current_cash_shift', 'null');
-            }
-            this.notify('CASH_SHIFT_UPDATED', openShift);
+            this.applyFirestoreCashShiftSnapshot(shifts, {
+              fromCache: snapshot.metadata.fromCache,
+              isFullCollection: false,
+            });
           },
           (error) => {
             console.warn('[Firestore Staff Sync] Open shift notice (Atendente):', error.message);
+            if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+              this.cashShiftSyncState = {
+                status: 'ERROR',
+                confirmedAt: null,
+                source: 'none',
+                error: error.message || 'Erro ao sincronizar caixa aberto.',
+              };
+              this.notify('CASH_SHIFT_UPDATED', null);
+            }
+            this.reconcileCashShiftWithServerOnSync(false).catch(() => {});
           }
         );
         this.staffUnsubscribers.push(unsubOpenShift);
@@ -2845,6 +3073,185 @@ class StoreService {
     }
   }
 
+  private applyFirestoreCashShiftSnapshot(
+    shifts: CashRegisterShift[],
+    options: { fromCache: boolean; isFullCollection: boolean; skipServerReconcileOnCache?: boolean }
+  ): void {
+    const openShifts = shifts
+      .filter((s) => s && s.status === 'ABERTO')
+      .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime());
+
+    if (options.isFullCollection) {
+      const closedShifts = shifts
+        .filter((s) => s && s.status === 'FECHADO')
+        .sort((a, b) => new Date(b.closedAt || b.openedAt).getTime() - new Date(a.closedAt || a.openedAt).getTime());
+      if (closedShifts.length > 0) {
+        try {
+          localStorage.setItem('gf_cash_shifts_history', JSON.stringify(closedShifts));
+        } catch {}
+      }
+    }
+
+    if (options.fromCache) {
+      // Cached IndexedDB data is NOT authoritative server confirmation.
+      if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+        this.cashShiftSyncState = {
+          status: 'SYNCING',
+          confirmedAt: null,
+          source: 'none',
+          error: null,
+        };
+        this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState());
+      }
+      if (!options.skipServerReconcileOnCache) {
+        this.reconcileCashShiftWithServerOnSync(options.isFullCollection).catch(() => {});
+      }
+      return;
+    }
+
+    if (options.isFullCollection) {
+      if (openShifts.length > 1) {
+        console.warn(`[Firestore Staff Sync] ALERTA: Existem ${openShifts.length} turnos de caixa ABERTO simultaneamente.`);
+        try {
+          localStorage.setItem('gf_multiple_open_shifts_count', String(openShifts.length));
+        } catch {}
+      } else {
+        try {
+          localStorage.removeItem('gf_multiple_open_shifts_count');
+        } catch {}
+      }
+    }
+
+    const openShift = openShifts[0] || null;
+    try {
+      if (openShift) {
+        localStorage.setItem('gf_current_cash_shift', JSON.stringify(openShift));
+      } else {
+        localStorage.setItem('gf_current_cash_shift', 'null');
+      }
+    } catch {}
+
+    this.cashShiftSyncState = {
+      status: 'CONFIRMED',
+      confirmedAt: new Date().toISOString(),
+      source: 'firestore_snapshot',
+      error: null,
+    };
+    this.notify('CASH_SHIFT_UPDATED', openShift);
+  }
+
+  private async reconcileCashShiftWithServerOnSync(canAccessCash: boolean): Promise<boolean> {
+    if (this.cashShiftSyncPromise) {
+      return this.cashShiftSyncPromise;
+    }
+
+    const run = async (): Promise<boolean> => {
+      if (db && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+        try {
+          const snap = canAccessCash
+            ? await getDocsFromServer(collection(db, 'cash_shifts'))
+            : await getDocsFromServer(query(collection(db, 'cash_shifts'), where('status', '==', 'ABERTO')));
+          const shifts: CashRegisterShift[] = [];
+          snap.forEach((docSnap) => {
+            const data = docSnap.data() as CashRegisterShift;
+            if (data) shifts.push(data);
+          });
+          this.applyFirestoreCashShiftSnapshot(shifts, {
+            fromCache: false,
+            isFullCollection: canAccessCash,
+          });
+          return true;
+        } catch (err) {
+          console.warn('[Cash Sync] Falha na consulta direta ao servidor Firestore:', err);
+        }
+      }
+
+      if (typeof fetch === 'function' && typeof window !== 'undefined') {
+        try {
+          const avail = await this.fetchPublicStoreAvailability({ timeoutMs: 5000 });
+          if (avail.verified) {
+            if (!avail.isOpen || !avail.activeShiftId) {
+              try {
+                localStorage.setItem('gf_current_cash_shift', 'null');
+              } catch {}
+              this.cashShiftSyncState = {
+                status: 'CONFIRMED',
+                confirmedAt: new Date().toISOString(),
+                source: 'server_api',
+                error: null,
+              };
+              this.notify('CASH_SHIFT_UPDATED', null);
+              return true;
+            }
+            if (canAccessCash) {
+              const authHeaders = await this.getFirebaseAuthHeaders();
+              const state = await this.consultCashShiftState(avail.activeShiftId, authHeaders);
+              if (state.verified && state.exists && state.shift?.status === 'ABERTO') {
+                this.commitOpenShiftLocally(state.shift);
+                return true;
+              }
+            }
+          }
+        } catch {
+          // ignore and mark error below
+        }
+      }
+
+      if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+        this.cashShiftSyncState = {
+          status: 'ERROR',
+          confirmedAt: null,
+          source: 'none',
+          error: 'Não foi possível confirmar o estado do caixa com o servidor.',
+        };
+        this.notify('CASH_SHIFT_UPDATED', null);
+      }
+      return false;
+    };
+
+    this.cashShiftSyncPromise = run().finally(() => {
+      this.cashShiftSyncPromise = null;
+    });
+    return this.cashShiftSyncPromise;
+  }
+
+  private async ensureCashShiftReadyForServerSale(
+    explicitShiftId?: string
+  ): Promise<{ ok: true; shiftId?: string } | { ok: false; error: string }> {
+    if (!this.isCloudCashConfirmationRequired()) {
+      const current = this.getCurrentCashShift();
+      return { ok: true, shiftId: explicitShiftId || current?.id };
+    }
+
+    if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+      await this.reconcileCashShiftWithServerOnSync(this.canUserManageCash());
+    }
+
+    if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+      return {
+        ok: false,
+        error:
+          this.cashShiftSyncState.error ||
+          'Sincronização do caixa com o servidor pendente ou indisponível. Aguarde a confirmação do caixa antes de finalizar a venda.',
+      };
+    }
+
+    if (explicitShiftId) {
+      return { ok: true, shiftId: explicitShiftId };
+    }
+
+    const confirmedShift = this.getCurrentCashShift();
+    if (!confirmedShift || confirmedShift.status !== 'ABERTO') {
+      return {
+        ok: false,
+        error:
+          'Nenhum turno de caixa ABERTO confirmado pelo servidor. Abra o caixa antes de registrar ou confirmar vendas pagas.',
+      };
+    }
+
+    return { ok: true, shiftId: confirmedShift.id };
+  }
+
   public stopStaffFirestoreSync(): void {
     if (this.staffSyncRetryTimer) {
       clearTimeout(this.staffSyncRetryTimer);
@@ -2853,6 +3260,15 @@ class StoreService {
     this.staffUnsubscribers.forEach((unsub) => unsub());
     this.staffUnsubscribers = [];
     this.isStaffSyncActive = false;
+    this.cashShiftSyncPromise = null;
+    if (this.isCloudCashConfirmationRequired()) {
+      this.cashShiftSyncState = {
+        status: 'IDLE',
+        confirmedAt: null,
+        source: 'none',
+        error: null,
+      };
+    }
   }
 
   public async refreshStaffSync(): Promise<void> {
@@ -2862,9 +3278,7 @@ class StoreService {
   }
 
   public stopFirestoreSync(): void {
-    this.publicUnsubscribers.forEach((unsub) => unsub());
-    this.publicUnsubscribers = [];
-    this.isPublicSyncActive = false;
+    this.teardownPublicListenersOnly();
     this.stopStaffFirestoreSync();
   }
 
@@ -3364,6 +3778,12 @@ class StoreService {
       try {
         localStorage.setItem('gf_current_cash_shift', JSON.stringify(confirmedShift));
       } catch {}
+      this.cashShiftSyncState = {
+        status: 'CONFIRMED',
+        confirmedAt: new Date().toISOString(),
+        source: 'server_api',
+        error: null,
+      };
       this.notify('CASH_SHIFT_UPDATED', confirmedShift);
     }
 
@@ -3577,6 +3997,16 @@ class StoreService {
       };
     }
 
+    const shiftCheck = await this.ensureCashShiftReadyForServerSale(options?.shiftId);
+    if (!shiftCheck.ok) {
+      return {
+        order: null,
+        synced: false,
+        rejected: true,
+        error: shiftCheck.error,
+      };
+    }
+
     const authHeaders = await this.getFirebaseAuthHeaders();
     const opKey = `pay:${draftOrder.id}`;
 
@@ -3675,7 +4105,7 @@ class StoreService {
         body: JSON.stringify({
           newOrder: this.cleanForFirestore(draftOrder),
           author,
-          shiftId: options?.shiftId || this.getCurrentCashShift()?.id,
+          shiftId: shiftCheck.shiftId,
         }),
         ...(controller ? { signal: controller.signal } : {}),
       });
@@ -4561,13 +4991,22 @@ class StoreService {
         return { status: 'unknown' as const };
       };
 
+      const shiftCheck = await this.ensureCashShiftReadyForServerSale();
+      if (!shiftCheck.ok) {
+        return {
+          success: false,
+          rejected: true,
+          error: shiftCheck.error,
+        };
+      }
+
       try {
         const res = await fetch('/api/cash-shifts/record-sale', {
           method: 'POST',
           headers: authHeaders,
           body: JSON.stringify({
             orderId: order.id,
-            shiftId: this.getCurrentCashShift()?.id,
+            shiftId: shiftCheck.shiftId,
             author: String(author || currentUser?.name || currentUser?.username || 'Atendente').slice(0, 128),
           }),
         });
@@ -4585,6 +5024,12 @@ class StoreService {
             this.commitConfirmedServerOrderAndShift(data.order as Order, (data.shift as CashRegisterShift) || null);
           } else if (data.shift) {
             localStorage.setItem('gf_current_cash_shift', JSON.stringify(data.shift));
+            this.cashShiftSyncState = {
+              status: 'CONFIRMED',
+              confirmedAt: new Date().toISOString(),
+              source: 'server_api',
+              error: null,
+            };
             this.notify('CASH_SHIFT_UPDATED', data.shift);
           }
           if (typeof window !== 'undefined') {
@@ -4860,6 +5305,16 @@ class StoreService {
       };
     }
 
+    const shiftCheck = await this.ensureCashShiftReadyForServerSale(options?.shiftId);
+    if (!shiftCheck.ok) {
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: true,
+        error: shiftCheck.error,
+      };
+    }
+
     const authHeaders = await this.getFirebaseAuthHeaders();
     const opKey = `pay:${orderId}`;
 
@@ -4958,7 +5413,7 @@ class StoreService {
         body: JSON.stringify({
           author,
           notes,
-          shiftId: options?.shiftId || this.getCurrentCashShift()?.id,
+          shiftId: shiftCheck.shiftId,
         }),
         ...(controller ? { signal: controller.signal } : {}),
       });
@@ -5457,8 +5912,17 @@ class StoreService {
   // ==========================================
   public getCurrentCashShift(): CashRegisterShift | null {
     try {
+      if (this.isCloudCashConfirmationRequired() && this.cashShiftSyncState.status !== 'CONFIRMED') {
+        return null;
+      }
+
       const data = localStorage.getItem('gf_current_cash_shift');
       if (data) return JSON.parse(data);
+
+      // When Firebase or Server Atomic mode is active, NEVER create a synthetic ABERTO shift.
+      if (this.shouldUseServerAtomicPayment()) {
+        return null;
+      }
 
       const initialShift: CashRegisterShift = {
         id: 'shift-' + getFortalezaDateKey(),
@@ -5569,6 +6033,12 @@ class StoreService {
       localStorage.setItem('gf_cash_shifts_history', JSON.stringify(history));
       localStorage.setItem('gf_current_cash_shift', 'null');
     } catch {}
+    this.cashShiftSyncState = {
+      status: 'CONFIRMED',
+      confirmedAt: new Date().toISOString(),
+      source: 'server_api',
+      error: null,
+    };
     this.notify('CASH_SHIFT_UPDATED', null);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'CASH_SHIFT_UPDATED' } }));
@@ -5584,6 +6054,12 @@ class StoreService {
     try {
       localStorage.setItem('gf_current_cash_shift', JSON.stringify(cleanShift));
     } catch {}
+    this.cashShiftSyncState = {
+      status: 'CONFIRMED',
+      confirmedAt: new Date().toISOString(),
+      source: 'server_api',
+      error: null,
+    };
     this.notify('CASH_SHIFT_UPDATED', cleanShift);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'CASH_SHIFT_UPDATED' } }));
@@ -9251,6 +9727,11 @@ class StoreService {
       });
     }
     this.stopStaffFirestoreSync();
+    if (this.isCloudCashConfirmationRequired()) {
+      try {
+        localStorage.removeItem('gf_current_cash_shift');
+      } catch {}
+    }
     signOutFirebase().catch(() => {});
     this.setCurrentUser(null);
   }

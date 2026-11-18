@@ -57,6 +57,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
   const [menuItems, setMenuItems] = useState<MenuItem[]>(() => store.getMenuItems());
   const [orders, setOrders] = useState<Order[]>(() => store.getOrders());
   const [currentShift, setCurrentShift] = useState(() => store.getCurrentCashShift());
+  const [cashSyncState, setCashSyncState] = useState(() => store.getCashShiftSyncState());
   const [config, setConfig] = useState(() => store.getRestaurantConfig());
 
   useEffect(() => {
@@ -64,6 +65,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       setMenuItems(store.getMenuItems());
       setOrders(store.getOrders());
       setCurrentShift(store.getCurrentCashShift());
+      setCashSyncState(store.getCashShiftSyncState());
       setConfig(store.getRestaurantConfig());
     };
     window.addEventListener('gestaofood_state_changed', handleUpdate);
@@ -142,6 +144,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
     setMenuItems(store.getMenuItems());
     setOrders(store.getOrders());
     setCurrentShift(store.getCurrentCashShift());
+    setCashSyncState(store.getCashShiftSyncState());
     setConfig(store.getRestaurantConfig());
   };
 
@@ -1178,12 +1181,28 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
               <span className="truncate">Operador: <strong className="text-[#2C1810]">{operatorName}</strong></span>
               <span>·</span>
               <span className={`flex items-center gap-1 font-semibold shrink-0 ${
-                currentShift && currentShift.status === 'ABERTO' ? 'text-emerald-700' : 'text-amber-700'
+                cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                  ? 'text-[#8C5E47]'
+                  : cashSyncState.status === 'ERROR'
+                  ? 'text-rose-700'
+                  : currentShift && currentShift.status === 'ABERTO'
+                  ? 'text-emerald-700'
+                  : 'text-amber-700'
               }`}>
                 <span className={`w-2 h-2 rounded-full ${
-                  currentShift && currentShift.status === 'ABERTO' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                  cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                    ? 'bg-[#C86D3B] animate-pulse'
+                    : cashSyncState.status === 'ERROR'
+                    ? 'bg-rose-500'
+                    : currentShift && currentShift.status === 'ABERTO'
+                    ? 'bg-emerald-500 animate-pulse'
+                    : 'bg-amber-500'
                 }`} />
-                Caixa {currentShift && currentShift.status === 'ABERTO' ? 'Aberto' : 'Fechado'}
+                {cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                  ? 'Sincronizando caixa...'
+                  : cashSyncState.status === 'ERROR'
+                  ? 'Falha ao sincronizar caixa'
+                  : `Caixa ${currentShift && currentShift.status === 'ABERTO' ? 'Aberto' : 'Fechado'}`}
               </span>
             </p>
           </div>

@@ -104,7 +104,8 @@ service cloud.firestore {
     // ZERO EXPOSURE OF COST PRICE: costPrice is strictly forbidden in this public collection.
     // =========================================================================
     match /menu_items/{itemId} {
-      allow get, list: if isValidId(itemId);
+      allow get: if isValidId(itemId);
+      allow list: if true;
       // Enforce that costPrice is NEVER written into the public catalog collection:
       allow create, update: if isValidId(itemId) && isGerente() && !('costPrice' in incoming());
       allow delete: if isValidId(itemId) && isGerente();

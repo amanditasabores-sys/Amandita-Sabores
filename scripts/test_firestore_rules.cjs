@@ -5,10 +5,15 @@
  */
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 
 class FirestoreRuleEngine {
-  constructor(firestoreState = {}) {
+  constructor(firestoreState = {}, options = {}) {
     this.db = firestoreState; // collection -> docId -> docData
+    this.rawRulesText =
+      options.rulesText ||
+      fs.readFileSync(path.join(__dirname, '../firestore.rules'), 'utf8');
   }
 
   isValidId(id) {
@@ -73,15 +78,47 @@ class FirestoreRuleEngine {
     return this.isGerente(auth) || (this.hasActiveProfile(auth) && ['CAIXA', 'caixa'].includes(this.userRole(auth)));
   }
 
+  extractMenuItemsRuleBlock() {
+    const match = this.rawRulesText.match(/match\s+\/menu_items\/\{itemId\}\s*\{([\s\S]*?)\n\s*\}/);
+    return match ? match[1] : '';
+  }
+
+  findMenuItemsAllowCondition(operation) {
+    const block = this.extractMenuItemsRuleBlock();
+    if (!block) return null;
+    const allowRegex = /allow\s+([^:]+):\s*if\s*([^;]+);/g;
+    let m;
+    while ((m = allowRegex.exec(block)) !== null) {
+      const ops = m[1].split(',').map((s) => s.trim());
+      if (ops.includes(operation) || ops.includes('read')) {
+        return m[2].trim();
+      }
+    }
+    return null;
+  }
+
   // Collection: menu_items
   evalMenuItemGet(auth, itemId) {
-    return this.isValidId(itemId);
+    const cond = this.findMenuItemsAllowCondition('get');
+    if (!cond) return false;
+    if (cond === 'true') return true;
+    if (cond === 'isValidId(itemId)') return this.isValidId(itemId);
+    return false;
   }
   evalMenuItemList(auth) {
-    return true;
+    const cond = this.findMenuItemsAllowCondition('list');
+    if (!cond) return false;
+    // Firestore "Rules are not filters": collection list queries fail if rule references {itemId} wildcard
+    if (/\bitemId\b/.test(cond) || /isValidId\s*\(/.test(cond)) {
+      return false;
+    }
+    return cond === 'true';
   }
   evalMenuItemWrite(auth, itemId, incoming) {
     if (incoming && 'costPrice' in incoming) return false;
+    return this.isValidId(itemId) && this.isGerente(auth);
+  }
+  evalMenuItemDelete(auth, itemId) {
     return this.isValidId(itemId) && this.isGerente(auth);
   }
   evalMenuItemCostRead(auth, itemId) {
@@ -1154,6 +1191,55 @@ runTest('33. Bloqueio Client SDK de CANCELADO em /public_tracking preservando an
     true,
     'Atualização operacional normal em public_tracking preservada'
   );
+});
+
+runTest('34. Sincronização Pública de menu_items: allow list aberto e detecção real de wildcard em firestore.rules', () => {
+  const menuBlock = engine.extractMenuItemsRuleBlock();
+  assert.ok(menuBlock.includes('allow list: if true;'), 'firestore.rules deve conter allow list: if true; em /menu_items/{itemId}');
+  assert.ok(menuBlock.includes('allow get: if isValidId(itemId);'), 'firestore.rules deve preservar allow get: if isValidId(itemId);');
+
+  // Garantir que o simulador NÃO mascara o bug anterior ("allow get, list: if isValidId(itemId);")
+  const buggyEngine = new FirestoreRuleEngine({}, {
+    rulesText: `
+      match /menu_items/{itemId} {
+        allow get, list: if isValidId(itemId);
+        allow create, update: if isValidId(itemId) && isGerente() && !('costPrice' in incoming());
+        allow delete: if isValidId(itemId) && isGerente();
+      }
+    `,
+  });
+  assert.strictEqual(buggyEngine.evalMenuItemList(anonymousAuth), false, 'Regra com isValidId(itemId) em list DEVE ser rejeitada pelo simulador');
+
+  // Regra corrigida permite listagem pública e leitura por ID válido, rejeitando ID inválido
+  assert.strictEqual(engine.evalMenuItemList(anonymousAuth), true, 'Listagem anônima de /menu_items deve ser permitida');
+  assert.strictEqual(engine.evalMenuItemGet(anonymousAuth, 'cuscuz-manteiga'), true, 'Leitura por ID válido deve ser permitida');
+  assert.strictEqual(engine.evalMenuItemGet(anonymousAuth, 'id invalido!'), false, 'Leitura por ID inválido deve ser rejeitada');
+});
+
+runTest('35. Controle Estrito de Escrita em menu_items e Isolamento de menu_item_costs', () => {
+  const cleanPayload = { id: 'cuscuz-manteiga', name: 'Cuscuz com Manteiga', price: 5.0 };
+  const payloadWithCost = { ...cleanPayload, costPrice: 2.0 };
+
+  assert.strictEqual(engine.evalMenuItemWrite(anonymousAuth, 'cuscuz-manteiga', cleanPayload), false, 'Anônimo não altera menu_items');
+  assert.strictEqual(engine.evalMenuItemWrite(caixaAuth, 'cuscuz-manteiga', cleanPayload), false, 'Caixa não altera menu_items');
+  assert.strictEqual(engine.evalMenuItemWrite(cozinhaAuth, 'cuscuz-manteiga', cleanPayload), false, 'Cozinha não altera menu_items');
+  assert.strictEqual(engine.evalMenuItemWrite(atendenteAuth, 'cuscuz-manteiga', cleanPayload), false, 'Atendente não altera menu_items');
+  assert.strictEqual(engine.evalMenuItemWrite(entregadorAuth, 'cuscuz-manteiga', cleanPayload), false, 'Entregador não altera menu_items');
+
+  assert.strictEqual(engine.evalMenuItemWrite(gerenteAuth, 'cuscuz-manteiga', cleanPayload), true, 'Gerente pode atualizar menu_items sem costPrice');
+  assert.strictEqual(engine.evalMenuItemWrite(adminAuth, 'cuscuz-manteiga', cleanPayload), true, 'Admin pode atualizar menu_items sem costPrice');
+  assert.strictEqual(engine.evalMenuItemWrite(gerenteAuth, 'cuscuz-manteiga', payloadWithCost), false, 'Gerente não pode gravar costPrice em menu_items');
+  assert.strictEqual(engine.evalMenuItemWrite(adminAuth, 'cuscuz-manteiga', payloadWithCost), false, 'Admin não pode gravar costPrice em menu_items');
+
+  assert.strictEqual(engine.evalMenuItemDelete(anonymousAuth, 'cuscuz-manteiga'), false, 'Anônimo não exclui menu_items');
+  assert.strictEqual(engine.evalMenuItemDelete(caixaAuth, 'cuscuz-manteiga'), false, 'Caixa não exclui menu_items');
+  assert.strictEqual(engine.evalMenuItemDelete(gerenteAuth, 'cuscuz-manteiga'), true, 'Gerente pode excluir menu_items');
+
+  assert.strictEqual(engine.evalMenuItemCostRead(anonymousAuth, 'cuscuz-manteiga'), false, 'Anônimo bloqueado em menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostRead(caixaAuth, 'cuscuz-manteiga'), false, 'Caixa bloqueado em menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostRead(cozinhaAuth, 'cuscuz-manteiga'), false, 'Cozinha bloqueada em menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostRead(gerenteAuth, 'cuscuz-manteiga'), true, 'Gerente lê menu_item_costs');
+  assert.strictEqual(engine.evalMenuItemCostRead(adminAuth, 'cuscuz-manteiga'), true, 'Admin lê menu_item_costs');
 });
 
 console.log(`\n======================================================`);

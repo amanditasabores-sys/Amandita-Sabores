@@ -22,6 +22,7 @@ interface CashierScreenProps {
 
 export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLogout }) => {
   const [currentShift, setCurrentShift] = useState<CashRegisterShift | null>(() => store.getCurrentCashShift());
+  const [cashSyncState, setCashSyncState] = useState(() => store.getCashShiftSyncState());
   const [activeTab, setActiveTab] = useState<'caixa' | 'relatorios' | 'pdv'>('caixa');
   const [currentTime, setCurrentTime] = useState(
     new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
@@ -36,6 +37,7 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
 
   const refreshData = () => {
     setCurrentShift(store.getCurrentCashShift());
+    setCashSyncState(store.getCashShiftSyncState());
   };
 
   useEffect(() => {
@@ -80,7 +82,17 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
                   {currentTime}
                 </span>
                 <span>·</span>
-                {currentShift && currentShift.status === 'ABERTO' ? (
+                {cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE' ? (
+                  <span className="text-amber-300 font-semibold flex items-center gap-1">
+                    <Clock className="w-3 h-3 animate-pulse" />
+                    Sincronizando caixa...
+                  </span>
+                ) : cashSyncState.status === 'ERROR' ? (
+                  <span className="text-rose-400 font-semibold flex items-center gap-1">
+                    <AlertCircle className="w-3 h-3" />
+                    Falha ao sincronizar caixa
+                  </span>
+                ) : currentShift && currentShift.status === 'ABERTO' ? (
                   <span className="text-emerald-400 font-bold flex items-center gap-1">
                     <CheckCircle2 className="w-3 h-3" />
                     Turno Aberto (R$ {currentShift.initialBalance.toFixed(2)})

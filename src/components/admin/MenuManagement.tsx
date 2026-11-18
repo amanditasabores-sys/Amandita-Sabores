@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { MenuItem, MenuItemAddon } from '../../types';
 import { formatCurrency } from '../../utils/formatters';
@@ -62,6 +62,21 @@ export const MenuManagement: React.FC = () => {
   const reload = () => {
     setItems(store.getMenuItems());
   };
+
+  useEffect(() => {
+    const handleStateSync = (event: Event) => {
+      const eventType = (event as CustomEvent)?.detail?.type;
+      if (
+        eventType === 'FIRESTORE_MENU_SYNCED' ||
+        eventType === 'MENU_UPDATED' ||
+        eventType === 'COMBOS_UPDATED'
+      ) {
+        setItems(store.getMenuItems());
+      }
+    };
+    window.addEventListener('gestaofood_state_changed', handleStateSync);
+    return () => window.removeEventListener('gestaofood_state_changed', handleStateSync);
+  }, []);
 
   const handleToggleAvailable = (item: MenuItem) => {
     const updated = { ...item, available: !item.available };
