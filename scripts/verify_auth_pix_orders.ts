@@ -472,20 +472,23 @@ async function run() {
         amount: 47.9,
         txId: '1042',
       });
-      assert(payload.startsWith('000201010211'), 'Deve iniciar com formato 01 e método estático 11');
+      assert(payload.startsWith('00020126'), 'Deve iniciar com formato 01 e omitir Tag 01 (padrão estático)');
       assert(payload.includes('+5583991234567'), 'Deve conter chave normalizada +55');
       assert(payload.includes('540547.90'), 'Deve conter campo 54 com valor exato 47.90');
       assert(payload.includes('5921AMANDITA SABORES LTDA'), 'Deve conter recebedor sanitizado');
       assert(payload.includes('6014CAMPINA GRANDE'), 'Deve conter cidade sanitizada');
+      assert(payload.includes('62070503***'), 'Deve conter TXID estático *** na tag 62.05');
       const bodyWithoutCrc = payload.slice(0, -4);
       const crc = payload.slice(-4);
       assert.strictEqual(calculateCRC16(bodyWithoutCrc), crc, 'CRC16-CCITT deve fechar exatamente');
 
       const audit = validatePixPayload(payload);
       assert.strictEqual(audit.valid, true, `TLV inválido: ${audit.error}`);
+      assert.strictEqual(audit.fields?.['01'], undefined, 'Tag 01 deve estar omitida');
+      assert.strictEqual(audit.merchantAccountInfo?.['02'], undefined, 'Subtag 26.02 deve estar omitida');
       assert.strictEqual(audit.pixKey, '+5583991234567');
       assert.strictEqual(audit.amount, '47.90');
-      assert.strictEqual(audit.txId, '1042');
+      assert.strictEqual(audit.txId, '***');
 
       // Test centralized generatePurchasePixPayload across all key types + Field 26 <= 99 chars
       const txA = generateOrderPixTxId('#1043', 'ord-abc1');
@@ -506,9 +509,12 @@ async function run() {
       if (evpRes.success) {
         const evpAudit = validatePixPayload(evpRes.payload);
         assert.strictEqual(evpAudit.valid, true, `EVP TLV inválido: ${evpAudit.error}`);
+        assert.strictEqual(evpAudit.fields?.['01'], undefined, 'Tag 01 deve estar omitida');
+        assert.strictEqual(evpAudit.merchantAccountInfo?.['02'], undefined, 'Subtag 26.02 deve estar omitida');
         assert((evpAudit.fields?.['26']?.length || 0) <= 99, 'Campo 26 não pode exceder 99 chars');
         assert.strictEqual(evpAudit.amount, '123.45');
-        assert.strictEqual(evpAudit.txId, txA);
+        assert.strictEqual(evpAudit.txId, '***');
+        assert.strictEqual(evpRes.txId, txA);
       }
 
       // Error when key missing or amount <= 0
@@ -675,8 +681,8 @@ async function run() {
       const createdAudit = validatePixPayload(createdWithDiscount.pixCode || '');
       assert.strictEqual(createdAudit.valid, true, `BR Code do pedido inválido: ${createdAudit.error}`);
       assert.strictEqual(createdAudit.amount, '34.50', 'BR Code deve refletir subtotal + taxa - desconto');
-      assert.strictEqual(createdAudit.txId, createdWithDiscount.pixTxId, 'TXID do BR Code deve coincidir com o salvo no pedido');
-      assert.notStrictEqual(createdWithDiscount.pixTxId, created.pixTxId, 'Pedidos distintos devem gerar TXIDs distintos');
+      assert.strictEqual(createdAudit.txId, '***', 'Payload BR Code estático deve usar TXID ***');
+      assert.notStrictEqual(createdWithDiscount.pixTxId, created.pixTxId, 'Pedidos distintos devem gerar TXIDs internos distintos');
 
       // Confirmação manual altera de PENDENTE -> PAGO
       const manuallyConfirmed = store.updatePaymentStatus(createdWithDiscount.id, 'PAGO', 'Caixa', 'Conferido no banco');
@@ -964,14 +970,16 @@ async function run() {
       assert.strictEqual(persistedPdvOrder.subtotal, roundedSubtotal);
       assert.strictEqual(persistedPdvOrder.discount, roundedDiscount);
       assert.strictEqual(persistedPdvOrder.totalAmount, expectedTotal, 'Total do pedido não pode ter imprecisão de ponto flutuante');
-      assert.strictEqual(persistedPdvOrder.pixCode, previewPix.payload, 'Payload Copia e Cola do pedido salvo deve ser 100% idêntico ao preview do PDV (incluindo Campo 26.02 e CRC16)');
+      assert.strictEqual(persistedPdvOrder.pixCode, previewPix.payload, 'Payload Copia e Cola do pedido salvo deve ser 100% idêntico ao preview do PDV');
       assert.strictEqual(persistedPdvOrder.pixTxId, pdvTxId);
       assert.strictEqual(persistedPdvOrder.paymentStatus, 'PENDENTE', 'Gerar QR Code no PDV não pode marcar pedido como PAGO');
 
       const audit = validatePixPayload(persistedPdvOrder.pixCode || '');
       assert.strictEqual(audit.valid, true);
+      assert.strictEqual(audit.fields?.['01'], undefined);
       assert.strictEqual(audit.amount, expectedTotal.toFixed(2));
-      assert.strictEqual(audit.merchantAccountInfo?.['02'], 'Venda PDV Amandita');
+      assert.strictEqual(audit.merchantAccountInfo?.['02'], undefined);
+      assert.strictEqual(audit.txId, '***');
     });
 
     // 10. Etapa 2: UTF-8 TLV lengths, multibyte CRC16, >99 bytes rejection & duplicate TLV tags

@@ -10,3 +10,4 @@ coverage/
 /.daily_menu_cache.json
 /.deleted_orders_cache.json
 /.push_dispatches_cache.json
+dev-dist/

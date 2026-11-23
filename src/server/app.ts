@@ -2465,7 +2465,10 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       }
 
       if (order.pixTxId !== undefined && order.pixTxId !== null && String(order.pixTxId).trim() !== '') {
-        if (!pixAudit.txId || sanitizeTxId(String(order.pixTxId)) !== pixAudit.txId) {
+        if (
+          !pixAudit.txId ||
+          (pixAudit.txId !== '***' && sanitizeTxId(String(order.pixTxId)) !== pixAudit.txId)
+        ) {
           return {
             ok: false,
             status: 400,

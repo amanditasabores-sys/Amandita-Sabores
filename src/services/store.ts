@@ -3871,7 +3871,7 @@ class StoreService {
           const previewAmount = roundCurrency(parseFloat(previewAudit.amount || '0'));
           if (
             previewAudit.valid &&
-            previewAudit.txId === cleanOrderInput.pixTxId &&
+            (previewAudit.txId === '***' || previewAudit.txId === cleanOrderInput.pixTxId) &&
             (!expectedNormalizedKey || previewAudit.pixKey === expectedNormalizedKey) &&
             previewAmount === effectiveTotal
           ) {
