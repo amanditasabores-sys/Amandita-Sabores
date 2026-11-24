@@ -7,6 +7,7 @@ import {
   DEFAULT_CLOSED_SECONDARY_MESSAGE,
   buildWhatsAppUrl,
   formatWhatsAppDisplay,
+  getDayOperatingShifts,
   normalizeClosedSettings,
 } from '../../utils/storeHours';
 
@@ -104,16 +105,17 @@ export const StoreClosedView: React.FC<StoreClosedViewProps> = ({
             <ul className="space-y-1.5">
               {closedSettings.operatingHours.map((day) => {
                 const isToday = day.dayKey === todayKey;
+                const shifts = getDayOperatingShifts(day);
                 return (
                   <li
                     key={day.dayKey}
-                    className={`flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs transition ${
+                    className={`flex items-start justify-between gap-3 px-2.5 py-1.5 rounded-xl text-xs transition ${
                       isToday
                         ? 'bg-[#FFFDF9] border border-[#C86D3B]/40 font-bold text-[#2C1810] shadow-2xs'
                         : 'text-[#6B4B3E]'
                     }`}
                   >
-                    <span className="flex items-center gap-1.5">
+                    <span className="flex items-center gap-1.5 pt-0.5">
                       <span>{day.label}</span>
                       {isToday && (
                         <span className="text-[10px] font-bold text-[#C86D3B] uppercase">
@@ -122,13 +124,17 @@ export const StoreClosedView: React.FC<StoreClosedViewProps> = ({
                       )}
                     </span>
 
-                    {day.isOpen ? (
-                      <span className="font-mono font-semibold text-[#2C1810]">
-                        {day.openTime} às {day.closeTime}
-                      </span>
+                    {shifts.length > 0 ? (
+                      <div className="flex flex-col items-end gap-0.5 font-mono font-semibold text-[#2C1810] text-right">
+                        {shifts.map((shift, idx) => (
+                          <span key={`${day.dayKey}-shift-${idx}`}>
+                            {shift.openTime} às {shift.closeTime}
+                          </span>
+                        ))}
+                      </div>
                     ) : (
                       <span className="text-[11px] font-semibold text-[#721C24] bg-[#721C24]/10 px-2 py-0.5 rounded-lg">
-                        Fechado
+                        Sem funcionamento
                       </span>
                     )}
                   </li>

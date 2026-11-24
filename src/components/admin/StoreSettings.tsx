@@ -14,10 +14,13 @@ import {
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { formatCurrency } from '../../utils/formatters';
 import {
-  DEFAULT_OPERATING_HOURS,
+  CANONICAL_WEEKDAYS,
   DEFAULT_CLOSED_PRIMARY_MESSAGE,
   DEFAULT_CLOSED_SECONDARY_MESSAGE,
+  getSuggestedSecondShift,
+  isValidTimeHHmm,
   normalizeOperatingHours,
+  validateOperatingDay,
   validateOperatingHours,
   validateWhatsAppNumber,
   formatWhatsAppDisplay,
@@ -55,7 +58,8 @@ import {
   Bike,
   Calendar,
   MessageSquare,
-  Info
+  Info,
+  Plus
 } from 'lucide-react';
 import { FirebaseStatusModal } from './FirebaseStatusModal';
 import { PrinterSettings } from './PrinterSettings';
@@ -525,8 +529,11 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
       return;
     }
 
-    const normalizedHours = normalizeOperatingHours(config.operatingHours);
-    const hoursCheck = validateOperatingHours(normalizedHours);
+    const hoursToValidate =
+      Array.isArray(config.operatingHours) && config.operatingHours.length === 7
+        ? config.operatingHours
+        : normalizeOperatingHours(config.operatingHours);
+    const hoursCheck = validateOperatingHours(hoursToValidate);
     if (!hoursCheck.valid) {
       setSaveStatus({
         type: 'error',
@@ -1062,67 +1069,202 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
               </div>
 
               <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden bg-slate-50/50">
-                {normalizeOperatingHours(config.operatingHours || DEFAULT_OPERATING_HOURS).map((day) => {
-                  const updateDay = (patch: Partial<typeof day>) => {
-                    const currentHours = normalizeOperatingHours(config.operatingHours || DEFAULT_OPERATING_HOURS);
-                    const nextHours = currentHours.map((d) =>
-                      d.dayKey === day.dayKey ? { ...d, ...patch } : d
-                    );
+                {(() => {
+                  const rawHoursByKey = new Map(
+                    (Array.isArray(config.operatingHours) ? config.operatingHours : []).map((d) => [d.dayKey, d])
+                  );
+                  const editableHours = CANONICAL_WEEKDAYS.map((canon) => {
+                    const existing = rawHoursByKey.get(canon.dayKey);
+                    if (!existing) {
+                      return {
+                        dayKey: canon.dayKey,
+                        label: canon.label,
+                        isOpen: canon.defaultOpen,
+                        openTime: canon.defaultOpenTime,
+                        closeTime: canon.defaultCloseTime,
+                      };
+                    }
+                    return {
+                      ...existing,
+                      dayKey: canon.dayKey,
+                      label: canon.label,
+                    };
+                  });
+
+                  const updateDay = (dayKey: string, patch: Partial<(typeof editableHours)[number]>) => {
+                    const nextHours = editableHours.map((d) => {
+                      if (d.dayKey !== dayKey) return d;
+                      const merged = { ...d, ...patch };
+                      if (!merged.hasSecondShift) {
+                        delete merged.hasSecondShift;
+                        delete merged.secondOpenTime;
+                        delete merged.secondCloseTime;
+                      }
+                      return merged;
+                    });
                     updateConfigField({ operatingHours: nextHours });
                   };
 
-                  return (
-                    <div
-                      key={day.dayKey}
-                      className="px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3 bg-white hover:bg-slate-50/70 transition"
-                    >
-                      <div className="flex items-center gap-2.5 min-w-[140px]">
-                        <input
-                          type="checkbox"
-                          id={`day-open-${day.dayKey}`}
-                          disabled={isLoadingCloudConfig}
-                          checked={day.isOpen}
-                          onChange={(e) => updateDay({ isOpen: e.target.checked })}
-                          className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-                        />
-                        <label
-                          htmlFor={`day-open-${day.dayKey}`}
-                          className={`text-xs font-bold cursor-pointer select-none ${
-                            day.isOpen ? 'text-slate-800' : 'text-slate-400 line-through'
-                          }`}
-                        >
-                          {day.label}
-                        </label>
-                      </div>
+                  return editableHours.map((day) => {
+                    const dayError = validateOperatingDay(day, day.label);
+                    const hasSecondShift = day.hasSecondShift === true;
 
-                      {day.isOpen ? (
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="time"
-                            aria-label={`Abertura ${day.label}`}
-                            disabled={isLoadingCloudConfig}
-                            value={day.openTime}
-                            onChange={(e) => updateDay({ openTime: e.target.value })}
-                            className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
-                          />
-                          <span className="text-[11px] text-slate-400 font-semibold">às</span>
-                          <input
-                            type="time"
-                            aria-label={`Fechamento ${day.label}`}
-                            disabled={isLoadingCloudConfig}
-                            value={day.closeTime}
-                            onChange={(e) => updateDay({ closeTime: e.target.value })}
-                            className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
-                          />
+                    return (
+                      <div
+                        key={day.dayKey}
+                        className="px-3.5 py-2.5 bg-white hover:bg-slate-50/70 transition space-y-2"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex items-center gap-2.5 min-w-[140px]">
+                            <input
+                              type="checkbox"
+                              id={`day-open-${day.dayKey}`}
+                              disabled={isLoadingCloudConfig}
+                              checked={day.isOpen}
+                              onChange={(e) => {
+                                const nextOpen = e.target.checked;
+                                const canon = CANONICAL_WEEKDAYS.find((c) => c.dayKey === day.dayKey);
+                                const patch: Partial<(typeof editableHours)[number]> = { isOpen: nextOpen };
+                                if (!nextOpen) {
+                                  if (!isValidTimeHHmm(day.openTime) && canon) patch.openTime = canon.defaultOpenTime;
+                                  if (!isValidTimeHHmm(day.closeTime) && canon) patch.closeTime = canon.defaultCloseTime;
+                                  if (
+                                    day.hasSecondShift &&
+                                    (!isValidTimeHHmm(day.secondOpenTime) || !isValidTimeHHmm(day.secondCloseTime))
+                                  ) {
+                                    patch.hasSecondShift = false;
+                                    patch.secondOpenTime = undefined;
+                                    patch.secondCloseTime = undefined;
+                                  }
+                                }
+                                updateDay(day.dayKey, patch);
+                              }}
+                              className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                            />
+                            <label
+                              htmlFor={`day-open-${day.dayKey}`}
+                              className={`text-xs font-bold cursor-pointer select-none ${
+                                day.isOpen ? 'text-slate-800' : 'text-slate-400 line-through'
+                              }`}
+                            >
+                              {day.label}
+                            </label>
+                          </div>
+
+                          {day.isOpen ? (
+                            <div className="flex flex-col items-end gap-2">
+                              {/* 1º Turno */}
+                              <div className="flex flex-wrap items-center justify-end gap-2">
+                                <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400 min-w-[46px] text-right">
+                                  1º turno
+                                </span>
+                                <input
+                                  type="time"
+                                  aria-label={`Abertura 1º turno ${day.label}`}
+                                  disabled={isLoadingCloudConfig}
+                                  value={day.openTime}
+                                  onChange={(e) => updateDay(day.dayKey, { openTime: e.target.value })}
+                                  className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                                />
+                                <span className="text-[11px] text-slate-400 font-semibold">às</span>
+                                <input
+                                  type="time"
+                                  aria-label={`Fechamento 1º turno ${day.label}`}
+                                  disabled={isLoadingCloudConfig}
+                                  value={day.closeTime}
+                                  onChange={(e) => updateDay(day.dayKey, { closeTime: e.target.value })}
+                                  className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                                />
+
+                                {!hasSecondShift && (
+                                  <button
+                                    type="button"
+                                    disabled={isLoadingCloudConfig}
+                                    onClick={() => {
+                                      const suggested = getSuggestedSecondShift(day.closeTime);
+                                      updateDay(day.dayKey, {
+                                        hasSecondShift: true,
+                                        secondOpenTime: day.secondOpenTime || suggested.openTime,
+                                        secondCloseTime: day.secondCloseTime || suggested.closeTime,
+                                      });
+                                    }}
+                                    className="px-2 py-1 rounded-lg text-[11px] font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 flex items-center gap-1 transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                                  >
+                                    <Plus className="w-3 h-3" />
+                                    <span>2º turno</span>
+                                  </button>
+                                )}
+                              </div>
+
+                              {/* 2º Turno (Opcional) */}
+                              {hasSecondShift && (
+                                <div className="flex flex-wrap items-center justify-end gap-2">
+                                  <span className="text-[10px] font-bold uppercase tracking-wide text-amber-700 min-w-[46px] text-right">
+                                    2º turno
+                                  </span>
+                                  <input
+                                    type="time"
+                                    aria-label={`Abertura 2º turno ${day.label}`}
+                                    disabled={isLoadingCloudConfig}
+                                    value={day.secondOpenTime ?? ''}
+                                    onChange={(e) =>
+                                      updateDay(day.dayKey, {
+                                        hasSecondShift: true,
+                                        secondOpenTime: e.target.value,
+                                      })
+                                    }
+                                    className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                                  />
+                                  <span className="text-[11px] text-slate-400 font-semibold">às</span>
+                                  <input
+                                    type="time"
+                                    aria-label={`Fechamento 2º turno ${day.label}`}
+                                    disabled={isLoadingCloudConfig}
+                                    value={day.secondCloseTime ?? ''}
+                                    onChange={(e) =>
+                                      updateDay(day.dayKey, {
+                                        hasSecondShift: true,
+                                        secondCloseTime: e.target.value,
+                                      })
+                                    }
+                                    className="px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-semibold text-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                                  />
+                                  <button
+                                    type="button"
+                                    aria-label={`Remover 2º turno ${day.label}`}
+                                    disabled={isLoadingCloudConfig}
+                                    onClick={() =>
+                                      updateDay(day.dayKey, {
+                                        hasSecondShift: false,
+                                        secondOpenTime: undefined,
+                                        secondCloseTime: undefined,
+                                      })
+                                    }
+                                    className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                                    title="Remover 2º turno"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-slate-100 text-slate-500 border border-slate-200">
+                              Sem funcionamento
+                            </span>
+                          )}
                         </div>
-                      ) : (
-                        <span className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-slate-100 text-slate-500 border border-slate-200">
-                          Fechado
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
+
+                        {dayError && (
+                          <p className="text-[11px] font-semibold text-rose-600 flex items-center gap-1.5 pl-6">
+                            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                            <span>{dayError}</span>
+                          </p>
+                        )}
+                      </div>
+                    );
+                  });
+                })()}
               </div>
             </div>
           </div>

@@ -320,8 +320,11 @@ export interface DayOperatingHours {
   dayKey: DayOfWeekKey;
   label: string;
   isOpen: boolean;
-  openTime: string; // 'HH:mm'
-  closeTime: string; // 'HH:mm'
+  openTime: string; // 'HH:mm' (1º turno)
+  closeTime: string; // 'HH:mm' (1º turno)
+  hasSecondShift?: boolean; // Opcional: habilita 2º turno no mesmo dia
+  secondOpenTime?: string; // 'HH:mm' (2º turno)
+  secondCloseTime?: string; // 'HH:mm' (2º turno)
 }
 
 export interface StoreClosedSettings {
