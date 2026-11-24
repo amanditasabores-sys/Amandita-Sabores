@@ -505,26 +505,17 @@ export function generatePixCopiaECola(params: PixPayloadParams): string {
     throw new Error('Valor PIX excede o limite suportado pelo BR Code.');
   }
   const cleanAmount = roundedAmount > 0 ? roundedAmount.toFixed(2) : '';
-  const txId = sanitizeTxId(params.txId);
-  const cleanDesc = params.description ? sanitizeDescription(params.description) : '';
 
   // Field 00: Payload Format Indicator (Version 01)
   const payloadFormat = formatField('00', '01');
 
-  // Field 01: Point of Initiation Method
-  // '11' = Static BR Code (allows raw Pix Key + fixed purchase amount + TxID across all Brazilian banks)
-  const pointOfInitiation = formatField('01', '11');
+  // Field 01 (Point of Initiation Method) intentionally omitted for maximum
+  // Brazilian banking app interoperability on static BR Codes (Cantina UDV / BACEN reference)
 
-  // Field 26: Merchant Account Information (max total value length 99 UTF-8 bytes per EMVCo TLV)
+  // Field 26: Merchant Account Information (strictly GUI 00 + PIX key 01; no optional 02 description)
   const gui = formatField('00', 'br.gov.bcb.pix');
   const key = formatField('01', cleanKey);
-  const maxRemainingForDesc = 99 - (getUtf8ByteLength(gui) + getUtf8ByteLength(key)) - 4;
-  const trimmedDesc =
-    cleanDesc && maxRemainingForDesc >= 1
-      ? sliceToMaxUtf8Bytes(cleanDesc, maxRemainingForDesc).trim()
-      : '';
-  const desc = trimmedDesc ? formatField('02', trimmedDesc) : '';
-  const merchantAccountValue = `${gui}${key}${desc}`;
+  const merchantAccountValue = `${gui}${key}`;
   if (getUtf8ByteLength(merchantAccountValue) > 99) {
     throw new Error('Campo 26 (Merchant Account Info) excede 99 bytes UTF-8.');
   }
@@ -548,11 +539,11 @@ export function generatePixCopiaECola(params: PixPayloadParams): string {
   // Field 60: Merchant City (Max 15 ASCII chars)
   const merchantCity = formatField('60', cleanCity);
 
-  // Field 62: Additional Data Field Template (TxID)
-  const additionalDataField = formatField('62', formatField('05', txId));
+  // Field 62: Additional Data Field Template (static TxID '***' in EMV payload; internal order IDs remain untouched)
+  const additionalDataField = formatField('62', formatField('05', '***'));
 
   // Assemble payload before CRC
-  const rawPayload = `${payloadFormat}${pointOfInitiation}${merchantAccountInfo}${merchantCategory}${transactionCurrency}${transactionAmount}${countryCode}${merchantName}${merchantCity}${additionalDataField}6304`;
+  const rawPayload = `${payloadFormat}${merchantAccountInfo}${merchantCategory}${transactionCurrency}${transactionAmount}${countryCode}${merchantName}${merchantCity}${additionalDataField}6304`;
 
   // Calculate CRC16 checksum over UTF-8 bytes
   const crc16 = calculateCRC16(rawPayload);

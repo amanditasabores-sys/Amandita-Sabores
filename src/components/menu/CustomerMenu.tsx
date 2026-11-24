@@ -652,7 +652,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       // If order has PIX code, generate QR Code data URL directly from the exact BR Code payload
       if (order.paymentMethod === 'PIX' && order.pixCode) {
         try {
-          const qrUrl = await generateQRCodeDataUrl(order.pixCode, { width: 360, margin: 1 });
+          const qrUrl = await generateQRCodeDataUrl(order.pixCode, { width: 300, margin: 4 });
           setPixQrDataUrl(qrUrl);
         } catch {
           setPixQrError(
@@ -1900,7 +1900,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                     <img
                       src={pixQrDataUrl}
                       alt="QR Code PIX"
-                      className="w-44 h-44 object-contain mx-auto"
+                      className="w-48 h-48 max-w-full object-contain mx-auto"
                     />
                   </div>
                 ) : pixQrError ? (

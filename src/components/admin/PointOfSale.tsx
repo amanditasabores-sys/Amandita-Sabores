@@ -248,7 +248,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
       }
 
       try {
-        const qr = await generateQRCodeDataUrl(posPixCode, { width: 220, margin: 1 });
+        const qr = await generateQRCodeDataUrl(posPixCode, { width: 300, margin: 4 });
         if (!cancelled) {
           setPosPixQrDataUrl(qr);
           setPosPixQrError(null);
@@ -1025,7 +1025,7 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                 <>
                   {posPixQrDataUrl && !posPixQrError && (
                     <div className="flex justify-center bg-white p-2 rounded-xl border border-cyan-100">
-                      <img src={posPixQrDataUrl} alt="QR Code PIX PDV" className="w-36 h-36 object-contain" />
+                      <img src={posPixQrDataUrl} alt="QR Code PIX PDV" className="w-48 h-48 max-w-full object-contain" />
                     </div>
                   )}
                   <div className="space-y-1.5">

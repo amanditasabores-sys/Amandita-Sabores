@@ -6,10 +6,11 @@ export async function generateQRCodeDataUrl(text: string, options?: QRCode.QRCod
   }
   try {
     const dataUrl = await QRCode.toDataURL(text, {
-      width: 320,
-      margin: 2,
+      width: 300,
+      margin: 4,
+      errorCorrectionLevel: 'M',
       color: {
-        dark: '#0f172a',
+        dark: '#000000',
         light: '#ffffff',
       },
       ...options,

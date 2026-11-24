@@ -442,7 +442,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
     setPixValidationError(null);
     setTestPixCode(pixRes.payload);
     try {
-      const qr = await generateQRCodeDataUrl(pixRes.payload, { width: 260, margin: 1 });
+      const qr = await generateQRCodeDataUrl(pixRes.payload, { width: 300, margin: 4 });
       setTestQrDataUrl(qr);
       setTestQrError(null);
     } catch {
@@ -836,7 +836,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
             <div className="p-3 bg-emerald-50/80 border border-emerald-200/80 rounded-xl text-xs text-emerald-950 flex items-start gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <span>
-                <strong>Padrão Oficial BACEN BR Code (valor individualizado por compra):</strong> O QR Code e o Copia e Cola seguem rigorosamente o padrão do Banco Central (Ponto de Iniciação <code className="bg-emerald-100 text-emerald-900 px-1 py-0.5 rounded text-[11px] font-mono">01: 11</code> com valor exato e TXID do pedido). Como não há integração bancária automática via API, a conferência do recebimento deve ser feita manualmente no aplicativo do banco.
+                <strong>Padrão Oficial BACEN BR Code (valor individualizado por compra):</strong> O QR Code e o Copia e Cola seguem o padrão estático do Banco Central (valor exato da compra e TXID estático <code className="bg-emerald-100 text-emerald-900 px-1 py-0.5 rounded text-[11px] font-mono">***</code> para máxima compatibilidade bancária). Como não há integração bancária automática via API, a conferência do recebimento deve ser feita manualmente no aplicativo do banco.
               </span>
             </div>
           </div>
@@ -1160,7 +1160,7 @@ export const StoreSettings: React.FC<StoreSettingsProps> = ({ currentUser, onNav
                 <img
                   src={testQrDataUrl}
                   alt="QR Code PIX de Teste"
-                  className="w-48 h-48 rounded-xl shadow-xs border border-white"
+                  className="w-48 h-48 max-w-full object-contain bg-white rounded-xl shadow-xs border border-white"
                 />
               ) : (testQrError || pixValidationError) ? (
                 <div className="w-48 min-h-36 p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-center justify-center text-center text-rose-700 text-[11px] font-semibold leading-snug">
