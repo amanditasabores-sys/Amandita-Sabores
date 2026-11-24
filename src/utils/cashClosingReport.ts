@@ -15,6 +15,15 @@ export interface CashShiftFinancialMetrics {
   grossCardSales: number;
   cardRefunds: number;
   netCardSales: number;
+  grossCreditCardSales: number;
+  creditCardRefunds: number;
+  netCreditCardSales: number;
+  grossDebitCardSales: number;
+  debitCardRefunds: number;
+  netDebitCardSales: number;
+  grossOtherCardOrMixedSales: number;
+  otherCardOrMixedRefunds: number;
+  netOtherCardOrMixedSales: number;
   totalSangrias: number;
   totalSuprimentos: number;
   totalVales: number;
@@ -54,6 +63,15 @@ export interface CashClosingReportData {
   grossCardSales: number;
   cardRefunds: number;
   netCardSales: number;
+  grossCreditCardSales: number;
+  creditCardRefunds: number;
+  netCreditCardSales: number;
+  grossDebitCardSales: number;
+  debitCardRefunds: number;
+  netDebitCardSales: number;
+  grossOtherCardOrMixedSales: number;
+  otherCardOrMixedRefunds: number;
+  netOtherCardOrMixedSales: number;
   totalNetRevenue: number;
   countedCash: number;
   difference: number;
@@ -92,6 +110,15 @@ export function calculateCashShiftMetrics(shift: CashRegisterShift | null): Cash
       grossCardSales: 0,
       cardRefunds: 0,
       netCardSales: 0,
+      grossCreditCardSales: 0,
+      creditCardRefunds: 0,
+      netCreditCardSales: 0,
+      grossDebitCardSales: 0,
+      debitCardRefunds: 0,
+      netDebitCardSales: 0,
+      grossOtherCardOrMixedSales: 0,
+      otherCardOrMixedRefunds: 0,
+      netOtherCardOrMixedSales: 0,
       totalSangrias: 0,
       totalSuprimentos: 0,
       totalVales: 0,
@@ -108,8 +135,12 @@ export function calculateCashShiftMetrics(shift: CashRegisterShift | null): Cash
   let cashRefunds = 0;
   let grossPixSales = 0;
   let pixRefunds = 0;
-  let grossCardSales = 0;
-  let cardRefunds = 0;
+  let grossCreditCardSales = 0;
+  let creditCardRefunds = 0;
+  let grossDebitCardSales = 0;
+  let debitCardRefunds = 0;
+  let grossOtherCardOrMixedSales = 0;
+  let otherCardOrMixedRefunds = 0;
   let totalSangrias = 0;
   let totalSuprimentos = 0;
   let totalVales = 0;
@@ -120,11 +151,15 @@ export function calculateCashShiftMetrics(shift: CashRegisterShift | null): Cash
     if (m.type === 'VENDA') {
       if (m.paymentMethod === 'DINHEIRO') grossCashSales += m.amount;
       else if (m.paymentMethod === 'PIX') grossPixSales += m.amount;
-      else grossCardSales += m.amount;
+      else if (m.paymentMethod === 'CARTAO_CREDITO') grossCreditCardSales += m.amount;
+      else if (m.paymentMethod === 'CARTAO_DEBITO') grossDebitCardSales += m.amount;
+      else grossOtherCardOrMixedSales += m.amount;
     } else if (m.type === 'ESTORNO') {
       if (m.paymentMethod === 'DINHEIRO') cashRefunds += m.amount;
       else if (m.paymentMethod === 'PIX') pixRefunds += m.amount;
-      else cardRefunds += m.amount;
+      else if (m.paymentMethod === 'CARTAO_CREDITO') creditCardRefunds += m.amount;
+      else if (m.paymentMethod === 'CARTAO_DEBITO') debitCardRefunds += m.amount;
+      else otherCardOrMixedRefunds += m.amount;
     } else if (m.type === 'SANGRIA') {
       totalSangrias += m.amount;
     } else if (m.type === 'SUPRIMENTO') {
@@ -136,8 +171,13 @@ export function calculateCashShiftMetrics(shift: CashRegisterShift | null): Cash
     }
   });
 
+  const grossCardSales = grossCreditCardSales + grossDebitCardSales + grossOtherCardOrMixedSales;
+  const cardRefunds = creditCardRefunds + debitCardRefunds + otherCardOrMixedRefunds;
   const netCashSales = grossCashSales - cashRefunds;
   const netPixSales = grossPixSales - pixRefunds;
+  const netCreditCardSales = grossCreditCardSales - creditCardRefunds;
+  const netDebitCardSales = grossDebitCardSales - debitCardRefunds;
+  const netOtherCardOrMixedSales = grossOtherCardOrMixedSales - otherCardOrMixedRefunds;
   const netCardSales = grossCardSales - cardRefunds;
   const totalGrossRevenue = grossCashSales + grossPixSales + grossCardSales;
   const totalRefunds = cashRefunds + pixRefunds + cardRefunds;
@@ -166,6 +206,15 @@ export function calculateCashShiftMetrics(shift: CashRegisterShift | null): Cash
     grossCardSales,
     cardRefunds,
     netCardSales,
+    grossCreditCardSales,
+    creditCardRefunds,
+    netCreditCardSales,
+    grossDebitCardSales,
+    debitCardRefunds,
+    netDebitCardSales,
+    grossOtherCardOrMixedSales,
+    otherCardOrMixedRefunds,
+    netOtherCardOrMixedSales,
     totalSangrias,
     totalSuprimentos,
     totalVales,
@@ -281,6 +330,15 @@ export function buildOpenShiftClosingReport(
     grossCardSales: m.grossCardSales,
     cardRefunds: m.cardRefunds,
     netCardSales: m.netCardSales,
+    grossCreditCardSales: m.grossCreditCardSales,
+    creditCardRefunds: m.creditCardRefunds,
+    netCreditCardSales: m.netCreditCardSales,
+    grossDebitCardSales: m.grossDebitCardSales,
+    debitCardRefunds: m.debitCardRefunds,
+    netDebitCardSales: m.netDebitCardSales,
+    grossOtherCardOrMixedSales: m.grossOtherCardOrMixedSales,
+    otherCardOrMixedRefunds: m.otherCardOrMixedRefunds,
+    netOtherCardOrMixedSales: m.netOtherCardOrMixedSales,
     totalNetRevenue: m.totalNetRevenue,
     countedCash: options.countedCash,
     difference,
@@ -345,6 +403,15 @@ export function buildClosedShiftClosingReport(
     grossCardSales: m.grossCardSales,
     cardRefunds: m.cardRefunds,
     netCardSales: m.netCardSales,
+    grossCreditCardSales: m.grossCreditCardSales,
+    creditCardRefunds: m.creditCardRefunds,
+    netCreditCardSales: m.netCreditCardSales,
+    grossDebitCardSales: m.grossDebitCardSales,
+    debitCardRefunds: m.debitCardRefunds,
+    netDebitCardSales: m.netDebitCardSales,
+    grossOtherCardOrMixedSales: m.grossOtherCardOrMixedSales,
+    otherCardOrMixedRefunds: m.otherCardOrMixedRefunds,
+    netOtherCardOrMixedSales: m.netOtherCardOrMixedSales,
     totalNetRevenue: m.totalNetRevenue,
     countedCash,
     difference,

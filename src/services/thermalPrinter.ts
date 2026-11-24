@@ -90,13 +90,18 @@ class ThermalPrinterService {
   private isReconnecting = false;
   private lastError: string | null = null;
   private lastPrintedAt: string | null = null;
+  private activeReconnectPromise: Promise<{ success: boolean; message: string }> | null = null;
+  private registeredDisconnectDevices: WeakSet<object> = new WeakSet();
+  private lastAutoReconnectAttemptAt = 0;
+  private readonly AUTO_RECONNECT_COOLDOWN_MS = 4000;
 
   constructor() {
     this.config = this.loadConfig();
     if (typeof window !== 'undefined' && typeof navigator !== 'undefined') {
       setTimeout(() => {
-        this.tryAutoReconnectOnStartup().catch(() => {});
+        this.tryAutoReconnectOnStartup({ silent: true }).catch(() => {});
       }, 300);
+      this.setupLifecycleAutoReconnectListeners();
     }
   }
 
@@ -259,9 +264,48 @@ class ThermalPrinterService {
     }
   }
 
+  private isBleConnectionHealthy(): boolean {
+    return Boolean(this.gattServer && this.gattServer.connected && this.writeCharacteristic);
+  }
+
+  private setupLifecycleAutoReconnectListeners(): void {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const triggerPassiveResumeReconnect = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (this.config.connectionMode !== 'bluetooth_ble') return;
+      if (!this.bleDevice && !this.config.lastDeviceId && !this.config.lastDeviceName) return;
+      if (this.isPrinting) return;
+      if (this.isBleConnectionHealthy()) return;
+      if (this.activeReconnectPromise) return;
+
+      const now = Date.now();
+      if (now - this.lastAutoReconnectAttemptAt < this.AUTO_RECONNECT_COOLDOWN_MS) return;
+
+      this.tryAutoReconnectOnStartup({ silent: true }).catch(() => {});
+    };
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        triggerPassiveResumeReconnect();
+      }
+    });
+
+    window.addEventListener('pageshow', (event: PageTransitionEvent) => {
+      if (event.persisted || document.visibilityState === 'visible') {
+        triggerPassiveResumeReconnect();
+      }
+    });
+  }
+
   private setupDeviceDisconnectionListener(device: any): void {
-    if (!device) return;
+    if (!device || typeof device !== 'object' || typeof device.addEventListener !== 'function') return;
+    if (this.registeredDisconnectDevices.has(device)) return;
+    this.registeredDisconnectDevices.add(device);
+
     device.addEventListener('gattserverdisconnected', () => {
+      // Proteção: ignora evento se pertencer a uma referência antiga já substituída
+      if (this.bleDevice && this.bleDevice !== device) return;
       console.info('[BLE] Conexão GATT com a impressora encerrada pelo hardware ou economia de energia.');
       this.writeCharacteristic = null;
       this.gattServer = null;
@@ -317,161 +361,273 @@ class ThermalPrinterService {
     return foundCharacteristic;
   }
 
-  /**
-   * Tentativa passiva de restauração ao iniciar/recarregar a página:
-   * Utiliza navigator.bluetooth.getDevices() quando autorizado pelo Chrome.
-   * Por segurança do navegador, o reload completo encerra handles GATT ativos;
-   * se o navegador exigir interação do operador ou a impressora estiver desligada,
-   * o estado permanece honestamente como "Desconectada" para reconexão em 1 clique.
-   */
-  public async tryAutoReconnectOnStartup(): Promise<{ success: boolean; message: string }> {
-    const nav = typeof navigator !== 'undefined' ? (navigator as any) : null;
-    if (
-      !nav?.bluetooth ||
-      typeof nav.bluetooth.getDevices !== 'function' ||
-      this.config.connectionMode !== 'bluetooth_ble' ||
-      (!this.config.lastDeviceId && !this.config.lastDeviceName)
-    ) {
-      return { success: false, message: 'Sem dispositivo BLE prévio para restauração automática.' };
-    }
-
-    if (this.gattServer?.connected && this.writeCharacteristic) {
-      return { success: true, message: 'Impressora já conectada.' };
-    }
-
-    this.isReconnecting = true;
-    this.notifyStatus();
-
+  private async connectGattWithTimeout(device: any, timeoutMs: number): Promise<any> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const devices = await nav.bluetooth.getDevices();
-      const matched = devices.find(
-        (d: any) =>
-          (this.config.lastDeviceId && d.id === this.config.lastDeviceId) ||
-          (this.config.lastDeviceName && d.name === this.config.lastDeviceName)
-      );
-
-      if (!matched || !matched.gatt) {
-        return {
-          success: false,
-          message: 'Sessão Bluetooth encerrada pelo recarregamento. Clique em Reconectar Impressora.',
-        };
-      }
-
-      this.bleDevice = matched;
-      this.setupDeviceDisconnectionListener(matched);
-
-      const server = await Promise.race([
-        matched.gatt.connect(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Tempo limite ao reconectar BLE')), 5000)),
+      return await Promise.race([
+        device.gatt.connect(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Tempo limite ao reconectar BLE')), timeoutMs);
+        }),
       ]);
-      this.gattServer = server;
-
-      const foundChar = await this.discoverWriteCharacteristic(server);
-      if (!foundChar) {
-        this.writeCharacteristic = null;
-        this.gattServer = null;
-        return {
-          success: false,
-          message: 'Impressora encontrada, mas aguardando reconexão manual da característica BLE.',
-        };
-      }
-
-      this.writeCharacteristic = foundChar;
-      this.lastError = null;
-      return {
-        success: true,
-        message: `Impressora "${matched.name || 'Térmica 58mm'}" reconectada automaticamente.`,
-      };
-    } catch {
-      this.writeCharacteristic = null;
-      this.gattServer = null;
-      return {
-        success: false,
-        message: 'Conexão BLE encerrada ao recarregar a página. Use o botão Reconectar Impressora.',
-      };
     } finally {
-      this.isReconnecting = false;
-      this.notifyStatus();
+      if (timer) clearTimeout(timer);
     }
   }
 
   /**
-   * Reconexão resiliente sem reabrir diálogo nativo do Chrome:
-   * Restaura gattServer, recupera dispositivo via getDevices() se perdido após reload,
-   * e redescobre a característica de escrita ESC/POS para evitar falha de characteristic nula.
+   * Aguarda brevemente um pacote de anúncio BLE (somente se watchAdvertisements for suportado),
+   * ajudando o Chrome a localizar dispositivos autorizados devolvidos por getDevices() após reload.
    */
-  public async reconnectSavedBLE(): Promise<{ success: boolean; message: string }> {
+  private async waitForAdvertisementBriefly(device: any, timeoutMs = 3000): Promise<void> {
+    if (!device || typeof device.watchAdvertisements !== 'function') return;
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let onAd: (() => void) | null = null;
+
+    try {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          if (onAd && typeof device.removeEventListener === 'function') {
+            device.removeEventListener('advertisementreceived', onAd);
+          }
+          resolve();
+        };
+
+        onAd = () => finish();
+        if (typeof device.addEventListener === 'function') {
+          device.addEventListener('advertisementreceived', onAd, { once: true });
+        }
+
+        timer = setTimeout(finish, timeoutMs);
+
+        const watchPromise = controller
+          ? device.watchAdvertisements({ signal: controller.signal })
+          : device.watchAdvertisements();
+
+        Promise.resolve(watchPromise).catch(() => finish());
+      });
+    } catch {
+      // Ignora erro caso o navegador não permita watchAdvertisements neste contexto
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAd && typeof device.removeEventListener === 'function') {
+        device.removeEventListener('advertisementreceived', onAd);
+      }
+      if (controller) {
+        try {
+          controller.abort();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  private async resolveSavedBleDevice(nav: any): Promise<any | null> {
+    if (this.bleDevice && this.bleDevice.gatt) {
+      this.setupDeviceDisconnectionListener(this.bleDevice);
+      return this.bleDevice;
+    }
+
+    if (
+      !nav?.bluetooth ||
+      typeof nav.bluetooth.getDevices !== 'function' ||
+      (!this.config.lastDeviceId && !this.config.lastDeviceName)
+    ) {
+      return null;
+    }
+
+    try {
+      const devices = await nav.bluetooth.getDevices();
+      if (!Array.isArray(devices) || devices.length === 0) return null;
+
+      // Prefere correspondência exata por ID salvo; fallback por nome salvo
+      const matched =
+        (this.config.lastDeviceId ? devices.find((d: any) => d && d.id === this.config.lastDeviceId) : null) ||
+        (this.config.lastDeviceName ? devices.find((d: any) => d && d.name === this.config.lastDeviceName) : null);
+
+      if (matched && matched.gatt) {
+        this.bleDevice = matched;
+        this.setupDeviceDisconnectionListener(matched);
+        return matched;
+      }
+    } catch (e) {
+      console.warn('[BLE Reconnect] getDevices aviso:', e);
+    }
+
+    return null;
+  }
+
+  private async performSerializedBleReconnect(options: {
+    silent: boolean;
+    timeoutMs: number;
+    allowWatchAdvertisements: boolean;
+  }): Promise<{ success: boolean; message: string }> {
+    // Nunca perturba nem desconecta uma conexão que já está funcionando
+    if (this.isBleConnectionHealthy()) {
+      return { success: true, message: 'Impressora já conectada e pronta.' };
+    }
+
+    // Serialização: se já há uma reconexão em andamento, compartilha a mesma Promise
+    if (this.activeReconnectPromise) {
+      return this.activeReconnectPromise;
+    }
+
     const nav = typeof navigator !== 'undefined' ? (navigator as any) : null;
     if (!nav?.bluetooth) {
       return { success: false, message: 'Web Bluetooth não suportado neste navegador.' };
     }
 
-    // Se já estiver conectado e com característica pronta, retorna sucesso
-    if (this.gattServer && this.gattServer.connected && this.writeCharacteristic) {
-      return { success: true, message: 'Impressora já conectada e pronta.' };
-    }
+    const run = (async (): Promise<{ success: boolean; message: string }> => {
+      this.lastAutoReconnectAttemptAt = Date.now();
+      this.isReconnecting = true;
+      this.notifyStatus();
 
-    this.isReconnecting = true;
-    this.notifyStatus();
+      try {
+        const hadDeviceInMemory = Boolean(this.bleDevice);
+        const device = await this.resolveSavedBleDevice(nav);
 
-    try {
-      // 1. Se o objeto de dispositivo em memória foi perdido, tenta recuperar via getDevices()
-      if (!this.bleDevice && nav.bluetooth.getDevices && (this.config.lastDeviceId || this.config.lastDeviceName)) {
-        try {
-          const devices = await nav.bluetooth.getDevices();
-          const matched = devices.find(
-            (d: any) =>
-              (this.config.lastDeviceId && d.id === this.config.lastDeviceId) ||
-              (this.config.lastDeviceName && d.name === this.config.lastDeviceName)
-          );
-          if (matched) {
-            this.bleDevice = matched;
-            this.setupDeviceDisconnectionListener(matched);
-          }
-        } catch (e) {
-          console.warn('[BLE Reconnect] getDevices aviso:', e);
+        if (!device || !device.gatt) {
+          return {
+            success: false,
+            message: options.silent
+              ? 'Sessão Bluetooth encerrada pelo recarregamento. Clique em Reconectar Impressora.'
+              : 'Handle Bluetooth encerrado pelo navegador ou dispositivo fora de alcance. Clique em "Parear / Reconectar" para autorizar novamente.',
+          };
         }
-      }
 
-      if (!this.bleDevice || !this.bleDevice.gatt) {
+        if (!options.silent) {
+          this.lastError = null;
+          this.notifyStatus();
+        }
+
+        // Até 2 tentativas controladas (nunca loop infinito):
+        // Tentativa 1: conexão GATT direta
+        // Tentativa 2 (somente se a 1ª falhar): aguarda anúncio BLE se suportado (útil após getDevices()/reload) ou breve pausa
+        let lastConnectError: any = null;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          if (this.isBleConnectionHealthy()) {
+            return {
+              success: true,
+              message: `Impressora "${device.name || 'Térmica 58mm'}" já conectada e pronta.`,
+            };
+          }
+
+          if (attempt === 2) {
+            if (options.allowWatchAdvertisements && !hadDeviceInMemory && typeof device.watchAdvertisements === 'function') {
+              await this.waitForAdvertisementBriefly(device, 3000);
+            } else {
+              await new Promise((r) => setTimeout(r, 350));
+            }
+          }
+
+          try {
+            const server = await this.connectGattWithTimeout(device, options.timeoutMs);
+            this.gattServer = server;
+
+            let foundChar = await this.discoverWriteCharacteristic(server);
+            if (!foundChar) {
+              // Pequena pausa para impressoras BLE que demoram alguns ms para expor serviços após acordar
+              await new Promise((r) => setTimeout(r, 250));
+              if (server?.connected) {
+                foundChar = await this.discoverWriteCharacteristic(server);
+              }
+            }
+
+            if (foundChar) {
+              this.writeCharacteristic = foundChar;
+              this.lastError = null;
+              return {
+                success: true,
+                message: options.silent
+                  ? `Impressora "${device.name || 'Térmica 58mm'}" reconectada automaticamente.`
+                  : `Impressora "${device.name || 'Térmica 58mm'}" reconectada com sucesso!`,
+              };
+            }
+
+            // Falha transitória na descoberta da característica:
+            // NÃO chama disconnectBluetooth() para preservar this.bleDevice em memória!
+            this.writeCharacteristic = null;
+            this.gattServer = null;
+            lastConnectError = new Error('Impressora reconectada, mas a característica de escrita BLE não foi encontrada.');
+          } catch (err: any) {
+            this.writeCharacteristic = null;
+            this.gattServer = null;
+            lastConnectError = err;
+          }
+        }
+
+        const msg = lastConnectError?.message || String(lastConnectError || 'Falha ao reconectar BLE');
+        if (!options.silent) {
+          const errorMessage = msg.startsWith('Impressora reconectada')
+            ? msg
+            : `Falha ao reconectar impressora: ${msg}`;
+          this.lastError = errorMessage;
+          return { success: false, message: errorMessage };
+        }
+
         return {
           success: false,
-          message: 'Handle Bluetooth encerrado pelo navegador ou dispositivo fora de alcance. Clique em "Parear / Reconectar" para autorizar novamente.',
+          message: 'Conexão BLE aguardando reconexão. Use o botão Reconectar Impressora se necessário.',
         };
+      } finally {
+        this.isReconnecting = false;
+        this.activeReconnectPromise = null;
+        this.notifyStatus();
       }
+    })();
 
-      this.lastError = null;
-      this.notifyStatus();
+    this.activeReconnectPromise = run;
+    return run;
+  }
 
-      // 2. Reconecta ao GATT Server
-      const server = await this.bleDevice.gatt.connect();
-      this.gattServer = server;
-
-      // 3. Redescobre a característica de escrita ESC/POS (CORREÇÃO CRÍTICA DO BUG DE CARACTERÍSTICA NULA)
-      const foundChar = await this.discoverWriteCharacteristic(server);
-      if (!foundChar) {
-        await this.disconnectBluetooth();
-        const err = 'Impressora reconectada, mas a característica de escrita BLE não foi encontrada.';
-        this.lastError = err;
-        return { success: false, message: err };
-      }
-
-      this.writeCharacteristic = foundChar;
-
-      return {
-        success: true,
-        message: `Impressora "${this.bleDevice.name || 'Térmica 58mm'}" reconectada com sucesso!`,
-      };
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      this.writeCharacteristic = null;
-      this.gattServer = null;
-      this.lastError = `Falha ao reconectar impressora: ${msg}`;
-      return { success: false, message: this.lastError };
-    } finally {
-      this.isReconnecting = false;
-      this.notifyStatus();
+  /**
+   * Tentativa passiva de restauração ao iniciar/recarregar a página ou retornar do segundo plano:
+   * Reutiliza this.bleDevice se presente em memória ou recupera via navigator.bluetooth.getDevices().
+   * Serializada por activeReconnectPromise para evitar múltiplas conexões GATT simultâneas.
+   */
+  public async tryAutoReconnectOnStartup(options?: { silent?: boolean }): Promise<{ success: boolean; message: string }> {
+    const nav = typeof navigator !== 'undefined' ? (navigator as any) : null;
+    if (
+      !nav?.bluetooth ||
+      this.config.connectionMode !== 'bluetooth_ble' ||
+      (!this.bleDevice && !this.config.lastDeviceId && !this.config.lastDeviceName)
+    ) {
+      return { success: false, message: 'Sem dispositivo BLE prévio para restauração automática.' };
     }
+
+    if (!this.bleDevice && typeof nav.bluetooth.getDevices !== 'function') {
+      return { success: false, message: 'Navegador sem suporte a getDevices() para restauração automática.' };
+    }
+
+    if (this.isBleConnectionHealthy()) {
+      return { success: true, message: 'Impressora já conectada.' };
+    }
+
+    return this.performSerializedBleReconnect({
+      silent: options?.silent !== false,
+      timeoutMs: 5000,
+      allowWatchAdvertisements: true,
+    });
+  }
+
+  /**
+   * Reconexão resiliente sem reabrir diálogo nativo do Chrome:
+   * Restaura gattServer, preserva this.bleDevice em falhas transitórias,
+   * recupera dispositivo via getDevices() se perdido após reload e redescobre a característica ESC/POS.
+   */
+  public async reconnectSavedBLE(): Promise<{ success: boolean; message: string }> {
+    return this.performSerializedBleReconnect({
+      silent: false,
+      timeoutMs: 6000,
+      allowWatchAdvertisements: true,
+    });
   }
 
   public async disconnectBluetooth(): Promise<void> {
@@ -560,22 +716,96 @@ class ThermalPrinterService {
     return ' '.repeat(leftPad) + s;
   }
 
-  private wrapText(text: string, maxLen = 32, indent = ''): string[] {
-    const sanitized = this.sanitizeText(text);
-    const words = sanitized.split(' ');
+  private wrapText(text: string, maxLen = 31, indent = ''): string[] {
+    const normalized = (text || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/\u00A0/g, ' ');
+    const paragraphs = normalized.split('\n');
     const lines: string[] = [];
-    let currentLine = indent;
 
-    for (const w of words) {
-      if ((currentLine + (currentLine === indent ? '' : ' ') + w).length <= maxLen) {
-        currentLine += (currentLine === indent ? '' : ' ') + w;
+    for (const para of paragraphs) {
+      const sanitized = this.sanitizeText(para).replace(/\s+/g, ' ').trim();
+      if (!sanitized) continue;
+      const words = sanitized.split(' ');
+      let currentLine = indent;
+
+      for (const w of words) {
+        const candidate = currentLine === indent ? indent + w : `${currentLine} ${w}`;
+        if (candidate.length <= maxLen) {
+          currentLine = candidate;
+        } else {
+          if (currentLine.trim()) lines.push(currentLine);
+          const usable = Math.max(1, maxLen - indent.length);
+          if (w.length > usable) {
+            let pos = 0;
+            while (pos < w.length) {
+              const part = w.slice(pos, pos + usable);
+              if (pos + usable < w.length) {
+                lines.push(indent + part);
+              } else {
+                currentLine = indent + part;
+              }
+              pos += usable;
+            }
+          } else {
+            currentLine = indent + w;
+          }
+        }
+      }
+      if (currentLine.trim()) lines.push(currentLine);
+    }
+    return lines;
+  }
+
+  /**
+   * Largura segura para recibos de pedido (1 coluna abaixo do limite físico de 32/48 col)
+   * evitando auto-wrap de hardware + LF que gera linhas em branco fantasmas em 58 mm.
+   */
+  private getSafeOrderColumns(): number {
+    return this.config.paperWidth === '80mm' ? 47 : 31;
+  }
+
+  /**
+   * Formata título do item com preço à direita na 1ª linha e continuação
+   * aproveitando a largura útil completa (evitando quebras excessivas em 22 colunas).
+   */
+  private formatOrderItemTitleLines(itemTitle: string, itemPrice: string, cols: number): string[] {
+    const cleanTitle = this.sanitizeText(itemTitle.replace(/\u00A0/g, ' ')).replace(/\s+/g, ' ').trim();
+    const cleanPrice = this.sanitizeText(itemPrice.replace(/\u00A0/g, ' ')).trim();
+
+    if (cleanTitle.length + cleanPrice.length + 1 <= cols) {
+      return [this.formatLine(cleanTitle, cleanPrice, cols)];
+    }
+
+    const firstLineMax = Math.max(10, cols - cleanPrice.length - 1);
+    const words = cleanTitle.split(' ');
+    let firstLine = '';
+    let idx = 0;
+
+    while (idx < words.length) {
+      const candidate = firstLine ? `${firstLine} ${words[idx]}` : words[idx];
+      if (candidate.length <= firstLineMax) {
+        firstLine = candidate;
+        idx++;
       } else {
-        if (currentLine.trim()) lines.push(currentLine);
-        currentLine = indent + w;
+        break;
       }
     }
-    if (currentLine.trim()) lines.push(currentLine);
-    return lines;
+
+    if (!firstLine) {
+      // Primeira palavra muito longa: fatia para caber com o preço na linha 1
+      const firstWord = words[0];
+      firstLine = firstWord.slice(0, firstLineMax);
+      const remainderWord = firstWord.slice(firstLineMax);
+      const remainingText = [remainderWord, ...words.slice(1)].filter(Boolean).join(' ');
+      const restLines = remainingText ? this.wrapText(remainingText, cols, '  ') : [];
+      return [this.formatLine(firstLine, cleanPrice, cols), ...restLines];
+    }
+
+    const remainingText = words.slice(idx).join(' ');
+    const restLines = remainingText ? this.wrapText(remainingText, cols, '  ') : [];
+    return [this.formatLine(firstLine, cleanPrice, cols), ...restLines];
   }
 
   /**
@@ -585,6 +815,7 @@ class ThermalPrinterService {
   public formatReceiptAddressLines(addr?: CustomerAddress): string[] {
     if (!addr) return [];
     const lines: string[] = [];
+    const cols = this.getSafeOrderColumns();
 
     const condRaw = (addr.condominium || '').trim();
     const streetRaw = (addr.street || '').trim();
@@ -621,7 +852,7 @@ class ThermalPrinterService {
     // 1. Condomínio (se informado)
     if (condRaw) {
       const cleanCond = condRaw.replace(/^condom[íi]nio\s*/i, '').trim();
-      lines.push(...this.wrapText(`Cond: ${cleanCond}`, 32, '  '));
+      lines.push(...this.wrapText(`Cond: ${cleanCond}`, cols, '  '));
       printedCond = true;
     }
 
@@ -632,7 +863,7 @@ class ThermalPrinterService {
         condRaw.toLowerCase().includes(streetRaw.toLowerCase())
       );
       if (!isSameAsCondo || !printedCond) {
-        lines.push(...this.wrapText(streetRaw, 32, '  '));
+        lines.push(...this.wrapText(streetRaw, cols, '  '));
         if (/condom[íi]nio/i.test(streetRaw)) {
           printedCond = true;
         }
@@ -643,7 +874,7 @@ class ThermalPrinterService {
     if (numRaw) {
       const isOnlyApOrBloco = /^(?:ap(?:to|\.)?\s*[:\-]?\s*[0-9a-zA-Z]+|bloco\s*[:\-]?\s*[0-9a-zA-Z]+|s\/?n)$/i.test(numRaw.trim());
       if (!isOnlyApOrBloco) {
-        lines.push(`  Numero: ${this.sanitizeText(numRaw)}`);
+        lines.push(...this.wrapText(`Numero: ${numRaw}`, cols, '  '));
       } else if (/^s\/?n$/i.test(numRaw.trim()) && !effectiveApt && !effectiveBlock) {
         lines.push(`  Numero: S/N`);
       }
@@ -658,7 +889,7 @@ class ThermalPrinterService {
       blockAptParts.push(`Apto: ${effectiveApt.replace(/^ap(?:to|\.)?\s*/i, '').trim()}`);
     }
     if (blockAptParts.length > 0) {
-      lines.push(`  ${blockAptParts.join(' - ')}`);
+      lines.push(...this.wrapText(blockAptParts.join(' - '), cols, '  '));
     }
 
     // 5. Complemento (remove redundâncias de Bloco e Ap já impressos)
@@ -672,7 +903,7 @@ class ThermalPrinterService {
       }
       cleanComp = cleanComp.replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '').trim();
       if (cleanComp) {
-        lines.push(...this.wrapText(`Compl: ${cleanComp}`, 32, '  '));
+        lines.push(...this.wrapText(`Compl: ${cleanComp}`, cols, '  '));
       }
     }
 
@@ -680,18 +911,18 @@ class ThermalPrinterService {
     if (neighRaw && neighRaw !== 'Bairro') {
       const isSameAsCondo = condRaw && neighRaw.toLowerCase().includes(condRaw.toLowerCase());
       if (!isSameAsCondo) {
-        lines.push(`  Bairro: ${this.sanitizeText(neighRaw)}`);
+        lines.push(...this.wrapText(`Bairro: ${neighRaw}`, cols, '  '));
       }
     }
 
     // 7. Cidade
     if (cityRaw) {
-      lines.push(`  Cidade: ${this.sanitizeText(cityRaw)}`);
+      lines.push(...this.wrapText(`Cidade: ${cityRaw}`, cols, '  '));
     }
 
     // 8. Ponto de Referência
     if (refRaw) {
-      lines.push(...this.wrapText(`Ref: ${refRaw}`, 32, '  '));
+      lines.push(...this.wrapText(`Ref: ${refRaw}`, cols, '  '));
     }
 
     return lines;
@@ -725,17 +956,16 @@ class ThermalPrinterService {
   public generateReceiptPlainText(order: Order, options?: { isReprint?: boolean; footerText?: string }): string {
     const isReprint = Boolean(options?.isReprint);
     const dateFormatted = formatDateTime(order.createdAt);
-    const separator = '--------------------------------';
+    const cols = this.getSafeOrderColumns();
+    const separator = '-'.repeat(cols);
     const lines: string[] = [];
 
     // CABEÇALHO
-    lines.push(this.centerText('AMANDITA SABORES'));
-    lines.push(this.centerText('Cardapio & Cozinha'));
-    lines.push('');
+    lines.push(this.centerText('AMANDITA SABORES', cols));
+    lines.push(this.centerText('Cardapio & Cozinha', cols));
 
     if (isReprint) {
-      lines.push(this.centerText('*** REIMPRESSAO ***'));
-      lines.push('');
+      lines.push(this.centerText('*** REIMPRESSAO ***', cols));
     }
 
     const isDelivery = order.fulfillmentType === 'DELIVERY';
@@ -743,18 +973,18 @@ class ThermalPrinterService {
     // MODALIDADE
     lines.push(separator);
     if (isDelivery) {
-      lines.push(this.centerText('*** ENTREGA ***'));
+      lines.push(this.centerText('*** ENTREGA ***', cols));
     } else {
-      lines.push(this.centerText('*** RETIRADA NO BALCAO ***'));
+      lines.push(this.centerText('*** RETIRADA NO BALCAO ***', cols));
     }
     lines.push(separator);
 
     // PEDIDO E DATA
-    lines.push(this.formatLine(`PEDIDO: ${order.orderNumber}`, dateFormatted.split(' ')[1] || ''));
+    lines.push(this.formatLine(`PEDIDO: ${order.orderNumber}`, dateFormatted.split(' ')[1] || '', cols));
     lines.push(`DATA: ${dateFormatted}`);
 
     // DADOS DO CLIENTE
-    lines.push(`CLIENTE: ${this.sanitizeText(order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao'))}`);
+    lines.push(...this.wrapText(`CLIENTE: ${order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao')}`, cols));
     if (order.customer.phone) {
       lines.push(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
     }
@@ -769,28 +999,19 @@ class ThermalPrinterService {
 
     // ITENS DO PEDIDO
     lines.push(separator);
-    lines.push(this.formatLine('QTD DESCRICAO', 'VALOR'));
+    lines.push(this.formatLine('QTD DESCRICAO', 'VALOR', cols));
     lines.push(separator);
 
     for (const it of order.items) {
       const itemTitle = `${it.quantity}x ${it.name}`;
-      const itemPrice = formatCurrency(it.subtotal);
-      
-      if (itemTitle.length + itemPrice.length + 1 <= 32) {
-        lines.push(this.formatLine(itemTitle, itemPrice));
-      } else {
-        const titleLines = this.wrapText(itemTitle, 22);
-        lines.push(this.formatLine(titleLines[0], itemPrice));
-        for (let i = 1; i < titleLines.length; i++) {
-          lines.push(titleLines[i]);
-        }
-      }
+      const itemPrice = formatReportCurrency(it.subtotal);
+      lines.push(...this.formatOrderItemTitleLines(itemTitle, itemPrice, cols));
 
       // Adicionais
       if (it.addons && it.addons.length > 0) {
         for (const ad of it.addons) {
           const adText = `+ ${ad.name} (R$ ${ad.price.toFixed(2)})`;
-          const wrapped = this.wrapText(adText, 30, '  ');
+          const wrapped = this.wrapText(adText, cols, '  ');
           lines.push(...wrapped);
         }
       }
@@ -798,8 +1019,8 @@ class ThermalPrinterService {
       // Componentes de combo
       if (it.isCombo && it.comboComponents && it.comboComponents.length > 0) {
         for (const comp of it.comboComponents) {
-          const compText = `  > ${comp.quantity * it.quantity}x ${comp.name}`;
-          const wrapped = this.wrapText(compText, 30, '   ');
+          const compText = `> ${comp.quantity * it.quantity}x ${comp.name}`;
+          const wrapped = this.wrapText(compText, cols, '  ');
           lines.push(...wrapped);
         }
       }
@@ -807,7 +1028,7 @@ class ThermalPrinterService {
       // Observações do item
       if (it.notes && it.notes.trim()) {
         const noteText = `Obs: ${it.notes.trim()}`;
-        const wrapped = this.wrapText(noteText, 30, '  * ');
+        const wrapped = this.wrapText(noteText, cols, '  * ');
         lines.push(...wrapped);
       }
     }
@@ -816,20 +1037,20 @@ class ThermalPrinterService {
     if (order.customer.notes && order.customer.notes.trim()) {
       lines.push(separator);
       lines.push('OBSERVACOES GERAIS:');
-      const obsLines = this.wrapText(order.customer.notes.trim(), 32, '  ');
+      const obsLines = this.wrapText(order.customer.notes.trim(), cols, '  ');
       lines.push(...obsLines);
     }
 
     // TOTAIS E PAGAMENTO
     lines.push(separator);
-    lines.push(this.formatLine('SUBTOTAL:', formatCurrency(order.subtotal)));
+    lines.push(this.formatLine('SUBTOTAL:', formatReportCurrency(order.subtotal), cols));
     if (isDelivery && typeof order.deliveryFee === 'number' && order.deliveryFee > 0) {
-      lines.push(this.formatLine('TAXA DE ENTREGA:', formatCurrency(order.deliveryFee)));
+      lines.push(this.formatLine('TAXA DE ENTREGA:', formatReportCurrency(order.deliveryFee), cols));
     }
     if (order.discount && order.discount > 0) {
-      lines.push(this.formatLine('DESCONTO:', `- ${formatCurrency(order.discount)}`));
+      lines.push(this.formatLine('DESCONTO:', `- ${formatReportCurrency(order.discount)}`, cols));
     }
-    lines.push(this.formatLine('TOTAL:', formatCurrency(order.totalAmount)));
+    lines.push(this.formatLine('TOTAL:', formatReportCurrency(order.totalAmount), cols));
     lines.push(separator);
 
     // FORMA DE PAGAMENTO E DETALHAMENTO FINANCEIRO
@@ -843,15 +1064,15 @@ class ThermalPrinterService {
         ? order.changeAmount
         : (received > order.totalAmount ? received - order.totalAmount : 0);
 
-      lines.push(this.formatLine('RECEBIDO:', formatCurrency(received)));
-      lines.push(this.formatLine('TROCO:', formatCurrency(change)));
+      lines.push(this.formatLine('RECEBIDO:', formatReportCurrency(received), cols));
+      lines.push(this.formatLine('TROCO:', formatReportCurrency(change), cols));
     } else if (order.paymentMethod === 'MISTO' && order.paymentSplits && order.paymentSplits.length > 0) {
       lines.push('DETALHAMENTO DO PAGAMENTO:');
       for (const split of order.paymentSplits) {
-        lines.push(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatCurrency(split.amount)));
+        lines.push(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatReportCurrency(split.amount), cols));
         if (split.method === 'DINHEIRO' && split.cashReceived !== undefined) {
-          lines.push(this.formatLine('  RECEBIDO:', formatCurrency(split.cashReceived)));
-          lines.push(this.formatLine('  TROCO:', formatCurrency(split.change || 0)));
+          lines.push(this.formatLine('  RECEBIDO:', formatReportCurrency(split.cashReceived), cols));
+          lines.push(this.formatLine('  TROCO:', formatReportCurrency(split.change || 0), cols));
         }
       }
     }
@@ -862,25 +1083,26 @@ class ThermalPrinterService {
     lines.push(situacao);
 
     lines.push(separator);
-    lines.push(this.centerText('Obrigado pela preferencia!'));
+    lines.push(this.centerText('Obrigado pela preferencia!', cols));
     const footerText = this.getEffectiveFooterText(options?.footerText);
     if (footerText) {
-      lines.push(this.centerText(footerText));
+      lines.push(this.centerText(footerText, cols));
     }
-    lines.push('');
-    lines.push('');
     lines.push('');
 
     return lines.join('\n');
   }
 
   /**
-   * Gera comandos binários ESC/POS para impressoras térmicas de 58 mm
+   * Gera comandos binários ESC/POS para impressoras térmicas (58 mm / 80 mm)
+   * com espaçamento moderado, sem linhas vazias fantasmas e preservando todo o conteúdo.
    */
   public generateReceiptEscPos(order: Order, options?: { isReprint?: boolean; footerText?: string }): Uint8Array {
     const ESC = 0x1b;
     const GS = 0x1d;
     const LF = 0x0a;
+    const cols = this.getSafeOrderColumns();
+    const separator = '-'.repeat(cols);
 
     const buffer: number[] = [];
 
@@ -889,7 +1111,7 @@ class ThermalPrinterService {
     };
 
     const appendText = (text: string) => {
-      const sanitized = this.sanitizeText(text);
+      const sanitized = this.sanitizeText(text.replace(/\u00A0/g, ' '));
       for (let i = 0; i < sanitized.length; i++) {
         buffer.push(sanitized.charCodeAt(i));
       }
@@ -900,9 +1122,10 @@ class ThermalPrinterService {
       append(LF);
     };
 
-    // 1. Inicializar impressora
+    // 1. Inicializar impressora + tabela CP860 + entrelinhamento moderado (ESC 3 24)
     append(ESC, 0x40); // ESC @ (Initialize)
     append(ESC, 0x74, 0x02); // ESC t 2 (CP860 Português)
+    append(ESC, 0x33, 0x18); // ESC 3 24 (entrelinhamento confortável e econômico)
 
     // 2. Cabeçalho Centralizado em Negrito / Altura Dupla
     append(ESC, 0x61, 0x01); // Center align
@@ -917,11 +1140,10 @@ class ThermalPrinterService {
       append(ESC, 0x45, 0x00); // Bold OFF
     }
 
-    append(LF);
-
     const isDelivery = order.fulfillmentType === 'DELIVERY';
 
     // 3. Modalidade Destaque
+    appendLine(separator);
     append(GS, 0x21, 0x01); // Double height
     append(ESC, 0x45, 0x01); // Bold ON
     if (isDelivery) {
@@ -931,7 +1153,7 @@ class ThermalPrinterService {
     }
     append(GS, 0x21, 0x00); // Normal
     append(ESC, 0x45, 0x00); // Bold OFF
-    appendLine('--------------------------------');
+    appendLine(separator);
 
     // 4. Pedido em Fonte Normal com Alinhamento à Esquerda
     append(ESC, 0x61, 0x00); // Left align
@@ -939,14 +1161,16 @@ class ThermalPrinterService {
     appendLine(`PEDIDO: ${order.orderNumber}`);
     append(ESC, 0x45, 0x00); // Bold OFF
     appendLine(`DATA: ${formatDateTime(order.createdAt)}`);
-    appendLine(`CLIENTE: ${this.sanitizeText(order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao'))}`);
+    for (const cl of this.wrapText(`CLIENTE: ${order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao')}`, cols)) {
+      appendLine(cl);
+    }
     if (order.customer.phone) {
       appendLine(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
     }
 
     // Endereço de Entrega (Exclusivo para modalidade DELIVERY - nunca inventar dados)
     if (isDelivery && order.customer.address) {
-      appendLine('--------------------------------');
+      appendLine(separator);
       append(ESC, 0x45, 0x01); // Bold ON
       appendLine('ENDERECO DE ENTREGA:');
       append(ESC, 0x45, 0x00); // Bold OFF
@@ -956,75 +1180,69 @@ class ThermalPrinterService {
       }
     }
 
-    // 5. Itens
-    appendLine('--------------------------------');
-    appendLine(this.formatLine('QTD DESCRICAO', 'VALOR'));
-    appendLine('--------------------------------');
+    // 5. Itens (largura segura de 31/47 colunas evita auto-wrap + LF com linha vazia)
+    appendLine(separator);
+    appendLine(this.formatLine('QTD DESCRICAO', 'VALOR', cols));
+    appendLine(separator);
 
     for (const it of order.items) {
       const itemTitle = `${it.quantity}x ${it.name}`;
-      const itemPrice = formatCurrency(it.subtotal);
+      const itemPrice = formatReportCurrency(it.subtotal);
 
       append(ESC, 0x45, 0x01); // Bold ON
-      if (itemTitle.length + itemPrice.length + 1 <= 32) {
-        appendLine(this.formatLine(itemTitle, itemPrice));
-      } else {
-        const titleLines = this.wrapText(itemTitle, 22);
-        appendLine(this.formatLine(titleLines[0], itemPrice));
-        for (let i = 1; i < titleLines.length; i++) {
-          appendLine(titleLines[i]);
-        }
+      for (const tl of this.formatOrderItemTitleLines(itemTitle, itemPrice, cols)) {
+        appendLine(tl);
       }
       append(ESC, 0x45, 0x00); // Bold OFF
 
       if (it.addons && it.addons.length > 0) {
         for (const ad of it.addons) {
           const adText = `+ ${ad.name} (R$ ${ad.price.toFixed(2)})`;
-          const wrapped = this.wrapText(adText, 30, '  ');
+          const wrapped = this.wrapText(adText, cols, '  ');
           for (const wl of wrapped) appendLine(wl);
         }
       }
 
       if (it.isCombo && it.comboComponents && it.comboComponents.length > 0) {
         for (const comp of it.comboComponents) {
-          const compText = `  > ${comp.quantity * it.quantity}x ${comp.name}`;
-          const wrapped = this.wrapText(compText, 30, '   ');
+          const compText = `> ${comp.quantity * it.quantity}x ${comp.name}`;
+          const wrapped = this.wrapText(compText, cols, '  ');
           for (const wl of wrapped) appendLine(wl);
         }
       }
 
       if (it.notes && it.notes.trim()) {
         const noteText = `Obs: ${it.notes.trim()}`;
-        const wrapped = this.wrapText(noteText, 30, '  * ');
+        const wrapped = this.wrapText(noteText, cols, '  * ');
         for (const wl of wrapped) appendLine(wl);
       }
     }
 
     // 6. Observações do Pedido
     if (order.customer.notes && order.customer.notes.trim()) {
-      appendLine('--------------------------------');
+      appendLine(separator);
       appendLine('OBSERVACOES GERAIS:');
-      const obsLines = this.wrapText(order.customer.notes.trim(), 32, '  ');
+      const obsLines = this.wrapText(order.customer.notes.trim(), cols, '  ');
       for (const ol of obsLines) appendLine(ol);
     }
 
     // 7. Totais e Pagamento
-    appendLine('--------------------------------');
-    appendLine(this.formatLine('SUBTOTAL:', formatCurrency(order.subtotal)));
+    appendLine(separator);
+    appendLine(this.formatLine('SUBTOTAL:', formatReportCurrency(order.subtotal), cols));
     if (isDelivery && typeof order.deliveryFee === 'number' && order.deliveryFee > 0) {
-      appendLine(this.formatLine('TAXA DE ENTREGA:', formatCurrency(order.deliveryFee)));
+      appendLine(this.formatLine('TAXA DE ENTREGA:', formatReportCurrency(order.deliveryFee), cols));
     }
     if (order.discount && order.discount > 0) {
-      appendLine(this.formatLine('DESCONTO:', `- ${formatCurrency(order.discount)}`));
+      appendLine(this.formatLine('DESCONTO:', `- ${formatReportCurrency(order.discount)}`, cols));
     }
 
     append(ESC, 0x45, 0x01); // Bold ON
     append(GS, 0x21, 0x01); // Double height
-    appendLine(this.formatLine('TOTAL:', formatCurrency(order.totalAmount)));
+    appendLine(this.formatLine('TOTAL:', formatReportCurrency(order.totalAmount), cols));
     append(GS, 0x21, 0x00); // Normal
     append(ESC, 0x45, 0x00); // Bold OFF
 
-    appendLine(this.config.paperWidth === '80mm' ? '------------------------------------------------' : '--------------------------------');
+    appendLine(separator);
     appendLine(`FORMA: ${this.sanitizeText(getPaymentMethodLabel(order.paymentMethod))}`);
 
     if (order.paymentMethod === 'DINHEIRO') {
@@ -1035,15 +1253,15 @@ class ThermalPrinterService {
         ? order.changeAmount
         : (received > order.totalAmount ? received - order.totalAmount : 0);
 
-      appendLine(this.formatLine('RECEBIDO:', formatCurrency(received)));
-      appendLine(this.formatLine('TROCO:', formatCurrency(change)));
+      appendLine(this.formatLine('RECEBIDO:', formatReportCurrency(received), cols));
+      appendLine(this.formatLine('TROCO:', formatReportCurrency(change), cols));
     } else if (order.paymentMethod === 'MISTO' && order.paymentSplits && order.paymentSplits.length > 0) {
       appendLine('DETALHAMENTO DO PAGAMENTO:');
       for (const split of order.paymentSplits) {
-        appendLine(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatCurrency(split.amount)));
+        appendLine(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatReportCurrency(split.amount), cols));
         if (split.method === 'DINHEIRO' && split.cashReceived !== undefined) {
-          appendLine(this.formatLine('  RECEBIDO:', formatCurrency(split.cashReceived)));
-          appendLine(this.formatLine('  TROCO:', formatCurrency(split.change || 0)));
+          appendLine(this.formatLine('  RECEBIDO:', formatReportCurrency(split.cashReceived), cols));
+          appendLine(this.formatLine('  TROCO:', formatReportCurrency(split.change || 0), cols));
         }
       }
     }
@@ -1056,7 +1274,7 @@ class ThermalPrinterService {
     append(ESC, 0x45, 0x00); // Bold OFF
 
     // 8. Rodapé
-    appendLine('--------------------------------');
+    appendLine(separator);
     append(ESC, 0x61, 0x01); // Center
     appendLine('Obrigado pela preferencia!');
     const footerText = this.getEffectiveFooterText(options?.footerText);
@@ -1064,10 +1282,12 @@ class ThermalPrinterService {
       appendLine(footerText);
     }
 
-    // 9. Avanço de Papel (Feed 4 linhas) & Corte
-    append(ESC, 0x64, 0x04); // Feed 4 lines
+    // 9. Avanço de Papel moderado (evita feed duplicado quando corte automático está ativo)
     if (this.config.cutPaper) {
+      append(ESC, 0x64, 0x01); // 1 linha antes do corte (GS V A 0 já avança até a lâmina/serrilha)
       append(GS, 0x56, 0x41, 0x00); // Cut paper (GS V A 0)
+    } else {
+      append(ESC, 0x64, 0x02); // 2 linhas para destaque confortável sem corte automático
     }
 
     return new Uint8Array(buffer);
@@ -1242,6 +1462,8 @@ class ThermalPrinterService {
   private printViaSystemSpooler(order: Order, isReprint: boolean): void {
     if (typeof window === 'undefined') return;
 
+    const widthCss = this.config.paperWidth === '80mm' ? '80mm' : '58mm';
+    const fontSizeCss = this.config.paperWidth === '80mm' ? '12px' : '11px';
     const receiptText = this.generateReceiptPlainText(order, { isReprint });
     const printWindow = window.open('', '_blank', 'width=380,height=600');
     if (!printWindow) {
@@ -1254,23 +1476,23 @@ class ThermalPrinterService {
       <!DOCTYPE html>
       <html>
         <head>
-          <title>Comprovante Pedido ${order.orderNumber} - 58mm</title>
+          <title>Comprovante Pedido ${order.orderNumber} - ${widthCss}</title>
           <meta charset="utf-8">
           <style>
             @page {
-              size: 58mm auto;
+              size: ${widthCss} auto;
               margin: 0mm;
             }
             body {
               font-family: 'Courier New', Courier, monospace;
-              font-size: 11px;
-              line-height: 1.25;
+              font-size: ${fontSizeCss};
+              line-height: 1.15;
               color: #000;
               background: #fff;
               margin: 0;
-              padding: 2mm 3mm;
-              width: 58mm;
-              max-width: 58mm;
+              padding: 1.5mm 2.5mm;
+              width: ${widthCss};
+              max-width: ${widthCss};
               box-sizing: border-box;
             }
             pre {
@@ -1703,7 +1925,27 @@ class ThermalPrinterService {
       lines.push(...this.formatCashClosingPair('  Liq PIX:', formatReportCurrency(report.netPixSales), maxLen));
     }
 
-    lines.push(...this.formatCashClosingPair('Vendas Cartoes (bruto):', formatReportCurrency(report.grossCardSales), maxLen));
+    lines.push(...this.formatCashClosingPair('Cartao Credito (bruto):', formatReportCurrency(report.grossCreditCardSales), maxLen));
+    if (report.creditCardRefunds > 0) {
+      lines.push(...this.formatCashClosingPair('  Devol Credito:', `-${formatReportCurrency(report.creditCardRefunds)}`, maxLen));
+      lines.push(...this.formatCashClosingPair('  Liq Credito:', formatReportCurrency(report.netCreditCardSales), maxLen));
+    }
+
+    lines.push(...this.formatCashClosingPair('Cartao Debito (bruto):', formatReportCurrency(report.grossDebitCardSales), maxLen));
+    if (report.debitCardRefunds > 0) {
+      lines.push(...this.formatCashClosingPair('  Devol Debito:', `-${formatReportCurrency(report.debitCardRefunds)}`, maxLen));
+      lines.push(...this.formatCashClosingPair('  Liq Debito:', formatReportCurrency(report.netDebitCardSales), maxLen));
+    }
+
+    if (report.grossOtherCardOrMixedSales > 0 || report.otherCardOrMixedRefunds > 0) {
+      lines.push(...this.formatCashClosingPair('Outros/Misto (bruto):', formatReportCurrency(report.grossOtherCardOrMixedSales), maxLen));
+      if (report.otherCardOrMixedRefunds > 0) {
+        lines.push(...this.formatCashClosingPair('  Devol Outros/Misto:', `-${formatReportCurrency(report.otherCardOrMixedRefunds)}`, maxLen));
+        lines.push(...this.formatCashClosingPair('  Liq Outros/Misto:', formatReportCurrency(report.netOtherCardOrMixedSales), maxLen));
+      }
+    }
+
+    lines.push(...this.formatCashClosingPair('Total Cartoes (bruto):', formatReportCurrency(report.grossCardSales), maxLen));
     if (report.cardRefunds > 0) {
       lines.push(...this.formatCashClosingPair('  Devol Cartoes:', `-${formatReportCurrency(report.cardRefunds)}`, maxLen));
       lines.push(...this.formatCashClosingPair('  Liq Cartoes:', formatReportCurrency(report.netCardSales), maxLen));

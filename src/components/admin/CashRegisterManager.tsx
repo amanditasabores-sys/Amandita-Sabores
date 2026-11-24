@@ -614,8 +614,13 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Vendas Cartão</span>
             <p className="text-base font-black text-indigo-700 mt-1">{formatCurrency(metrics.netCardSales)}</p>
             <span className="text-[10px] text-indigo-600 block">
-              {metrics.cardRefunds > 0 ? `Líq (Devol: -${formatCurrency(metrics.cardRefunds)})` : 'POS / Máquina'}
+              Créd: {formatCurrency(metrics.netCreditCardSales)} · Déb: {formatCurrency(metrics.netDebitCardSales)}
             </span>
+            {metrics.cardRefunds > 0 && (
+              <span className="text-[10px] text-rose-600 block">
+                Devol: -{formatCurrency(metrics.cardRefunds)}
+              </span>
+            )}
           </div>
 
           <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-xs">
@@ -1033,8 +1038,31 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Vendas Cartões:</span>
+                  <span>Vendas Cartão de Crédito:</span>
                   <span className="font-semibold text-indigo-700">
+                    Bruto: {formatCurrency(metrics.grossCreditCardSales)}
+                    {metrics.creditCardRefunds > 0 ? ` | Devol: -${formatCurrency(metrics.creditCardRefunds)} | Líq: ${formatCurrency(metrics.netCreditCardSales)}` : ''}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Vendas Cartão de Débito:</span>
+                  <span className="font-semibold text-indigo-700">
+                    Bruto: {formatCurrency(metrics.grossDebitCardSales)}
+                    {metrics.debitCardRefunds > 0 ? ` | Devol: -${formatCurrency(metrics.debitCardRefunds)} | Líq: ${formatCurrency(metrics.netDebitCardSales)}` : ''}
+                  </span>
+                </div>
+                {(metrics.grossOtherCardOrMixedSales > 0 || metrics.otherCardOrMixedRefunds > 0) && (
+                  <div className="flex justify-between">
+                    <span>Outros / Pagamento Misto (não separado):</span>
+                    <span className="font-semibold text-slate-700">
+                      Bruto: {formatCurrency(metrics.grossOtherCardOrMixedSales)}
+                      {metrics.otherCardOrMixedRefunds > 0 ? ` | Devol: -${formatCurrency(metrics.otherCardOrMixedRefunds)} | Líq: ${formatCurrency(metrics.netOtherCardOrMixedSales)}` : ''}
+                    </span>
+                  </div>
+                )}
+                <div className="flex justify-between">
+                  <span className="font-semibold text-slate-700">Total Cartões:</span>
+                  <span className="font-semibold text-indigo-800">
                     Bruto: {formatCurrency(metrics.grossCardSales)}
                     {metrics.cardRefunds > 0 ? ` | Devol: -${formatCurrency(metrics.cardRefunds)} | Líq: ${formatCurrency(metrics.netCardSales)}` : ''}
                   </span>
@@ -1364,31 +1392,52 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               </div>
 
               {(() => {
-                let grossCash = 0, refCash = 0, grossPix = 0, refPix = 0, grossCard = 0, refCard = 0;
-                selectedHistoryShift.movements.forEach(m => {
-                  if (m.type === 'VENDA') {
-                    if (m.paymentMethod === 'DINHEIRO') grossCash += m.amount;
-                    else if (m.paymentMethod === 'PIX') grossPix += m.amount;
-                    else grossCard += m.amount;
-                  } else if (m.type === 'ESTORNO') {
-                    if (m.paymentMethod === 'DINHEIRO') refCash += m.amount;
-                    else if (m.paymentMethod === 'PIX') refPix += m.amount;
-                    else refCard += m.amount;
-                  }
-                });
+                const histMetrics = calculateCashShiftMetrics(selectedHistoryShift);
                 return (
                   <div className="p-3 bg-slate-50 rounded-xl space-y-1 border border-slate-200">
-                    <div className="flex justify-between">
+                    <div className="flex justify-between gap-2">
                       <span className="text-slate-600">Vendas Dinheiro:</span>
-                      <span className="font-mono">Bruto: {formatCurrency(grossCash)} {refCash > 0 ? `| Estornos: -${formatCurrency(refCash)} | Líq: ${formatCurrency(grossCash - refCash)}` : ''}</span>
+                      <span className="font-mono text-right">
+                        Bruto: {formatCurrency(histMetrics.grossCashSales)}
+                        {histMetrics.cashRefunds > 0 ? ` | Estornos: -${formatCurrency(histMetrics.cashRefunds)} | Líq: ${formatCurrency(histMetrics.netCashSales)}` : ''}
+                      </span>
                     </div>
-                    <div className="flex justify-between">
+                    <div className="flex justify-between gap-2">
                       <span className="text-slate-600">Vendas PIX:</span>
-                      <span className="font-mono">Bruto: {formatCurrency(grossPix)} {refPix > 0 ? `| Estornos: -${formatCurrency(refPix)} | Líq: ${formatCurrency(grossPix - refPix)}` : ''}</span>
+                      <span className="font-mono text-right">
+                        Bruto: {formatCurrency(histMetrics.grossPixSales)}
+                        {histMetrics.pixRefunds > 0 ? ` | Estornos: -${formatCurrency(histMetrics.pixRefunds)} | Líq: ${formatCurrency(histMetrics.netPixSales)}` : ''}
+                      </span>
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-600">Vendas Cartão:</span>
-                      <span className="font-mono">Bruto: {formatCurrency(grossCard)} {refCard > 0 ? `| Estornos: -${formatCurrency(refCard)} | Líq: ${formatCurrency(grossCard - refCard)}` : ''}</span>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-600">Vendas Cartão de Crédito:</span>
+                      <span className="font-mono text-right text-indigo-700">
+                        Bruto: {formatCurrency(histMetrics.grossCreditCardSales)}
+                        {histMetrics.creditCardRefunds > 0 ? ` | Estornos: -${formatCurrency(histMetrics.creditCardRefunds)} | Líq: ${formatCurrency(histMetrics.netCreditCardSales)}` : ''}
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-600">Vendas Cartão de Débito:</span>
+                      <span className="font-mono text-right text-indigo-700">
+                        Bruto: {formatCurrency(histMetrics.grossDebitCardSales)}
+                        {histMetrics.debitCardRefunds > 0 ? ` | Estornos: -${formatCurrency(histMetrics.debitCardRefunds)} | Líq: ${formatCurrency(histMetrics.netDebitCardSales)}` : ''}
+                      </span>
+                    </div>
+                    {(histMetrics.grossOtherCardOrMixedSales > 0 || histMetrics.otherCardOrMixedRefunds > 0) && (
+                      <div className="flex justify-between gap-2">
+                        <span className="text-slate-600">Outros / Pagamento Misto:</span>
+                        <span className="font-mono text-right">
+                          Bruto: {formatCurrency(histMetrics.grossOtherCardOrMixedSales)}
+                          {histMetrics.otherCardOrMixedRefunds > 0 ? ` | Estornos: -${formatCurrency(histMetrics.otherCardOrMixedRefunds)} | Líq: ${formatCurrency(histMetrics.netOtherCardOrMixedSales)}` : ''}
+                        </span>
+                      </div>
+                    )}
+                    <div className="flex justify-between gap-2 pt-1 border-t border-slate-200 font-semibold">
+                      <span className="text-slate-700">Total Cartões:</span>
+                      <span className="font-mono text-right text-indigo-800">
+                        Bruto: {formatCurrency(histMetrics.grossCardSales)}
+                        {histMetrics.cardRefunds > 0 ? ` | Estornos: -${formatCurrency(histMetrics.cardRefunds)} | Líq: ${formatCurrency(histMetrics.netCardSales)}` : ''}
+                      </span>
                     </div>
                   </div>
                 );

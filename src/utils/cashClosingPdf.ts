@@ -614,14 +614,51 @@ export function generateCashClosingPdfBytes(report: CashClosingReportData): Uint
     valueColor: COLOR_BLUE,
   });
 
+  const creditCardValueText =
+    report.creditCardRefunds > 0
+      ? `Bruto: ${formatReportCurrency(report.grossCreditCardSales)} | Devol: -${formatReportCurrency(report.creditCardRefunds)} | Líq: ${formatReportCurrency(report.netCreditCardSales)}`
+      : `Bruto: ${formatReportCurrency(report.grossCreditCardSales)}`;
+
+  doc.drawKeyValueRow('Vendas Cartão de Crédito:', creditCardValueText, {
+    fontSize: 9.5,
+    boldValue: true,
+    valueColor: COLOR_INDIGO,
+  });
+
+  const debitCardValueText =
+    report.debitCardRefunds > 0
+      ? `Bruto: ${formatReportCurrency(report.grossDebitCardSales)} | Devol: -${formatReportCurrency(report.debitCardRefunds)} | Líq: ${formatReportCurrency(report.netDebitCardSales)}`
+      : `Bruto: ${formatReportCurrency(report.grossDebitCardSales)}`;
+
+  doc.drawKeyValueRow('Vendas Cartão de Débito:', debitCardValueText, {
+    fontSize: 9.5,
+    boldValue: true,
+    valueColor: COLOR_INDIGO,
+  });
+
+  if (report.grossOtherCardOrMixedSales > 0 || report.otherCardOrMixedRefunds > 0) {
+    const otherValueText =
+      report.otherCardOrMixedRefunds > 0
+        ? `Bruto: ${formatReportCurrency(report.grossOtherCardOrMixedSales)} | Devol: -${formatReportCurrency(report.otherCardOrMixedRefunds)} | Líq: ${formatReportCurrency(report.netOtherCardOrMixedSales)}`
+        : `Bruto: ${formatReportCurrency(report.grossOtherCardOrMixedSales)}`;
+
+    doc.drawKeyValueRow('Outros / Pagamento Misto (não separado):', otherValueText, {
+      fontSize: 9,
+      boldValue: true,
+      valueColor: COLOR_SLATE_700,
+    });
+  }
+
   const cardValueText =
     report.cardRefunds > 0
       ? `Bruto: ${formatReportCurrency(report.grossCardSales)} | Devol: -${formatReportCurrency(report.cardRefunds)} | Líq: ${formatReportCurrency(report.netCardSales)}`
       : `Bruto: ${formatReportCurrency(report.grossCardSales)}`;
 
-  doc.drawKeyValueRow('Vendas Cartões:', cardValueText, {
+  doc.drawKeyValueRow('Total Cartões:', cardValueText, {
     fontSize: 9.5,
+    boldLabel: true,
     boldValue: true,
+    labelColor: COLOR_SLATE_900,
     valueColor: COLOR_INDIGO,
   });
 
