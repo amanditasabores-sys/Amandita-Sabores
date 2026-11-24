@@ -21,9 +21,18 @@ import {
   X,
   FileText,
   UserCheck,
-  Pencil
+  Pencil,
+  Share2
 } from 'lucide-react';
 import { ConfirmModal } from '../common/ConfirmModal';
+import { thermalPrinterService } from '../../services/thermalPrinter';
+import {
+  calculateCashShiftMetrics,
+  parseCountedCashInput,
+  buildOpenShiftClosingReport,
+  buildClosedShiftClosingReport,
+} from '../../utils/cashClosingReport';
+import { shareOrDownloadCashClosingPdf } from '../../utils/cashClosingPdf';
 
 interface CashRegisterManagerProps {
   onStateChanged: () => void;
@@ -73,6 +82,18 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
   const pendingShiftIdRef = useRef<string | null>(null);
   const pendingMovementIdRef = useRef<string | null>(null);
 
+  // Read-only output actions (Thermal Print & Share PDF)
+  const [isPrintingClosing, setIsPrintingClosing] = useState(false);
+  const [isSharingPdf, setIsSharingPdf] = useState(false);
+  const [closeModalOutputFeedback, setCloseModalOutputFeedback] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const [historyModalOutputFeedback, setHistoryModalOutputFeedback] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+
   const reloadData = () => {
     setCurrentShift(store.getCurrentCashShift());
     setCashSyncState(store.getCashShiftSyncState());
@@ -86,100 +107,146 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
     return () => window.removeEventListener('gestaofood_state_changed', handleSync);
   }, []);
 
-  // Financial calculations for open shift
-  const metrics = useMemo(() => {
-    if (!currentShift) {
-      return {
-        initialBalance: 0,
-        cashSales: 0,
-        grossCashSales: 0,
-        cashRefunds: 0,
-        netCashSales: 0,
-        pixSales: 0,
-        grossPixSales: 0,
-        pixRefunds: 0,
-        netPixSales: 0,
-        cardSales: 0,
-        grossCardSales: 0,
-        cardRefunds: 0,
-        netCardSales: 0,
-        totalSangrias: 0,
-        totalSuprimentos: 0,
-        totalVales: 0,
-        totalAjustes: 0,
-        totalGrossRevenue: 0,
-        totalRefunds: 0,
-        totalNetRevenue: 0,
-        expectedCashInDrawer: 0,
-        totalRevenue: 0,
-      };
+  // Financial calculations for open shift (mesma fórmula centralizada em cashClosingReport.ts)
+  const metrics = useMemo(() => calculateCashShiftMetrics(currentShift), [currentShift]);
+
+  // Read-only: Imprimir conferência pré-fechamento (Turno Aberto)
+  const handlePrintOpenClosing = async () => {
+    if (!currentShift || isSubmittingShiftOp || isPrintingClosing) return;
+    setCloseModalOutputFeedback(null);
+
+    const parsed = parseCountedCashInput(countedCashInput);
+    if (!parsed.valid) {
+      setCloseModalOutputFeedback({
+        type: 'error',
+        message: parsed.error || 'Informe o valor em dinheiro contado na gaveta.',
+      });
+      return;
     }
 
-    let grossCashSales = 0;
-    let cashRefunds = 0;
-    let grossPixSales = 0;
-    let pixRefunds = 0;
-    let grossCardSales = 0;
-    let cardRefunds = 0;
-    let totalSangrias = 0;
-    let totalSuprimentos = 0;
-    let totalVales = 0;
-    let totalAjustes = 0;
+    const operator =
+      store.getCurrentUser()?.name ||
+      store.getCurrentUser()?.username ||
+      openedByInput.trim() ||
+      'admin';
 
-    currentShift.movements.forEach((m) => {
-      if (m.type === 'VENDA') {
-        if (m.paymentMethod === 'DINHEIRO') grossCashSales += m.amount;
-        else if (m.paymentMethod === 'PIX') grossPixSales += m.amount;
-        else grossCardSales += m.amount;
-      } else if (m.type === 'ESTORNO') {
-        if (m.paymentMethod === 'DINHEIRO') cashRefunds += m.amount;
-        else if (m.paymentMethod === 'PIX') pixRefunds += m.amount;
-        else cardRefunds += m.amount;
-      } else if (m.type === 'SANGRIA') {
-        totalSangrias += m.amount;
-      } else if (m.type === 'SUPRIMENTO') {
-        totalSuprimentos += m.amount;
-      } else if (m.type === 'VALE') {
-        totalVales += m.amount;
-      } else if (m.type === 'AJUSTE') {
-        totalAjustes += m.amount;
-      }
+    const report = buildOpenShiftClosingReport(currentShift, {
+      countedCash: parsed.value,
+      closingNotes: closingNotesInput,
+      operatorName: operator,
     });
 
-    const netCashSales = grossCashSales - cashRefunds;
-    const netPixSales = grossPixSales - pixRefunds;
-    const netCardSales = grossCardSales - cardRefunds;
-    const totalGrossRevenue = grossCashSales + grossPixSales + grossCardSales;
-    const totalRefunds = cashRefunds + pixRefunds + cardRefunds;
-    const totalNetRevenue = totalGrossRevenue - totalRefunds;
+    setIsPrintingClosing(true);
+    try {
+      const res = await thermalPrinterService.printCashClosingReceipt(report);
+      setCloseModalOutputFeedback({
+        type: res.success ? 'success' : 'error',
+        message: res.message,
+      });
+    } catch (err: any) {
+      setCloseModalOutputFeedback({
+        type: 'error',
+        message: `Não foi possível imprimir: ${err?.message || String(err)}`,
+      });
+    } finally {
+      setIsPrintingClosing(false);
+    }
+  };
 
-    const expectedCashInDrawer = currentShift.initialBalance + grossCashSales - cashRefunds + totalSuprimentos - totalSangrias - totalVales + totalAjustes;
+  // Read-only: Compartilhar / Baixar PDF da conferência pré-fechamento (Turno Aberto)
+  const handleShareOpenClosingPdf = async () => {
+    if (!currentShift || isSubmittingShiftOp || isSharingPdf) return;
+    setCloseModalOutputFeedback(null);
 
-    return {
-      initialBalance: currentShift.initialBalance,
-      cashSales: grossCashSales,
-      grossCashSales,
-      cashRefunds,
-      netCashSales,
-      pixSales: grossPixSales,
-      grossPixSales,
-      pixRefunds,
-      netPixSales,
-      cardSales: grossCardSales,
-      grossCardSales,
-      cardRefunds,
-      netCardSales,
-      totalSangrias,
-      totalSuprimentos,
-      totalVales,
-      totalAjustes,
-      totalGrossRevenue,
-      totalRefunds,
-      totalNetRevenue,
-      expectedCashInDrawer,
-      totalRevenue: totalNetRevenue,
-    };
-  }, [currentShift]);
+    const parsed = parseCountedCashInput(countedCashInput);
+    if (!parsed.valid) {
+      setCloseModalOutputFeedback({
+        type: 'error',
+        message: parsed.error || 'Informe o valor em dinheiro contado na gaveta.',
+      });
+      return;
+    }
+
+    const operator =
+      store.getCurrentUser()?.name ||
+      store.getCurrentUser()?.username ||
+      openedByInput.trim() ||
+      'admin';
+
+    const report = buildOpenShiftClosingReport(currentShift, {
+      countedCash: parsed.value,
+      closingNotes: closingNotesInput,
+      operatorName: operator,
+    });
+
+    setIsSharingPdf(true);
+    try {
+      const res = await shareOrDownloadCashClosingPdf(report);
+      if (!res.cancelled && res.message) {
+        setCloseModalOutputFeedback({
+          type: res.success ? 'success' : 'error',
+          message: res.message,
+        });
+      }
+    } catch (err: any) {
+      setCloseModalOutputFeedback({
+        type: 'error',
+        message: `Não foi possível gerar o PDF: ${err?.message || String(err)}`,
+      });
+    } finally {
+      setIsSharingPdf(false);
+    }
+  };
+
+  // Read-only: Imprimir espelho de fechamento oficial (Turno Fechado / Histórico)
+  const handlePrintHistoryClosing = async () => {
+    if (!selectedHistoryShift || isPrintingClosing) return;
+    setHistoryModalOutputFeedback(null);
+
+    const report = buildClosedShiftClosingReport(selectedHistoryShift);
+
+    setIsPrintingClosing(true);
+    try {
+      const res = await thermalPrinterService.printCashClosingReceipt(report);
+      setHistoryModalOutputFeedback({
+        type: res.success ? 'success' : 'error',
+        message: res.message,
+      });
+    } catch (err: any) {
+      setHistoryModalOutputFeedback({
+        type: 'error',
+        message: `Não foi possível imprimir o espelho: ${err?.message || String(err)}`,
+      });
+    } finally {
+      setIsPrintingClosing(false);
+    }
+  };
+
+  // Read-only: Compartilhar / Baixar PDF do espelho de fechamento oficial (Turno Fechado / Histórico)
+  const handleShareHistoryClosingPdf = async () => {
+    if (!selectedHistoryShift || isSharingPdf) return;
+    setHistoryModalOutputFeedback(null);
+
+    const report = buildClosedShiftClosingReport(selectedHistoryShift);
+
+    setIsSharingPdf(true);
+    try {
+      const res = await shareOrDownloadCashClosingPdf(report);
+      if (!res.cancelled && res.message) {
+        setHistoryModalOutputFeedback({
+          type: res.success ? 'success' : 'error',
+          message: res.message,
+        });
+      }
+    } catch (err: any) {
+      setHistoryModalOutputFeedback({
+        type: 'error',
+        message: `Não foi possível gerar o PDF do espelho: ${err?.message || String(err)}`,
+      });
+    } finally {
+      setIsSharingPdf(false);
+    }
+  };
 
   // Adjust Drawer Balance handler (awaits server confirmation)
   const handleSaveAdjustDrawer = async (e: React.FormEvent) => {
@@ -286,10 +353,12 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
       }
 
       setIsCloseModalActive(false);
+      setCloseModalOutputFeedback(null);
       setCountedCashInput('');
       setClosingNotesInput('');
       reloadData();
       if (res.shift) {
+        setHistoryModalOutputFeedback(null);
         setSelectedHistoryShift(res.shift);
       }
     } finally {
@@ -468,6 +537,7 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               <button
                 onClick={() => {
                   setShiftActionError(null);
+                  setCloseModalOutputFeedback(null);
                   setCountedCashInput(metrics.expectedCashInDrawer.toFixed(2));
                   setIsCloseModalActive(true);
                 }}
@@ -795,7 +865,8 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                       </td>
                       <td className="py-3 px-2 text-center">
                         <button
-                          onClick={() => setSelectedHistoryShift(h)}
+                          type="button"
+                          onClick={() => { setHistoryModalOutputFeedback(null); setSelectedHistoryShift(h); }}
                           className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-semibold transition"
                         >
                           Ver Espelho
@@ -900,8 +971,9 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <h3 className="text-base font-bold text-slate-900">Fechamento e Apuração de Caixa</h3>
               </div>
               <button
+                type="button"
                 disabled={isSubmittingShiftOp}
-                onClick={() => { setShiftActionError(null); setIsCloseModalActive(false); }}
+                onClick={() => { setShiftActionError(null); setCloseModalOutputFeedback(null); setIsCloseModalActive(false); }}
                 className="text-slate-400 hover:text-slate-800 p-1 disabled:opacity-50"
               >
                 <X className="w-5 h-5" />
@@ -1026,11 +1098,58 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 </div>
               )}
 
+              {closeModalOutputFeedback && (
+                <div
+                  className={`p-2.5 rounded-xl text-xs flex items-center justify-between gap-2 border ${
+                    closeModalOutputFeedback.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                      : 'bg-amber-50 border-amber-200 text-amber-900'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    {closeModalOutputFeedback.type === 'success' ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                    )}
+                    <span>{closeModalOutputFeedback.message}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setCloseModalOutputFeedback(null)}
+                    className="text-slate-400 hover:text-slate-700 px-1 font-bold"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  disabled={isSubmittingShiftOp || isPrintingClosing}
+                  onClick={handlePrintOpenClosing}
+                  className="flex-1 min-w-[130px] px-3 py-2 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <Printer className="w-3.5 h-3.5 text-slate-700" />
+                  <span>{isPrintingClosing ? 'Imprimindo...' : 'Imprimir'}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isSubmittingShiftOp || isSharingPdf}
+                  onClick={handleShareOpenClosingPdf}
+                  className="flex-1 min-w-[140px] px-3 py-2 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <Share2 className="w-3.5 h-3.5 text-slate-700" />
+                  <span>{isSharingPdf ? 'Gerando PDF...' : 'Compartilhar PDF'}</span>
+                </button>
+              </div>
+
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
                 <button
                   type="button"
                   disabled={isSubmittingShiftOp}
-                  onClick={() => { setShiftActionError(null); setIsCloseModalActive(false); }}
+                  onClick={() => { setShiftActionError(null); setCloseModalOutputFeedback(null); setIsCloseModalActive(false); }}
                   className="px-4 py-2 bg-slate-100 text-slate-700 rounded-xl font-semibold disabled:opacity-50"
                 >
                   Cancelar
@@ -1218,7 +1337,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
                 <FileText className="w-5 h-5 text-slate-700" />
                 <h3 className="text-base font-bold text-slate-900">Espelho de Caixa Fechado</h3>
               </div>
-              <button onClick={() => setSelectedHistoryShift(null)} className="text-slate-400 hover:text-slate-800 p-1">
+              <button
+                type="button"
+                onClick={() => { setHistoryModalOutputFeedback(null); setSelectedHistoryShift(null); }}
+                className="text-slate-400 hover:text-slate-800 p-1"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -1314,10 +1437,57 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               </div>
             </div>
 
-            <div className="flex justify-end pt-3 border-t border-slate-100">
+            {historyModalOutputFeedback && (
+              <div
+                className={`p-2.5 rounded-xl text-xs flex items-center justify-between gap-2 border ${
+                  historyModalOutputFeedback.type === 'success'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    : 'bg-amber-50 border-amber-200 text-amber-900'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {historyModalOutputFeedback.type === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                  )}
+                  <span>{historyModalOutputFeedback.message}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setHistoryModalOutputFeedback(null)}
+                  className="text-slate-400 hover:text-slate-700 px-1 font-bold"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isPrintingClosing}
+                  onClick={handlePrintHistoryClosing}
+                  className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl font-semibold text-xs flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <Printer className="w-3.5 h-3.5 text-slate-700" />
+                  <span>{isPrintingClosing ? 'Imprimindo...' : 'Imprimir'}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isSharingPdf}
+                  onClick={handleShareHistoryClosingPdf}
+                  className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl font-semibold text-xs flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <Share2 className="w-3.5 h-3.5 text-slate-700" />
+                  <span>{isSharingPdf ? 'Gerando PDF...' : 'Compartilhar PDF'}</span>
+                </button>
+              </div>
               <button
-                onClick={() => setSelectedHistoryShift(null)}
-                className="px-4 py-2 bg-slate-900 text-white rounded-xl font-semibold text-xs"
+                type="button"
+                onClick={() => { setHistoryModalOutputFeedback(null); setSelectedHistoryShift(null); }}
+                className="px-4 py-2 bg-slate-900 text-white rounded-xl font-semibold text-xs cursor-pointer"
               >
                 Fechar
               </button>

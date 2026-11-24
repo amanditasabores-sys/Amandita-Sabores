@@ -716,7 +716,7 @@ export const INITIAL_COMBOS: Combo[] = [
     category: 'Combos',
     items: [
       { menuItemId: 'cuscuz-ovos', name: 'Cuscuz com ovos', quantity: 1, originalPrice: 8.00 },
-      { menuItemId: 'bebida-cafe-leite', name: 'Café com leite — 200 ml', quantity: 1, originalPrice: 5.00 },
+      { menuItemId: 'bebida-cafe-com-leite', name: 'Café com leite — 200 ml', quantity: 1, originalPrice: 5.00 },
     ],
     originalPrice: 13.00,
     comboPrice: 10.90,
@@ -752,7 +752,7 @@ export const INITIAL_COMBOS: Combo[] = [
     category: 'Combos',
     items: [
       { menuItemId: 'cuscuz-gostosinho', name: 'Gostosinho (Carne moída, queijo, ovo e verdura)', quantity: 2, originalPrice: 15.00 },
-      { menuItemId: 'bebida-refrigerante-lata', name: 'Refrigerante lata — 350 ml', quantity: 2, originalPrice: 5.00 },
+      { menuItemId: 'refrigerante-lata-350ml', name: 'Refrigerante lata — 350 ml', quantity: 2, originalPrice: 5.00 },
     ],
     originalPrice: 40.00,
     comboPrice: 32.90,

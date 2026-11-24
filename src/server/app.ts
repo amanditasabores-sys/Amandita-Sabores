@@ -2310,7 +2310,42 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       }
     }
 
-    // Mathematical item and official catalog price invariant verification
+    // Mathematical item, official catalog price, and live combo availability invariant verification
+    const menuDocCache = new Map<string, Record<string, any> | null>();
+    const fetchLiveMenuItemDoc = async (docId: string): Promise<Record<string, any> | null> => {
+      const normalizedId = typeof docId === 'string' ? docId.trim() : '';
+      if (!normalizedId || !/^[a-zA-Z0-9_\-]{1,128}$/.test(normalizedId)) return null;
+      if (menuDocCache.has(normalizedId)) {
+        return menuDocCache.get(normalizedId) ?? null;
+      }
+
+      let found: Record<string, any> | null = null;
+      if (adminDb) {
+        try {
+          const liveDoc = await adminDb.collection('menu_items').doc(normalizedId).get();
+          if (liveDoc.exists) {
+            found = (liveDoc.data() as Record<string, any>) || null;
+          }
+        } catch {}
+      } else if (PROJECT_ID && API_KEY) {
+        try {
+          const restRes = await fetch(
+            `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/menu_items/${encodeURIComponent(normalizedId)}?key=${API_KEY}`
+          );
+          if (restRes.ok) {
+            const rawDoc = await restRes.json();
+            const parsedDoc = firestoreDocumentToJson(rawDoc);
+            if (parsedDoc && typeof parsedDoc === 'object') {
+              found = parsedDoc;
+            }
+          }
+        } catch {}
+      }
+
+      menuDocCache.set(normalizedId, found);
+      return found;
+    };
+
     let calculatedSubtotal = 0;
     for (const item of order.items) {
       if (
@@ -2333,27 +2368,61 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
         };
       }
 
-      let officialPrice: number | null = null;
-      if (adminDb) {
-        try {
-          const liveDoc = await adminDb.collection('menu_items').doc(item.menuItemId).get();
-          if (liveDoc.exists && typeof liveDoc.data()?.price === 'number') {
-            officialPrice = liveDoc.data()?.price;
+      const liveDoc = await fetchLiveMenuItemDoc(item.menuItemId);
+
+      // Public menu orders must respect live availability of items, combos, and combo components
+      if (!isStaffRequester && liveDoc) {
+        if (liveDoc.available === false || liveDoc.comboActive === false) {
+          return {
+            ok: false,
+            status: 400,
+            message: `O item '${item.name}' está temporariamente indisponível no cardápio.`,
+          };
+        }
+
+        if (liveDoc.isCombo === true) {
+          const comboItems = Array.isArray(liveDoc.comboItems) ? liveDoc.comboItems : [];
+          if (comboItems.length === 0) {
+            return {
+              ok: false,
+              status: 400,
+              message: `O combo '${item.name}' está em atualização e não pode ser pedido no momento.`,
+            };
           }
-        } catch {}
-      } else if (PROJECT_ID && API_KEY) {
-        try {
-          const restRes = await fetch(
-            `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/menu_items/${encodeURIComponent(item.menuItemId)}?key=${API_KEY}`
-          );
-          if (restRes.ok) {
-            const rawDoc = await restRes.json();
-            const parsedDoc = firestoreDocumentToJson(rawDoc);
-            if (parsedDoc && typeof parsedDoc.price === 'number') {
-              officialPrice = parsedDoc.price;
+
+          for (const comp of comboItems) {
+            const compId = typeof comp?.menuItemId === 'string' ? comp.menuItemId.trim() : '';
+            if (!compId) {
+              return {
+                ok: false,
+                status: 400,
+                message: `O combo '${item.name}' possui composição inválida e está temporariamente indisponível.`,
+              };
+            }
+
+            const compDoc = await fetchLiveMenuItemDoc(compId);
+            if (!compDoc) {
+              return {
+                ok: false,
+                status: 400,
+                message: `O combo '${item.name}' está em atualização pois um dos produtos inclusos (${comp?.name || compId}) não está no catálogo.`,
+              };
+            }
+
+            if (compDoc.available === false) {
+              return {
+                ok: false,
+                status: 400,
+                message: `O combo '${item.name}' possui um produto temporariamente indisponível (${compDoc.name || comp?.name || compId}).`,
+              };
             }
           }
-        } catch {}
+        }
+      }
+
+      let officialPrice: number | null = null;
+      if (liveDoc && typeof liveDoc.price === 'number') {
+        officialPrice = liveDoc.price;
       }
       const catalogItem = catalogMap.get(item.menuItemId) || catalogMap.get(item.id);
       if (officialPrice === null && catalogItem) {

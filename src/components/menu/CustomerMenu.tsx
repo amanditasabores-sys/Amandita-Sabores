@@ -5,6 +5,7 @@ import { formatCurrency, generateWhatsAppOrderMessage, formatCustomerAddress } f
 import { getPublicAppUrl } from '../../utils/url';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
 import { generatePurchasePixPayload, inferPixKeyType } from '../../utils/pix';
+import { getPublicComboUnavailableMessage, isComboMenuItem } from '../../utils/comboAvailability';
 import { 
   Search, 
   ShoppingBag, 
@@ -270,7 +271,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     }
 
     menuItems.forEach((item) => {
-      if (publishedItemSet.has(item.id) && item.category && item.category !== 'Combos') {
+      if (publishedItemSet.has(item.id) && item.category && !isComboMenuItem(item)) {
         set.add(item.category);
       }
     });
@@ -330,7 +331,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
 
     let list = menuItems.filter((item) => {
       // Exclude items categorized as combos (handled in filteredCombos)
-      if (item.category === 'Combos') return false;
+      if (isComboMenuItem(item)) return false;
 
       // Only available items
       if (item.available === false) return false;
@@ -383,7 +384,12 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
 
   const handleAddComboToCart = (combo: Combo) => {
     if (!combo.available) {
-      alert('Este combo possui componentes temporariamente indisponíveis no estoque.');
+      const info = getPublicComboUnavailableMessage(combo);
+      setCartToast({
+        message: `${combo.name}: ${info.badge}`,
+        submessage: info.detail,
+      });
+      setTimeout(() => setCartToast(null), 4000);
       return;
     }
 
@@ -1042,14 +1048,15 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 sm:gap-4">
               {filteredCombos.map((combo) => {
-                const isOutOfStock = !combo.available;
+                const isUnavailable = !combo.available;
+                const unavailableInfo = isUnavailable ? getPublicComboUnavailableMessage(combo) : null;
 
                 return (
                   <div
                     key={combo.id}
                     className={`bg-[#FFFDF9] rounded-3xl border transition-all p-3.5 sm:p-4 flex flex-col justify-between shadow-xs ${
-                      isOutOfStock
-                        ? 'border-slate-200 opacity-60'
+                      isUnavailable
+                        ? 'border-slate-200 opacity-65'
                         : 'border-[#E8DFD5] hover:border-[#C86D3B]/50 hover:shadow-md'
                     }`}
                   >
@@ -1081,10 +1088,10 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                           )}
                         </div>
 
-                        {isOutOfStock && (
-                          <div className="absolute inset-0 bg-black/40 backdrop-blur-2xs flex items-center justify-center">
+                        {isUnavailable && unavailableInfo && (
+                          <div className="absolute inset-0 bg-black/40 backdrop-blur-2xs flex items-center justify-center px-3 text-center">
                             <span className="px-3 py-1 bg-rose-600 text-white font-bold rounded-xl text-xs shadow-md">
-                              Componente Esgotado
+                              {unavailableInfo.badge}
                             </span>
                           </div>
                         )}
@@ -1114,6 +1121,12 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                           ))}
                         </div>
                       </div>
+
+                      {isUnavailable && unavailableInfo && (
+                        <p className="mt-2 text-[11px] text-rose-700 font-medium leading-snug">
+                          {unavailableInfo.detail}
+                        </p>
+                      )}
                     </div>
 
                     {/* Price & Add to Cart */}
@@ -1131,10 +1144,10 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
 
                       <button
                         type="button"
-                        disabled={isOutOfStock}
+                        disabled={isUnavailable}
                         onClick={() => handleAddComboToCart(combo)}
                         className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer ${
-                          isOutOfStock
+                          isUnavailable
                             ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                             : 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white hover:opacity-95'
                         }`}

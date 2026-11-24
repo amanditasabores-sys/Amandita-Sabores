@@ -96,6 +96,13 @@ export interface MenuItem {
   featured?: boolean;
   tags?: string[];
   addons?: MenuItemAddon[];
+  // Metadados opcionais quando o documento em menu_items representa um Combo oficial
+  isCombo?: boolean;
+  comboActive?: boolean;
+  comboItems?: ComboComponent[];
+  originalPrice?: number;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ComboComponent {
@@ -103,6 +110,17 @@ export interface ComboComponent {
   name: string;
   quantity: number;
   originalPrice: number;
+}
+
+export type ComboAvailabilityStatus =
+  | 'AVAILABLE'
+  | 'INACTIVE'
+  | 'COMPONENT_PAUSED'
+  | 'COMPONENT_MISSING'
+  | 'EMPTY_COMPOSITION';
+
+export interface ComboComponentStatus extends ComboComponent {
+  status: 'AVAILABLE' | 'PAUSED' | 'MISSING';
 }
 
 export interface Combo {
@@ -115,11 +133,23 @@ export interface Combo {
   originalPrice: number; // Sum of component individual prices
   comboPrice: number; // Special promotional price
   active: boolean; // Active / Inactive
-  available: boolean; // Components available in stock
+  available: boolean; // Active and all component products exist and are available
+  availabilityStatus?: ComboAvailabilityStatus;
+  missingComponents?: ComboComponent[];
+  pausedComponents?: ComboComponent[];
+  componentStatuses?: ComboComponentStatus[];
+  syncSource?: 'firestore' | 'local_legacy' | 'initial_fallback';
   featured?: boolean;
   tags?: string[];
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface LegacyComboSyncCandidate {
+  combo: Combo;
+  reason: 'NOT_IN_FIRESTORE' | 'MISSING_COMPOSITION_IN_FIRESTORE' | 'LOCAL_NEWER';
+  localUpdatedAt?: string;
+  remoteUpdatedAt?: string;
 }
 
 export interface DailyMenuConfig {

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { store } from '../../../services/store';
 import { MenuItem, Combo, DailyMenuConfig } from '../../../types';
 import { formatCurrency } from '../../../utils/formatters';
+import { isComboMenuItem } from '../../../utils/comboAvailability';
 import { 
   Calendar, 
   Check, 
@@ -68,7 +69,7 @@ export const DailyMenuTab: React.FC = () => {
   const categories = useMemo(() => {
     const set = new Set<string>();
     catalogItems.forEach((i) => {
-      if (i.category && i.category !== 'Combos') set.add(i.category);
+      if (i.category && !isComboMenuItem(i)) set.add(i.category);
     });
     return ['TODAS', ...Array.from(set), 'Combos'];
   }, [catalogItems]);
@@ -87,7 +88,7 @@ export const DailyMenuTab: React.FC = () => {
   // Filter items
   const filteredItems = useMemo(() => {
     return catalogItems.filter((item) => {
-      if (item.category === 'Combos') return false; // Handled in combos section
+      if (isComboMenuItem(item)) return false; // Handled in combos section
       if (categoryFilter !== 'TODAS' && item.category !== categoryFilter) return false;
 
       const isSelected = selectedItemIds.has(item.id);
@@ -140,8 +141,10 @@ export const DailyMenuTab: React.FC = () => {
   };
 
   const handleSelectAll = () => {
-    // Select all available catalog items and active combos
-    const itemIds = new Set(catalogItems.filter((i) => i.available !== false).map((i) => i.id));
+    // Select all available individual catalog items and active/available combos
+    const itemIds = new Set(
+      catalogItems.filter((i) => !isComboMenuItem(i) && i.available !== false).map((i) => i.id)
+    );
     const comboIds = new Set(combos.filter((c) => c.active !== false && c.available !== false).map((c) => c.id));
     setSelectedItemIds(itemIds);
     setSelectedComboIds(comboIds);
@@ -379,7 +382,23 @@ export const DailyMenuTab: React.FC = () => {
                       )}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <span className="font-bold text-xs text-[#2C1810] block truncate">{combo.name}</span>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-bold text-xs text-[#2C1810] truncate max-w-[160px]">{combo.name}</span>
+                        {combo.active === false ? (
+                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-slate-200 text-slate-700">
+                            Inativo
+                          </span>
+                        ) : combo.availabilityStatus === 'COMPONENT_PAUSED' ? (
+                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                            Item pausado
+                          </span>
+                        ) : combo.availabilityStatus === 'COMPONENT_MISSING' ||
+                          combo.availabilityStatus === 'EMPTY_COMPOSITION' ? (
+                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">
+                            Revisar combo
+                          </span>
+                        ) : null}
+                      </div>
                       <span className="text-[11px] text-[#8C5E47] font-mono block">
                         {formatCurrency(combo.comboPrice)} ({combo.items.length} itens)
                       </span>

@@ -1,30 +1,42 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { store } from '../../../services/store';
-import { Combo, ComboComponent, MenuItem } from '../../../types';
+import { Combo, ComboComponent, LegacyComboSyncCandidate, MenuItem } from '../../../types';
 import { formatCurrency } from '../../../utils/formatters';
-import { 
-  Plus, 
-  Search, 
-  Edit2, 
-  Trash2, 
-  Copy, 
-  Check, 
-  X, 
-  Sparkles, 
-  Layers, 
-  Package, 
-  Tag, 
-  Eye, 
-  EyeOff, 
+import { isComboMenuItem } from '../../../utils/comboAvailability';
+import {
+  Plus,
+  Search,
+  Edit2,
+  Trash2,
+  Copy,
+  Check,
+  X,
+  Sparkles,
+  Layers,
+  Package,
+  Eye,
+  EyeOff,
   AlertCircle,
-  ArrowRight,
-  TrendingDown
+  AlertTriangle,
+  TrendingDown,
+  CloudUpload,
+  CheckCircle2,
+  RefreshCw,
 } from 'lucide-react';
 import { ConfirmModal } from '../../common/ConfirmModal';
+
+const getLegacyReasonLabel = (reason: LegacyComboSyncCandidate['reason']): string => {
+  if (reason === 'NOT_IN_FIRESTORE') return 'Ainda não salvo no Firebase';
+  if (reason === 'MISSING_COMPOSITION_IN_FIRESTORE') return 'Composição completa ausente no Firebase';
+  return 'Alteração local mais recente';
+};
 
 export const ComboManagerTab: React.FC = () => {
   const [combos, setCombos] = useState<Combo[]>(() => store.getCombos());
   const [catalogItems, setCatalogItems] = useState<MenuItem[]>(() => store.getMenuItems());
+  const [legacyCandidates, setLegacyCandidates] = useState<LegacyComboSyncCandidate[]>(() =>
+    store.getLegacyCombosPendingSync()
+  );
   const [search, setSearch] = useState('');
   const [activeFilter, setActiveFilter] = useState<'all' | 'active' | 'inactive'>('all');
 
@@ -32,6 +44,15 @@ export const ComboManagerTab: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingCombo, setEditingCombo] = useState<Combo | null>(null);
   const [comboToDelete, setComboToDelete] = useState<Combo | null>(null);
+
+  // Async operation states & feedback
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [isSyncingLegacy, setIsSyncingLegacy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // Form state
   const [name, setName] = useState('');
@@ -45,13 +66,13 @@ export const ComboManagerTab: React.FC = () => {
   const [selectedComponents, setSelectedComponents] = useState<ComboComponent[]>([]);
 
   // Item selector in form
-  const [componentSearch, setComponentSearch] = useState('');
   const [selectedAddItemId, setSelectedAddItemId] = useState('');
   const [selectedAddQuantity, setSelectedAddQuantity] = useState(1);
 
   const reload = () => {
     setCombos(store.getCombos());
     setCatalogItems(store.getMenuItems());
+    setLegacyCandidates(store.getLegacyCombosPendingSync());
   };
 
   useEffect(() => {
@@ -63,7 +84,7 @@ export const ComboManagerTab: React.FC = () => {
   // Filtered combos
   const filteredCombos = useMemo(() => {
     return combos.filter((c) => {
-      const matchSearch = 
+      const matchSearch =
         c.name.toLowerCase().includes(search.toLowerCase()) ||
         c.description.toLowerCase().includes(search.toLowerCase()) ||
         c.items.some((it) => it.name.toLowerCase().includes(search.toLowerCase()));
@@ -75,14 +96,18 @@ export const ComboManagerTab: React.FC = () => {
     });
   }, [combos, search, activeFilter]);
 
-  // Available catalog items for adding as components (excluding existing combos)
+  // Available catalog items for adding as components (excluding combos)
   const availableCatalogItems = useMemo(() => {
-    return catalogItems.filter((i) => i.category !== 'Combos');
+    return catalogItems.filter((i) => !isComboMenuItem(i));
   }, [catalogItems]);
+
+  const catalogById = useMemo(() => {
+    return new Map<string, MenuItem>(availableCatalogItems.map((i) => [i.id, i]));
+  }, [availableCatalogItems]);
 
   // Calculate live sum of components
   const calculatedOriginalPrice = useMemo(() => {
-    return selectedComponents.reduce((sum, comp) => sum + (comp.originalPrice * comp.quantity), 0);
+    return selectedComponents.reduce((sum, comp) => sum + comp.originalPrice * comp.quantity, 0);
   }, [selectedComponents]);
 
   // Calculate discount percentage
@@ -94,6 +119,7 @@ export const ComboManagerTab: React.FC = () => {
 
   const handleOpenCreate = () => {
     setEditingCombo(null);
+    setFormError(null);
     setName('');
     setDescription('');
     setImageUrl('https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80');
@@ -110,6 +136,7 @@ export const ComboManagerTab: React.FC = () => {
 
   const handleOpenEdit = (combo: Combo) => {
     setEditingCombo(combo);
+    setFormError(null);
     setName(combo.name);
     setDescription(combo.description);
     setImageUrl(combo.imageUrl || '');
@@ -118,22 +145,86 @@ export const ComboManagerTab: React.FC = () => {
     setIsActive(combo.active !== false);
     setIsFeatured(!!combo.featured);
     setTagsInput(combo.tags?.join(', ') || '');
-    setSelectedComponents([...combo.items]);
+    setSelectedComponents(combo.items.map((item) => ({ ...item })));
     setSelectedAddItemId(availableCatalogItems[0]?.id || '');
     setSelectedAddQuantity(1);
     setIsModalOpen(true);
   };
 
-  const handleDuplicate = (combo: Combo) => {
-    const copy = store.duplicateCombo(combo.id);
-    if (copy) {
-      reload();
+  const handleDuplicate = async (combo: Combo) => {
+    setFeedback(null);
+    const now = new Date().toISOString();
+    const duplicated: Combo = {
+      ...combo,
+      id: `combo-${Date.now()}`,
+      name: `${combo.name} (Cópia)`,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const res = await store.saveComboAsync(duplicated);
+    reload();
+    if (res.success) {
+      setFeedback({ type: 'success', text: `Combo "${duplicated.name}" duplicado e salvo no Firebase.` });
+    } else {
+      setFeedback({
+        type: 'error',
+        text: res.error || 'Combo duplicado localmente, mas não foi possível confirmar gravação no Firebase.',
+      });
     }
   };
 
-  const handleToggleActive = (combo: Combo) => {
-    store.toggleComboActive(combo.id);
-    reload();
+  const handleToggleActive = async (combo: Combo) => {
+    if (togglingId) return;
+    setTogglingId(combo.id);
+    setFeedback(null);
+    try {
+      const res = await store.toggleComboActiveAsync(combo.id);
+      reload();
+      if (res.success) {
+        const nowActive = res.combo?.active !== false;
+        setFeedback({
+          type: 'success',
+          text: nowActive
+            ? `Combo "${combo.name}" ativado e sincronizado no Firebase.`
+            : `Combo "${combo.name}" pausado e sincronizado no Firebase.`,
+        });
+      } else {
+        setFeedback({
+          type: 'error',
+          text: res.error || 'Não foi possível confirmar a alteração de status do combo no Firebase.',
+        });
+      }
+    } finally {
+      setTogglingId(null);
+    }
+  };
+
+  const handleSyncLegacyCombos = async (comboIds?: string[]) => {
+    if (isSyncingLegacy) return;
+    setIsSyncingLegacy(true);
+    setFeedback(null);
+    try {
+      const result = await store.syncLegacyLocalCombosToFirestore(comboIds);
+      reload();
+      if (result.failed.length > 0) {
+        setFeedback({
+          type: 'error',
+          text: `Sincronização parcial: ${result.synced.length} enviado(s), ${result.failed.length} com erro (${result.failed[0].error}). Os dados locais foram preservados.`,
+        });
+      } else if (result.synced.length > 0) {
+        setFeedback({
+          type: 'success',
+          text: `${result.synced.length} combo(s) sincronizado(s) com o Firebase com sucesso. Nenhum dado local foi apagado.`,
+        });
+      } else {
+        setFeedback({
+          type: 'info',
+          text: 'Todos os combos selecionados já estavam atualizados no Firebase.',
+        });
+      }
+    } finally {
+      setIsSyncingLegacy(false);
+    }
   };
 
   const handleAddComponent = () => {
@@ -141,10 +232,12 @@ export const ComboManagerTab: React.FC = () => {
     const item = availableCatalogItems.find((i) => i.id === selectedAddItemId);
     if (!item) return;
 
+    setFormError(null);
     const existingIndex = selectedComponents.findIndex((c) => c.menuItemId === item.id);
     if (existingIndex >= 0) {
-      const updated = [...selectedComponents];
-      updated[existingIndex].quantity += selectedAddQuantity;
+      const updated = selectedComponents.map((c, idx) =>
+        idx === existingIndex ? { ...c, quantity: c.quantity + selectedAddQuantity } : c
+      );
       setSelectedComponents(updated);
     } else {
       setSelectedComponents([
@@ -162,7 +255,7 @@ export const ComboManagerTab: React.FC = () => {
   };
 
   const handleRemoveComponent = (menuItemId: string) => {
-    setSelectedComponents(selectedComponents.filter((c) => c.menuItemId !== menuItemId));
+    setSelectedComponents((prev) => prev.filter((c) => c.menuItemId !== menuItemId));
   };
 
   const handleComponentQuantityChange = (menuItemId: string, newQty: number) => {
@@ -170,22 +263,28 @@ export const ComboManagerTab: React.FC = () => {
       handleRemoveComponent(menuItemId);
       return;
     }
-    setSelectedComponents(
-      selectedComponents.map((c) => (c.menuItemId === menuItemId ? { ...c, quantity: newQty } : c))
+    setSelectedComponents((prev) =>
+      prev.map((c) => (c.menuItemId === menuItemId ? { ...c, quantity: newQty } : c))
     );
   };
 
-  const handleSaveCombo = (e: React.FormEvent) => {
+  const handleSaveCombo = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
+    if (isSaving) return;
+    setFormError(null);
+
+    if (!name.trim()) {
+      setFormError('Informe o nome do combo.');
+      return;
+    }
     if (selectedComponents.length === 0) {
-      alert('Adicione pelo menos um produto para compor o combo.');
+      setFormError('Adicione pelo menos um produto do catálogo para compor o combo.');
       return;
     }
 
     const priceNum = parseFloat(comboPrice);
     if (isNaN(priceNum) || priceNum <= 0) {
-      alert('Informe um preço especial válido para o combo.');
+      setFormError('Informe um preço especial válido para o combo.');
       return;
     }
 
@@ -204,24 +303,61 @@ export const ComboManagerTab: React.FC = () => {
       originalPrice: calculatedOriginalPrice,
       comboPrice: priceNum,
       active: isActive,
-      available: isActive && selectedComponents.every((c) => {
-        const found = catalogItems.find((it) => it.id === c.menuItemId);
-        return found && found.available !== false;
-      }),
+      available:
+        isActive &&
+        selectedComponents.every((c) => {
+          const found = catalogById.get(c.menuItemId);
+          return Boolean(found && found.available !== false);
+        }),
       featured: isFeatured,
       tags: tags.length > 0 ? tags : ['Combo'],
+      createdAt: editingCombo?.createdAt,
     };
 
-    store.saveCombo(comboData);
-    setIsModalOpen(false);
-    reload();
+    setIsSaving(true);
+    try {
+      const res = await store.saveComboAsync(comboData);
+      reload();
+      if (res.success) {
+        setIsModalOpen(false);
+        setFeedback({
+          type: 'success',
+          text: editingCombo
+            ? `Combo "${comboData.name}" atualizado e sincronizado no Firebase.`
+            : `Combo "${comboData.name}" criado e sincronizado no Firebase.`,
+        });
+      } else {
+        setFormError(
+          res.error ||
+            'O combo foi preservado localmente, mas não foi possível confirmar a gravação no Firebase. Tente novamente.'
+        );
+      }
+    } finally {
+      setIsSaving(false);
+    }
   };
 
-  const handleDeleteConfirm = () => {
-    if (!comboToDelete) return;
-    store.deleteCombo(comboToDelete.id);
-    setComboToDelete(null);
-    reload();
+  const handleDeleteConfirm = async () => {
+    if (!comboToDelete || isDeleting) return;
+    const target = comboToDelete;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      const res = await store.deleteComboAsync(target.id);
+      reload();
+      if (res.success) {
+        setComboToDelete(null);
+        setDeleteError(null);
+        setFeedback({
+          type: 'success',
+          text: `Combo "${target.name}" excluído do cardápio com confirmação do Firebase.`,
+        });
+      } else {
+        setDeleteError(res.error || 'Não foi possível excluir o combo no Firebase. Tente novamente.');
+      }
+    } finally {
+      setIsDeleting(false);
+    }
   };
 
   return (
@@ -236,13 +372,14 @@ export const ComboManagerTab: React.FC = () => {
             <div>
               <h3 className="text-base sm:text-lg font-black text-[#2C1810]">Gestão de Combos</h3>
               <p className="text-xs text-[#8C5E47]">
-                Crie combinações especiais de produtos com desconto exclusivo para atrair clientes.
+                Crie combinações especiais de produtos com desconto exclusivo, sincronizadas com o Firebase.
               </p>
             </div>
           </div>
         </div>
 
         <button
+          type="button"
           onClick={handleOpenCreate}
           className="w-full sm:w-auto px-4 py-2.5 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white font-bold rounded-xl text-xs sm:text-sm hover:opacity-95 transition shadow-xs flex items-center justify-center gap-2 cursor-pointer"
         >
@@ -250,6 +387,97 @@ export const ComboManagerTab: React.FC = () => {
           <span>Criar Novo Combo</span>
         </button>
       </div>
+
+      {/* Feedback Banner */}
+      {feedback && (
+        <div
+          className={`flex items-center justify-between gap-3 px-4 py-3 rounded-2xl border text-xs sm:text-sm ${
+            feedback.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              : feedback.type === 'error'
+              ? 'bg-rose-50 border-rose-200 text-rose-900'
+              : 'bg-amber-50 border-amber-200 text-amber-900'
+          }`}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            {feedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            )}
+            <span className="font-medium">{feedback.text}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFeedback(null)}
+            className="p-1 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
+            aria-label="Fechar aviso"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Manual Legacy Sync Review Panel (only shown when local combos need confirmation to sync to Firebase) */}
+      {legacyCandidates.length > 0 && (
+        <div className="bg-amber-50/90 border border-amber-300 rounded-2xl p-4 space-y-3 shadow-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <CloudUpload className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <h4 className="text-xs sm:text-sm font-black text-amber-950">
+                  Sincronização Manual de Combos Locais ({legacyCandidates.length})
+                </h4>
+                <p className="text-xs text-amber-900 mt-0.5 leading-relaxed">
+                  Foram encontrados combos salvos neste navegador cuja composição completa ainda não está no Firebase.
+                  Revise a lista abaixo e confirme para publicar no Firebase sem apagar dados locais e sem sobrescrever
+                  alterações remotas mais recentes.
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={isSyncingLegacy}
+              onClick={() => handleSyncLegacyCombos()}
+              className="shrink-0 px-4 py-2 bg-amber-700 hover:bg-amber-800 disabled:opacity-50 text-white font-bold rounded-xl text-xs transition flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingLegacy ? 'animate-spin' : ''}`} />
+              <span>{isSyncingLegacy ? 'Sincronizando...' : 'Sincronizar Todos com Firebase'}</span>
+            </button>
+          </div>
+
+          <div className="space-y-1.5">
+            {legacyCandidates.map((cand) => (
+              <div
+                key={cand.combo.id}
+                className="bg-white/90 border border-amber-200 rounded-xl px-3 py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-bold text-[#2C1810]">{cand.combo.name}</span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-amber-100 text-amber-900">
+                      {getLegacyReasonLabel(cand.reason)}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-[#8C5E47] mt-0.5">
+                    {cand.combo.items.length} item(ns) · {formatCurrency(cand.combo.comboPrice)} · ID: {cand.combo.id}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isSyncingLegacy}
+                  onClick={() => handleSyncLegacyCombos([cand.combo.id])}
+                  className="shrink-0 px-3 py-1.5 bg-[#2C1810] hover:bg-[#3D2314] disabled:opacity-50 text-white font-bold rounded-lg text-[11px] transition cursor-pointer"
+                >
+                  Enviar este combo
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Filter & Search Bar */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
@@ -266,6 +494,7 @@ export const ComboManagerTab: React.FC = () => {
 
         <div className="flex items-center gap-1.5 p-1 bg-white border border-[#E8DFD5] rounded-xl shrink-0">
           <button
+            type="button"
             onClick={() => setActiveFilter('all')}
             className={`px-3 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer ${
               activeFilter === 'all' ? 'bg-[#2C1810] text-white' : 'text-[#8C5E47] hover:text-[#2C1810]'
@@ -274,6 +503,7 @@ export const ComboManagerTab: React.FC = () => {
             Todos ({combos.length})
           </button>
           <button
+            type="button"
             onClick={() => setActiveFilter('active')}
             className={`px-3 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer ${
               activeFilter === 'active' ? 'bg-emerald-600 text-white' : 'text-[#8C5E47] hover:text-[#2C1810]'
@@ -282,6 +512,7 @@ export const ComboManagerTab: React.FC = () => {
             Ativos ({combos.filter((c) => c.active !== false).length})
           </button>
           <button
+            type="button"
             onClick={() => setActiveFilter('inactive')}
             className={`px-3 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer ${
               activeFilter === 'inactive' ? 'bg-slate-700 text-white' : 'text-[#8C5E47] hover:text-[#2C1810]'
@@ -304,15 +535,21 @@ export const ComboManagerTab: React.FC = () => {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-5">
           {filteredCombos.map((combo) => {
-            const hasStockIssue = !combo.available && combo.active !== false;
+            const status = combo.availabilityStatus || (combo.active === false ? 'INACTIVE' : combo.available ? 'AVAILABLE' : 'COMPONENT_PAUSED');
+            const hasAvailabilityIssue = combo.active !== false && !combo.available;
+            const statusByComponentId = new Map(
+              (combo.componentStatuses || []).map((cs) => [cs.menuItemId, cs.status])
+            );
 
             return (
               <div
                 key={combo.id}
                 className={`bg-[#FFFDF9] rounded-2xl border transition shadow-xs overflow-hidden flex flex-col justify-between ${
                   combo.active === false
-                    ? 'border-slate-200 opacity-60'
-                    : hasStockIssue
+                    ? 'border-slate-200 opacity-65'
+                    : status === 'COMPONENT_MISSING' || status === 'EMPTY_COMPOSITION'
+                    ? 'border-rose-300 bg-rose-50/15'
+                    : hasAvailabilityIssue
                     ? 'border-amber-300 bg-amber-50/20'
                     : 'border-[#E8DFD5] hover:border-[#C86D3B]/50 hover:shadow-md'
                 }`}
@@ -321,11 +558,7 @@ export const ComboManagerTab: React.FC = () => {
                   {/* Image & Header */}
                   <div className="relative h-40 bg-slate-100 overflow-hidden">
                     {combo.imageUrl ? (
-                      <img
-                        src={combo.imageUrl}
-                        alt={combo.name}
-                        className="w-full h-full object-cover"
-                      />
+                      <img src={combo.imageUrl} alt={combo.name} className="w-full h-full object-cover" />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center bg-[#FAF7F2] text-[#8C5E47]">
                         <Package className="w-10 h-10 opacity-40" />
@@ -345,14 +578,24 @@ export const ComboManagerTab: React.FC = () => {
                     </div>
 
                     <div className="absolute top-2.5 right-2.5">
-                      {combo.active === false ? (
+                      {status === 'INACTIVE' ? (
                         <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-slate-800 text-white shadow-xs">
                           Inativo
                         </span>
-                      ) : hasStockIssue ? (
+                      ) : status === 'COMPONENT_MISSING' ? (
+                        <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-rose-600 text-white shadow-xs flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>Produto Removido</span>
+                        </span>
+                      ) : status === 'EMPTY_COMPOSITION' ? (
+                        <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-600 text-white shadow-xs flex items-center gap-1">
+                          <AlertCircle className="w-3 h-3" />
+                          <span>Composição Pendente</span>
+                        </span>
+                      ) : status === 'COMPONENT_PAUSED' ? (
                         <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-500 text-white shadow-xs flex items-center gap-1">
                           <AlertCircle className="w-3 h-3" />
-                          <span>Item Indisponível</span>
+                          <span>Item Pausado</span>
                         </span>
                       ) : (
                         <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-emerald-600 text-white shadow-xs">
@@ -366,9 +609,38 @@ export const ComboManagerTab: React.FC = () => {
                   <div className="p-4">
                     <h4 className="font-black text-sm sm:text-base text-[#2C1810] leading-snug">{combo.name}</h4>
                     {combo.description && (
-                      <p className="text-xs text-[#8C5E47] mt-1 line-clamp-2 leading-relaxed">
-                        {combo.description}
-                      </p>
+                      <p className="text-xs text-[#8C5E47] mt-1 line-clamp-2 leading-relaxed">{combo.description}</p>
+                    )}
+
+                    {/* Diagnostic notice when active combo is unavailable */}
+                    {hasAvailabilityIssue && (
+                      <div
+                        className={`mt-3 p-2.5 rounded-xl border text-[11px] leading-snug ${
+                          status === 'COMPONENT_MISSING'
+                            ? 'bg-rose-50 border-rose-200 text-rose-900'
+                            : 'bg-amber-50 border-amber-200 text-amber-900'
+                        }`}
+                      >
+                        {status === 'EMPTY_COMPOSITION' && (
+                          <span>
+                            Este combo ainda não possui produtos vinculados no Firebase. Clique em <strong>Editar</strong>{' '}
+                            para definir os itens inclusos.
+                          </span>
+                        )}
+                        {status === 'COMPONENT_MISSING' && combo.missingComponents && combo.missingComponents.length > 0 && (
+                          <span>
+                            <strong>Removido do catálogo:</strong>{' '}
+                            {combo.missingComponents.map((c) => c.name).join(', ')}. Edite o combo para remover ou
+                            substituir o item.
+                          </span>
+                        )}
+                        {status === 'COMPONENT_PAUSED' && combo.pausedComponents && combo.pausedComponents.length > 0 && (
+                          <span>
+                            <strong>Pausado na aba Produtos:</strong>{' '}
+                            {combo.pausedComponents.map((c) => c.name).join(', ')}.
+                          </span>
+                        )}
+                      </div>
                     )}
 
                     {/* Component Items List */}
@@ -376,19 +648,36 @@ export const ComboManagerTab: React.FC = () => {
                       <span className="text-[10px] font-bold uppercase tracking-wider text-[#8C5E47] block">
                         Produtos Inclusos ({combo.items.length}):
                       </span>
-                      <ul className="space-y-1">
-                        {combo.items.map((comp, idx) => (
-                          <li key={idx} className="text-xs text-[#3D2314] flex items-center justify-between">
-                            <span className="flex items-center gap-1.5">
-                              <span className="font-bold text-[#C86D3B]">{comp.quantity}x</span>
-                              <span className="truncate max-w-[170px]">{comp.name}</span>
-                            </span>
-                            <span className="text-[11px] text-[#8C5E47] font-mono">
-                              {formatCurrency(comp.originalPrice * comp.quantity)}
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
+                      {combo.items.length === 0 ? (
+                        <p className="text-[11px] italic text-amber-800">Nenhum produto vinculado ainda.</p>
+                      ) : (
+                        <ul className="space-y-1">
+                          {combo.items.map((comp, idx) => {
+                            const compStatus = statusByComponentId.get(comp.menuItemId);
+                            return (
+                              <li key={`${comp.menuItemId}-${idx}`} className="text-xs text-[#3D2314] flex items-center justify-between gap-2">
+                                <span className="flex items-center gap-1.5 min-w-0">
+                                  <span className="font-bold text-[#C86D3B] shrink-0">{comp.quantity}x</span>
+                                  <span className="truncate">{comp.name}</span>
+                                  {compStatus === 'PAUSED' && (
+                                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 shrink-0">
+                                      Pausado
+                                    </span>
+                                  )}
+                                  {compStatus === 'MISSING' && (
+                                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-100 text-rose-800 shrink-0">
+                                      Removido
+                                    </span>
+                                  )}
+                                </span>
+                                <span className="text-[11px] text-[#8C5E47] font-mono shrink-0">
+                                  {formatCurrency(comp.originalPrice * comp.quantity)}
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
                     </div>
 
                     {/* Pricing Breakdown */}
@@ -417,20 +706,25 @@ export const ComboManagerTab: React.FC = () => {
                 {/* Card Action Buttons */}
                 <div className="p-3 bg-[#FAF7F2] border-t border-[#E8DFD5] flex items-center justify-between gap-1.5">
                   <button
+                    type="button"
+                    disabled={togglingId === combo.id}
                     onClick={() => handleToggleActive(combo)}
-                    className={`p-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
+                    className={`p-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50 ${
                       combo.active === false
                         ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
                         : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
                     }`}
-                    title={combo.active === false ? 'Ativar combo' : 'Desativar combo'}
+                    title={combo.active === false ? 'Ativar combo' : 'Pausar combo'}
                   >
                     {combo.active === false ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-                    <span className="text-[11px]">{combo.active === false ? 'Ativar' : 'Pausar'}</span>
+                    <span className="text-[11px]">
+                      {togglingId === combo.id ? 'Salvando...' : combo.active === false ? 'Ativar' : 'Pausar'}
+                    </span>
                   </button>
 
                   <div className="flex items-center gap-1">
                     <button
+                      type="button"
                       onClick={() => handleDuplicate(combo)}
                       className="p-2 text-[#8C5E47] hover:text-[#2C1810] hover:bg-white rounded-xl transition cursor-pointer"
                       title="Duplicar combo"
@@ -438,6 +732,7 @@ export const ComboManagerTab: React.FC = () => {
                       <Copy className="w-3.5 h-3.5" />
                     </button>
                     <button
+                      type="button"
                       onClick={() => handleOpenEdit(combo)}
                       className="p-2 text-[#C86D3B] hover:text-[#721C24] hover:bg-white rounded-xl transition cursor-pointer"
                       title="Editar combo"
@@ -445,7 +740,11 @@ export const ComboManagerTab: React.FC = () => {
                       <Edit2 className="w-3.5 h-3.5" />
                     </button>
                     <button
-                      onClick={() => setComboToDelete(combo)}
+                      type="button"
+                      onClick={() => {
+                        setDeleteError(null);
+                        setComboToDelete(combo);
+                      }}
                       className="p-2 text-rose-600 hover:text-rose-800 hover:bg-rose-50 rounded-xl transition cursor-pointer"
                       title="Excluir combo"
                     >
@@ -478,14 +777,22 @@ export const ComboManagerTab: React.FC = () => {
 
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={() => setIsModalOpen(false)}
-                className="p-1.5 text-slate-400 hover:text-[#2C1810] rounded-xl hover:bg-slate-100 transition cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-[#2C1810] rounded-xl hover:bg-slate-100 transition cursor-pointer disabled:opacity-50"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             <form onSubmit={handleSaveCombo} className="p-5 sm:p-6 space-y-4">
+              {formError && (
+                <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span className="font-medium">{formError}</span>
+                </div>
+              )}
+
               {/* Nome do Combo */}
               <div>
                 <label className="block text-xs font-bold text-[#3D2314] uppercase tracking-wider mb-1">
@@ -551,6 +858,7 @@ export const ComboManagerTab: React.FC = () => {
                     {availableCatalogItems.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.name} — {formatCurrency(item.price)} ({item.category})
+                        {item.available === false ? ' [PAUSADO]' : ''}
                       </option>
                     ))}
                   </select>
@@ -592,34 +900,72 @@ export const ComboManagerTab: React.FC = () => {
                   </div>
                 ) : (
                   <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                    {selectedComponents.map((comp) => (
-                      <div
-                        key={comp.menuItemId}
-                        className="p-2 bg-white rounded-xl border border-[#E8DFD5] flex items-center justify-between text-xs"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className="font-bold text-[#C86D3B]">{comp.quantity}x</span>
-                          <span className="font-medium text-[#2C1810] truncate max-w-[200px]">{comp.name}</span>
-                          <span className="text-[11px] text-slate-400 font-mono">
-                            ({formatCurrency(comp.originalPrice)} un.)
-                          </span>
-                        </div>
+                    {selectedComponents.map((comp) => {
+                      const matchedProduct = catalogById.get(comp.menuItemId);
+                      const isMissing = !matchedProduct;
+                      const isPaused = Boolean(matchedProduct && matchedProduct.available === false);
 
-                        <div className="flex items-center gap-2 shrink-0">
-                          <span className="font-mono font-bold text-[#2C1810]">
-                            {formatCurrency(comp.originalPrice * comp.quantity)}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveComponent(comp.menuItemId)}
-                            className="p-1 text-slate-400 hover:text-rose-600 transition cursor-pointer"
-                            title="Remover produto do combo"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                      return (
+                        <div
+                          key={comp.menuItemId}
+                          className={`p-2 rounded-xl border flex items-center justify-between gap-2 text-xs ${
+                            isMissing
+                              ? 'bg-rose-50 border-rose-200'
+                              : isPaused
+                              ? 'bg-amber-50 border-amber-200'
+                              : 'bg-white border-[#E8DFD5]'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                            <div className="flex items-center border border-[#E8DFD5] rounded-lg bg-white overflow-hidden shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => handleComponentQuantityChange(comp.menuItemId, comp.quantity - 1)}
+                                className="px-1.5 py-0.5 text-[11px] text-[#8C5E47] hover:bg-slate-50 cursor-pointer"
+                              >
+                                -
+                              </button>
+                              <span className="px-1.5 text-[11px] font-bold text-[#C86D3B]">{comp.quantity}x</span>
+                              <button
+                                type="button"
+                                onClick={() => handleComponentQuantityChange(comp.menuItemId, comp.quantity + 1)}
+                                className="px-1.5 py-0.5 text-[11px] text-[#8C5E47] hover:bg-slate-50 cursor-pointer"
+                              >
+                                +
+                              </button>
+                            </div>
+                            <span className="font-medium text-[#2C1810] truncate max-w-[180px]">{comp.name}</span>
+                            <span className="text-[11px] text-slate-400 font-mono">
+                              ({formatCurrency(comp.originalPrice)} un.)
+                            </span>
+                            {isMissing && (
+                              <span className="text-[10px] font-bold text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded">
+                                Removido do catálogo — remova ou substitua
+                              </span>
+                            )}
+                            {isPaused && (
+                              <span className="text-[10px] font-bold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                                Pausado na aba Produtos
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="font-mono font-bold text-[#2C1810]">
+                              {formatCurrency(comp.originalPrice * comp.quantity)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveComponent(comp.menuItemId)}
+                              className="p-1 text-slate-400 hover:text-rose-600 transition cursor-pointer"
+                              title="Remover produto do combo"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -699,17 +1045,25 @@ export const ComboManagerTab: React.FC = () => {
               <div className="pt-4 border-t border-[#E8DFD5] flex items-center justify-end gap-2.5">
                 <button
                   type="button"
+                  disabled={isSaving}
                   onClick={() => setIsModalOpen(false)}
-                  className="px-4 py-2.5 text-xs font-bold text-[#8C5E47] hover:text-[#2C1810] transition cursor-pointer"
+                  className="px-4 py-2.5 text-xs font-bold text-[#8C5E47] hover:text-[#2C1810] transition cursor-pointer disabled:opacity-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2.5 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white text-xs sm:text-sm font-bold rounded-xl hover:opacity-95 transition shadow-xs cursor-pointer flex items-center gap-1.5"
+                  disabled={isSaving}
+                  className="px-5 py-2.5 bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white text-xs sm:text-sm font-bold rounded-xl hover:opacity-95 transition shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-60"
                 >
                   <Check className="w-4 h-4" />
-                  <span>{editingCombo ? 'Salvar Alterações' : 'Criar Combo'}</span>
+                  <span>
+                    {isSaving
+                      ? 'Salvando no Firebase...'
+                      : editingCombo
+                      ? 'Salvar Alterações'
+                      : 'Criar Combo'}
+                  </span>
                 </button>
               </div>
             </form>
@@ -720,12 +1074,23 @@ export const ComboManagerTab: React.FC = () => {
       {/* Confirmação de Exclusão */}
       <ConfirmModal
         isOpen={Boolean(comboToDelete)}
-        title="Excluir Combo"
-        message={`Tem certeza que deseja excluir o combo "${comboToDelete?.name}"? Esta ação removerá o combo do cardápio, mas os produtos individuais permanecerão intactos no catálogo.`}
-        confirmLabel="Excluir Combo"
+        title={isDeleting ? 'Excluindo Combo...' : 'Excluir Combo'}
+        message={
+          isDeleting
+            ? `Excluindo "${comboToDelete?.name}"... Aguardando confirmação do Firebase.`
+            : `Tem certeza que deseja excluir o combo "${comboToDelete?.name}"? Esta ação removerá o combo do cardápio, mas os produtos individuais permanecerão intactos no catálogo.`
+        }
+        confirmLabel={isDeleting ? 'Excluindo...' : 'Excluir Combo'}
         isDanger={true}
+        isLoading={isDeleting}
+        errorMessage={deleteError}
         onConfirm={handleDeleteConfirm}
-        onCancel={() => setComboToDelete(null)}
+        onCancel={() => {
+          if (!isDeleting) {
+            setComboToDelete(null);
+            setDeleteError(null);
+          }
+        }}
       />
     </div>
   );

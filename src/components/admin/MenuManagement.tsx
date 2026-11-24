@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { store } from '../../services/store';
 import { MenuItem, MenuItemAddon } from '../../types';
 import { formatCurrency } from '../../utils/formatters';
+import { isComboMenuItem } from '../../utils/comboAvailability';
 import { 
   Plus, 
   Search, 
@@ -34,6 +35,7 @@ const PRESET_IMAGES = [
 
 export const MenuManagement: React.FC = () => {
   const [items, setItems] = useState<MenuItem[]>(() => store.getMenuItems());
+  const [combosCount, setCombosCount] = useState<number>(() => store.getCombos().length);
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('TODAS');
   const [activeSection, setActiveSection] = useState<'produtos' | 'categorias' | 'combos' | 'cardapio-do-dia'>('produtos');
@@ -64,6 +66,7 @@ export const MenuManagement: React.FC = () => {
 
   const reload = () => {
     setItems(store.getMenuItems());
+    setCombosCount(store.getCombos().length);
   };
 
   useEffect(() => {
@@ -75,6 +78,7 @@ export const MenuManagement: React.FC = () => {
         eventType === 'COMBOS_UPDATED'
       ) {
         setItems(store.getMenuItems());
+        setCombosCount(store.getCombos().length);
       }
     };
     window.addEventListener('gestaofood_state_changed', handleStateSync);
@@ -201,10 +205,14 @@ export const MenuManagement: React.FC = () => {
     reload();
   };
 
-  // Categories list
-  const categories = ['TODAS', ...Array.from(new Set(items.map((i) => i.category)))];
+  // Individual catalog products only (combos are managed exclusively in Tab 3)
+  const productItems = items.filter((item) => !isComboMenuItem(item));
+  const hiddenComboDocsCount = items.length - productItems.length;
 
-  const filtered = items.filter((item) => {
+  // Categories list (excluding combos)
+  const categories = ['TODAS', ...Array.from(new Set(productItems.map((i) => i.category)))];
+
+  const filtered = productItems.filter((item) => {
     if (categoryFilter !== 'TODAS' && item.category !== categoryFilter) return false;
     if (search.trim()) {
       const q = search.toLowerCase();
@@ -227,7 +235,7 @@ export const MenuManagement: React.FC = () => {
           }`}
         >
           <Utensils className="w-4 h-4 text-[#C86D3B]" />
-          <span>1. Produtos ({items.length})</span>
+          <span>1. Produtos ({productItems.length})</span>
         </button>
 
         <button
@@ -253,7 +261,7 @@ export const MenuManagement: React.FC = () => {
           }`}
         >
           <Layers className="w-4 h-4 text-[#C86D3B]" />
-          <span>3. Combos</span>
+          <span>3. Combos ({combosCount})</span>
         </button>
 
         <button
@@ -329,6 +337,25 @@ export const MenuManagement: React.FC = () => {
             aria-label="Fechar aviso"
           >
             <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {hiddenComboDocsCount > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 bg-[#FFFDF9] border border-[#E8DFD5] rounded-xl text-xs text-[#8C5E47]">
+          <span className="flex items-center gap-2">
+            <Layers className="w-4 h-4 text-[#C86D3B] shrink-0" />
+            <span>
+              Os combos cadastrados ({combosCount}) são gerenciados exclusivamente na aba <strong>3. Combos</strong> para
+              evitar duplicidade.
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setActiveSection('combos')}
+            className="text-[#721C24] font-bold hover:underline cursor-pointer"
+          >
+            Abrir aba Combos
           </button>
         </div>
       )}

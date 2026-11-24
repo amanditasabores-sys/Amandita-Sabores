@@ -21,7 +21,8 @@ import {
   OrderRefundInfo,
   PublicStoreAvailability,
   StoreClosedSettings,
-  DayOperatingHours
+  DayOperatingHours,
+  LegacyComboSyncCandidate
 } from '../types';
 import { formatCurrency, getFortalezaDateKey } from '../utils/formatters';
 import { soundService } from './audio';
@@ -35,6 +36,15 @@ import {
   validateOperatingHours,
   validateWhatsAppNumber,
 } from '../utils/storeHours';
+import {
+  comboToMenuItemDocument,
+  evaluateComboAvailability,
+  hasCompleteFirestoreComboMetadata,
+  isComboMenuItem,
+  menuItemDocumentToComboBase,
+  normalizeComboComponents,
+  parseIsoTimestampMs,
+} from '../utils/comboAvailability';
 
 const roundCurrency = (value: number): number => {
   if (!Number.isFinite(value)) return 0;
@@ -131,6 +141,7 @@ class StoreService {
   private readonly pendingMenuWritesKey = 'gf_pending_menu_writes';
   private readonly menuSyncConfirmedKey = 'gf_menu_firestore_synced';
   private menuDeleteExecutorOverride: ((id: string) => Promise<void>) | null = null;
+  private menuWriteExecutorOverride: ((id: string, payload: Record<string, any>) => Promise<void>) | null = null;
   private staffSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private publicSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPublicMenuRefreshAt = 0;
@@ -333,97 +344,384 @@ class StoreService {
   }
 
   // ==========================================
-  // COMBOS API (LOCAL CACHE + FIRESTORE INTEGRATION)
+  // COMBOS API (FIRESTORE menu_items COMO FONTE OFICIAL + CACHE LOCAL gf_combos)
   // ==========================================
-  public getCombos(): Combo[] {
+  private readLocalCombosRaw(): Combo[] {
     try {
       const data = localStorage.getItem('gf_combos');
-      let combosList: Combo[] = [];
-      if (data) {
-        try {
-          const parsed = JSON.parse(data);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            combosList = parsed;
+      if (!data) return [];
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((entry) => Boolean(entry && typeof entry === 'object' && typeof entry.id === 'string' && entry.id.trim()))
+        .map((entry) => ({
+          ...(entry as Combo),
+          id: String(entry.id).trim(),
+          category: 'Combos',
+          items: normalizeComboComponents(entry.items),
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  private upsertComboInLocalCache(combo: Combo): void {
+    try {
+      const existing = this.readLocalCombosRaw();
+      const idx = existing.findIndex((c) => c.id === combo.id);
+      const storedEntry: Combo = {
+        id: combo.id,
+        name: combo.name,
+        description: combo.description,
+        imageUrl: combo.imageUrl,
+        category: 'Combos',
+        items: normalizeComboComponents(combo.items),
+        originalPrice: combo.originalPrice,
+        comboPrice: combo.comboPrice,
+        active: combo.active !== false,
+        available: combo.available,
+        featured: Boolean(combo.featured),
+        tags: combo.tags,
+        createdAt: combo.createdAt,
+        updatedAt: combo.updatedAt,
+      };
+      if (idx >= 0) {
+        existing[idx] = storedEntry;
+      } else {
+        existing.push(storedEntry);
+      }
+      localStorage.setItem('gf_combos', JSON.stringify(existing));
+    } catch (storageErr) {
+      console.warn('[Combos Cache] Falha ao atualizar cache local gf_combos:', storageErr);
+    }
+  }
+
+  private removeComboFromLocalCache(id: string): void {
+    try {
+      const existing = this.readLocalCombosRaw();
+      const filtered = existing.filter((c) => c.id !== id);
+      localStorage.setItem('gf_combos', JSON.stringify(filtered));
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  /**
+   * Sincroniza combos completos recebidos do Firestore para o cache offline `gf_combos`
+   * SEM apagar combos locais antigos e SEM sobrescrever registros locais mais recentes.
+   */
+  private mergeRemoteCombosIntoLocalCache(remoteMenuItems: MenuItem[]): boolean {
+    try {
+      const completeRemoteCombos = remoteMenuItems
+        .filter((item) => hasCompleteFirestoreComboMetadata(item) && !this.inFlightMenuDeletes.has(item.id))
+        .map((item) => menuItemDocumentToComboBase(item));
+
+      if (completeRemoteCombos.length === 0) return false;
+
+      const localList = this.readLocalCombosRaw();
+      const localMap = new Map<string, Combo>(localList.map((c) => [c.id, c]));
+      const pendingWrites = this.getPendingMenuWritesMap();
+      let changed = false;
+
+      for (const remoteCombo of completeRemoteCombos) {
+        if (pendingWrites[remoteCombo.id]) continue;
+        const existingLocal = localMap.get(remoteCombo.id);
+        if (!existingLocal) {
+          localMap.set(remoteCombo.id, remoteCombo);
+          changed = true;
+          continue;
+        }
+        const localTs = parseIsoTimestampMs(existingLocal.updatedAt);
+        const remoteTs = parseIsoTimestampMs(remoteCombo.updatedAt);
+        // Nunca sobrescrever dados locais mais recentes com versão remota mais antiga
+        if (localTs > remoteTs) {
+          continue;
+        }
+        const nextSnapshot: Combo = {
+          id: remoteCombo.id,
+          name: remoteCombo.name,
+          description: remoteCombo.description,
+          imageUrl: remoteCombo.imageUrl,
+          category: 'Combos',
+          items: remoteCombo.items,
+          originalPrice: remoteCombo.originalPrice,
+          comboPrice: remoteCombo.comboPrice,
+          active: remoteCombo.active !== false,
+          available: remoteCombo.available,
+          featured: Boolean(remoteCombo.featured),
+          tags: remoteCombo.tags,
+          createdAt: remoteCombo.createdAt || existingLocal.createdAt,
+          updatedAt: remoteCombo.updatedAt || existingLocal.updatedAt,
+        };
+        if (JSON.stringify(existingLocal) !== JSON.stringify(nextSnapshot)) {
+          localMap.set(remoteCombo.id, nextSnapshot);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        localStorage.setItem('gf_combos', JSON.stringify(Array.from(localMap.values())));
+      }
+      return changed;
+    } catch {
+      return false;
+    }
+  }
+
+  public getCombos(): Combo[] {
+    try {
+      const allMenuItems = this.getMenuItems();
+      const productItems = allMenuItems.filter((item) => !isComboMenuItem(item));
+      const catalogMap = new Map(productItems.map((i) => [i.id, i]));
+
+      const remoteComboDocs = allMenuItems.filter(
+        (item) => isComboMenuItem(item) && !this.inFlightMenuDeletes.has(item.id)
+      );
+      const localCombos = this.readLocalCombosRaw().filter((c) => !this.inFlightMenuDeletes.has(c.id));
+      const localById = new Map<string, Combo>(localCombos.map((c) => [c.id, c]));
+      const pendingWrites = this.getPendingMenuWritesMap();
+
+      const mergedById = new Map<string, Combo>();
+
+      // 1. Fonte oficial: documentos de combos sincronizados em Firestore menu_items/{combo.id}
+      for (const docItem of remoteComboDocs) {
+        const local = localById.get(docItem.id);
+        const remoteComplete = hasCompleteFirestoreComboMetadata(docItem);
+
+        if (remoteComplete) {
+          const remoteCombo = menuItemDocumentToComboBase(docItem);
+          const localTs = parseIsoTimestampMs(local?.updatedAt);
+          const remoteTs = parseIsoTimestampMs(remoteCombo.updatedAt);
+          const hasPendingLocalWrite = Boolean(pendingWrites[docItem.id]);
+
+          if (local && (hasPendingLocalWrite || localTs > remoteTs)) {
+            mergedById.set(docItem.id, {
+              ...local,
+              items: normalizeComboComponents(local.items),
+              syncSource: 'local_legacy',
+            });
+          } else {
+            mergedById.set(docItem.id, {
+              ...remoteCombo,
+              syncSource: 'firestore',
+            });
           }
-        } catch {}
+        } else if (local && normalizeComboComponents(local.items).length > 0) {
+          // Documento espelho legado em menu_items (sem comboItems ainda): preserva composição local de gf_combos
+          const localTs = parseIsoTimestampMs(local.updatedAt);
+          const remoteTs = parseIsoTimestampMs(docItem.updatedAt);
+          if (localTs >= remoteTs) {
+            mergedById.set(docItem.id, {
+              ...local,
+              items: normalizeComboComponents(local.items),
+              syncSource: 'local_legacy',
+            });
+          } else {
+            mergedById.set(docItem.id, {
+              ...menuItemDocumentToComboBase(docItem),
+              items: normalizeComboComponents(local.items),
+              originalPrice: local.originalPrice,
+              active: local.active !== false,
+              syncSource: 'local_legacy',
+            });
+          }
+        } else {
+          // Documento legado no Firestore sem composição local: nunca substitui por INITIAL_COMBOS
+          mergedById.set(docItem.id, {
+            ...menuItemDocumentToComboBase(docItem),
+            syncSource: 'firestore',
+          });
+        }
       }
 
-      if (combosList.length === 0) {
-        combosList = [...INITIAL_COMBOS];
+      // 2. Preservar combos locais em gf_combos que ainda não existem no Firestore
+      for (const local of localCombos) {
+        if (!mergedById.has(local.id)) {
+          mergedById.set(local.id, {
+            ...local,
+            items: normalizeComboComponents(local.items),
+            syncSource: 'local_legacy',
+          });
+        }
       }
 
-      // Check current availability of component items
-      const catalogItems = this.getMenuItems();
-      const catalogMap = new Map(catalogItems.map((i) => [i.id, i]));
+      // 3. Fallback inicial SOMENTE quando ainda não houve sincronização com Firestore e não há cache local
+      if (mergedById.size === 0 && !this.isMenuSyncedWithFirestore() && localCombos.length === 0) {
+        for (const fallbackCombo of INITIAL_COMBOS) {
+          mergedById.set(fallbackCombo.id, {
+            ...fallbackCombo,
+            items: normalizeComboComponents(fallbackCombo.items),
+            syncSource: 'initial_fallback',
+          });
+        }
+      }
 
-      return combosList.map((combo) => {
-        // Validate if all component items are available
-        const allComponentsAvailable = combo.items.every((comp) => {
-          const found = catalogMap.get(comp.menuItemId);
-          return found && found.available !== false;
-        });
-
-        // Calculate current reference sum of components
-        const currentSum = combo.items.reduce((acc, comp) => {
-          const found = catalogMap.get(comp.menuItemId);
-          const unit = found ? found.price : comp.originalPrice;
-          return acc + (unit * comp.quantity);
-        }, 0);
-
+      // 4. Avaliar disponibilidade real de cada combo contra os produtos do catálogo
+      return Array.from(mergedById.values()).map((combo) => {
+        const evaluation = evaluateComboAvailability(combo, catalogMap);
         return {
           ...combo,
-          originalPrice: currentSum > 0 ? currentSum : combo.originalPrice,
-          available: combo.active !== false && allComponentsAvailable,
+          items: normalizeComboComponents(combo.items),
+          originalPrice: evaluation.originalPrice,
+          available: evaluation.available,
+          availabilityStatus: evaluation.availabilityStatus,
+          missingComponents: evaluation.missingComponents,
+          pausedComponents: evaluation.pausedComponents,
+          componentStatuses: evaluation.componentStatuses,
         };
       });
     } catch {
-      return INITIAL_COMBOS;
+      return this.isMenuSyncedWithFirestore() ? [] : INITIAL_COMBOS;
     }
+  }
+
+  /**
+   * Identifica, em modo somente leitura, combos presentes no `localStorage['gf_combos']`
+   * cuja composição ainda não foi sincronizada com `menu_items/{combo.id}` no Firestore
+   * ou possui alteração local mais recente. Não grava nem exclui nada automaticamente.
+   */
+  public getLegacyCombosPendingSync(): LegacyComboSyncCandidate[] {
+    const localCombos = this.readLocalCombosRaw().filter((c) => !this.inFlightMenuDeletes.has(c.id));
+    if (localCombos.length === 0) return [];
+
+    const allMenuItems = this.getMenuItems();
+    const productItems = allMenuItems.filter((item) => !isComboMenuItem(item));
+    const catalogMap = new Map(productItems.map((i) => [i.id, i]));
+    const menuById = new Map<string, MenuItem>(allMenuItems.map((i) => [i.id, i]));
+    const pendingWrites = this.getPendingMenuWritesMap();
+
+    const candidates: LegacyComboSyncCandidate[] = [];
+
+    for (const local of localCombos) {
+      const normalizedItems = normalizeComboComponents(local.items);
+      if (normalizedItems.length === 0) continue;
+
+      const remoteDoc = menuById.get(local.id);
+      const evaluation = evaluateComboAvailability(
+        { active: local.active !== false, items: normalizedItems, originalPrice: local.originalPrice },
+        catalogMap
+      );
+      const enrichedCombo: Combo = {
+        ...local,
+        items: normalizedItems,
+        originalPrice: evaluation.originalPrice,
+        available: evaluation.available,
+        availabilityStatus: evaluation.availabilityStatus,
+        missingComponents: evaluation.missingComponents,
+        pausedComponents: evaluation.pausedComponents,
+        componentStatuses: evaluation.componentStatuses,
+        syncSource: 'local_legacy',
+      };
+
+      if (!remoteDoc) {
+        candidates.push({
+          combo: enrichedCombo,
+          reason: 'NOT_IN_FIRESTORE',
+          localUpdatedAt: local.updatedAt,
+        });
+        continue;
+      }
+
+      if (!hasCompleteFirestoreComboMetadata(remoteDoc)) {
+        candidates.push({
+          combo: enrichedCombo,
+          reason: 'MISSING_COMPOSITION_IN_FIRESTORE',
+          localUpdatedAt: local.updatedAt,
+          remoteUpdatedAt: remoteDoc.updatedAt,
+        });
+        continue;
+      }
+
+      const localTs = parseIsoTimestampMs(local.updatedAt);
+      const remoteTs = parseIsoTimestampMs(remoteDoc.updatedAt);
+      if (Boolean(pendingWrites[local.id]) || localTs > remoteTs) {
+        candidates.push({
+          combo: enrichedCombo,
+          reason: 'LOCAL_NEWER',
+          localUpdatedAt: local.updatedAt,
+          remoteUpdatedAt: remoteDoc.updatedAt,
+        });
+      }
+    }
+
+    return candidates;
+  }
+
+  public async saveComboAsync(combo: Combo): Promise<{ success: boolean; combo?: Combo; error?: string }> {
+    if (!this.canUserManageMenu()) {
+      const msg = 'Permissão insuficiente: apenas Administrador ou Gerente podem gerenciar combos.';
+      console.warn('[Security Guard] Acesso negado:', msg);
+      return { success: false, error: msg };
+    }
+
+    const trimmedId = (combo.id || '').trim();
+    if (!trimmedId || !/^[a-zA-Z0-9_\-]{1,128}$/.test(trimmedId)) {
+      return { success: false, error: 'Identificador de combo inválido para persistência no Firebase.' };
+    }
+
+    const now = new Date().toISOString();
+    const allMenuItems = this.getMenuItems();
+    const productItems = allMenuItems.filter((item) => !isComboMenuItem(item));
+    const catalogMap = new Map(productItems.map((i) => [i.id, i]));
+
+    const { menuItem, normalizedCombo } = comboToMenuItemDocument(
+      {
+        ...combo,
+        id: trimmedId,
+        updatedAt: now,
+      },
+      catalogMap,
+      now
+    );
+
+    // Atualiza cache local gf_combos preservando demais registros existentes
+    this.upsertComboInLocalCache(normalizedCombo);
+
+    // Persiste metadados completos em menu_items/{combo.id} no Cloud Firestore
+    const writeRes = await this.saveMenuItemAsync(menuItem);
+    this.notify('COMBOS_UPDATED', normalizedCombo);
+
+    if (!writeRes.success) {
+      return {
+        success: false,
+        combo: normalizedCombo,
+        error: writeRes.error || 'Falha ao confirmar gravação do combo no Cloud Firestore.',
+      };
+    }
+
+    return {
+      success: true,
+      combo: { ...normalizedCombo, syncSource: 'firestore' },
+    };
   }
 
   public saveCombo(combo: Combo): void {
+    this.saveComboAsync(combo).catch((err) => {
+      console.warn('[Combos Save] Erro ao sincronizar combo:', err);
+    });
+  }
+
+  public async deleteComboAsync(id: string): Promise<{ success: boolean; error?: string }> {
     if (!this.canUserManageMenu()) {
-      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para gerenciar combos.');
-      return;
+      const msg = 'Permissão insuficiente: apenas Administrador ou Gerente podem excluir combos.';
+      console.warn('[Security Guard] Acesso negado:', msg);
+      return { success: false, error: msg };
     }
 
-    const combos = this.getCombos();
-    const index = combos.findIndex((c) => c.id === combo.id);
-    if (index >= 0) {
-      combos[index] = { ...combo, updatedAt: new Date().toISOString() };
-    } else {
-      combos.push({ ...combo, createdAt: new Date().toISOString() });
+    const deleteRes = await this.deleteMenuItem(id);
+    if (!deleteRes.success) {
+      return deleteRes;
     }
-    localStorage.setItem('gf_combos', JSON.stringify(combos));
-    this.notify('COMBOS_UPDATED', combo);
 
-    // Also register combo in the menu items store so it is synced and visible
-    const menuItemRepresentation: MenuItem = {
-      id: combo.id,
-      name: combo.name,
-      description: combo.description,
-      category: 'Combos',
-      price: combo.comboPrice,
-      prepTimeMinutes: 20,
-      imageUrl: combo.imageUrl || 'https://images.unsplash.com/photo-1541592106381-b31e9677c0e5?auto=format&fit=crop&w=700&q=80',
-      available: combo.available && combo.active !== false,
-      featured: combo.featured,
-      tags: combo.tags || ['Combo', 'Especial'],
-      addons: [],
-    };
-    this.saveMenuItem(menuItemRepresentation);
+    this.removeComboFromLocalCache(id);
+    this.notify('COMBOS_UPDATED', { id });
+    return { success: true };
   }
 
   public deleteCombo(id: string): void {
-    if (!this.canUserManageMenu()) {
-      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para excluir combos.');
-      return;
-    }
-
-    const combos = this.getCombos().filter((c) => c.id !== id);
-    localStorage.setItem('gf_combos', JSON.stringify(combos));
-    this.deleteMenuItem(id).catch(() => {});
-    this.notify('COMBOS_UPDATED', { id });
+    this.deleteComboAsync(id).catch((err) => {
+      console.warn('[Combos Delete] Erro ao excluir combo:', err);
+    });
   }
 
   public duplicateCombo(id: string): Combo | null {
@@ -432,25 +730,88 @@ class StoreService {
     const source = combos.find((c) => c.id === id);
     if (!source) return null;
 
+    const now = new Date().toISOString();
     const newCombo: Combo = {
       ...source,
       id: `combo-${Date.now()}`,
       name: `${source.name} (Cópia)`,
-      createdAt: new Date().toISOString(),
-      updatedAt: undefined,
+      createdAt: now,
+      updatedAt: now,
     };
     this.saveCombo(newCombo);
     return newCombo;
   }
 
-  public toggleComboActive(id: string): void {
-    if (!this.canUserManageMenu()) return;
+  public async toggleComboActiveAsync(id: string): Promise<{ success: boolean; combo?: Combo; error?: string }> {
+    if (!this.canUserManageMenu()) {
+      return { success: false, error: 'Permissão insuficiente para alterar status do combo.' };
+    }
     const combos = this.getCombos();
     const target = combos.find((c) => c.id === id);
-    if (target) {
-      target.active = !target.active;
-      this.saveCombo(target);
+    if (!target) {
+      return { success: false, error: 'Combo não encontrado.' };
     }
+
+    return this.saveComboAsync({
+      ...target,
+      active: !(target.active !== false),
+    });
+  }
+
+  public toggleComboActive(id: string): void {
+    this.toggleComboActiveAsync(id).catch((err) => {
+      console.warn('[Combos Toggle] Erro ao alternar status do combo:', err);
+    });
+  }
+
+  /**
+   * Migração manual, idempotente e verificável de combos locais (`gf_combos`) para o Firestore (`menu_items/{combo.id}`).
+   * Nunca é executada automaticamente; exige ação explícita do administrador.
+   * Nunca apaga `gf_combos` e nunca sobrescreve dados remotos mais recentes.
+   */
+  public async syncLegacyLocalCombosToFirestore(comboIds?: string[]): Promise<{
+    synced: string[];
+    skipped: string[];
+    failed: Array<{ id: string; error: string }>;
+  }> {
+    if (!this.canUserManageMenu()) {
+      return {
+        synced: [],
+        skipped: [],
+        failed: [{ id: '*', error: 'Permissão insuficiente para sincronizar combos.' }],
+      };
+    }
+
+    const candidates = this.getLegacyCombosPendingSync();
+    const candidateIds = new Set(candidates.map((c) => c.combo.id));
+    const allowedSet = Array.isArray(comboIds) ? new Set(comboIds) : null;
+    const synced: string[] = [];
+    const skipped: string[] = [];
+    const failed: Array<{ id: string; error: string }> = [];
+
+    if (allowedSet) {
+      for (const requestedId of allowedSet) {
+        if (!candidateIds.has(requestedId)) {
+          skipped.push(requestedId);
+        }
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (allowedSet && !allowedSet.has(candidate.combo.id)) {
+        skipped.push(candidate.combo.id);
+        continue;
+      }
+
+      const res = await this.saveComboAsync(candidate.combo);
+      if (res.success) {
+        synced.push(candidate.combo.id);
+      } else {
+        failed.push({ id: candidate.combo.id, error: res.error || 'Falha ao gravar no Firestore.' });
+      }
+    }
+
+    return { synced, skipped, failed };
   }
 
   // ==========================================
@@ -2417,11 +2778,12 @@ class StoreService {
           ? this.menuItemCostsCache.get(entry.id)
           : existingLocal?.costPrice;
 
+      const isComboDoc = isComboMenuItem(d);
       nextMap.set(entry.id, {
         ...(d as MenuItem),
         id: entry.id,
         available: d.available !== false,
-        addons: d.addons || existingLocal?.addons || OFFICIAL_ADDONS,
+        addons: isComboDoc ? (d.addons || []) : (d.addons || existingLocal?.addons || OFFICIAL_ADDONS),
         ...(preservedCost !== undefined ? { costPrice: preservedCost } : {}),
       });
     }
@@ -2431,6 +2793,7 @@ class StoreService {
     for (const [pendingId, pendingEntry] of Object.entries(pendingWrites)) {
       if (this.inFlightMenuDeletes.has(pendingId)) continue;
       const pendingItem = pendingEntry.item;
+      const isPendingCombo = isComboMenuItem(pendingItem);
       const preservedCost =
         pendingItem.costPrice !== undefined
           ? pendingItem.costPrice
@@ -2439,7 +2802,7 @@ class StoreService {
         ...pendingItem,
         id: pendingId,
         available: pendingItem.available !== false,
-        addons: pendingItem.addons || OFFICIAL_ADDONS,
+        addons: isPendingCombo ? (pendingItem.addons || []) : (pendingItem.addons || OFFICIAL_ADDONS),
         ...(preservedCost !== undefined ? { costPrice: preservedCost } : {}),
       });
     }
@@ -2455,6 +2818,8 @@ class StoreService {
       prevJson = null;
     }
 
+    const combosCacheChanged = this.mergeRemoteCombosIntoLocalCache(nextList);
+
     if (nextJson !== prevJson) {
       try {
         localStorage.setItem('gf_menu_items', nextJson);
@@ -2462,6 +2827,10 @@ class StoreService {
         console.warn('[Firestore Public Sync] Falha ao gravar cache local do cardápio:', storageErr);
       }
       this.notify('FIRESTORE_MENU_SYNCED', { count: nextList.length });
+    }
+
+    if (combosCacheChanged) {
+      this.notify('COMBOS_UPDATED', { source: 'firestore' });
     }
   }
 
@@ -3865,17 +4234,25 @@ class StoreService {
     }
   }
 
-  public saveMenuItem(item: MenuItem): void {
+  public setMenuWriteExecutorForTest(
+    executor: ((id: string, payload: Record<string, any>) => Promise<void>) | null
+  ): void {
+    this.menuWriteExecutorOverride = executor;
+  }
+
+  public async saveMenuItemAsync(item: MenuItem): Promise<{ success: boolean; error?: string }> {
     if (!this.canUserManageMenu()) {
-      console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para gerenciar o cardápio.');
-      return;
+      const msg = 'Permissão insuficiente: apenas Administrador ou Gerente podem gerenciar o cardápio.';
+      console.warn('[Security Guard] Acesso negado:', msg);
+      return { success: false, error: msg };
     }
 
     const writeSeq = ++this.menuWriteSeq;
+    const isComboDoc = isComboMenuItem(item);
     const normalizedItem: MenuItem = {
       ...item,
       available: item.available !== false,
-      addons: item.addons || OFFICIAL_ADDONS,
+      addons: isComboDoc ? (item.addons || []) : (item.addons || OFFICIAL_ADDONS),
     };
 
     if (normalizedItem.costPrice !== undefined) {
@@ -3890,8 +4267,9 @@ class StoreService {
       items.push(normalizedItem);
     }
 
+    const hasRemoteWriter = Boolean(this.menuWriteExecutorOverride || db);
     // Track pending local write so incoming snapshots do not overwrite unsynced edits
-    if (db) {
+    if (hasRemoteWriter) {
       this.recordPendingMenuWrite(normalizedItem, writeSeq);
     }
 
@@ -3902,35 +4280,54 @@ class StoreService {
     }
     this.notify('MENU_UPDATED', normalizedItem);
 
-    // Asynchronously sync to Firestore (strictly stripping costPrice from public menu_items)
-    if (db) {
+    // Sync to Firestore (strictly stripping costPrice from public menu_items)
+    if (hasRemoteWriter) {
       const { costPrice, ...publicItem } = normalizedItem;
-      setDoc(doc(db, 'menu_items', normalizedItem.id), this.cleanForFirestore(publicItem))
-        .then(() => {
-          this.clearPendingMenuWrite(normalizedItem.id, writeSeq);
-        })
-        .catch((err) => {
-          const code = String((err as any)?.code || '');
-          const msg = String((err as any)?.message || err || '');
-          const isNetworkErr =
-            code === 'unavailable' ||
-            code === 'deadline-exceeded' ||
-            msg.toLowerCase().includes('offline') ||
-            msg.toLowerCase().includes('network');
-          if (!isNetworkErr) {
-            this.clearPendingMenuWrite(normalizedItem.id, writeSeq);
-          }
-          handleFirestoreError(err, OperationType.WRITE, `menu_items/${normalizedItem.id}`);
-        });
+      const sanitizedPayload = this.cleanForFirestore(publicItem) as Record<string, any>;
+      try {
+        if (this.menuWriteExecutorOverride) {
+          await this.menuWriteExecutorOverride(normalizedItem.id, sanitizedPayload);
+        } else if (db) {
+          await setDoc(doc(db, 'menu_items', normalizedItem.id), sanitizedPayload);
+        }
+        this.clearPendingMenuWrite(normalizedItem.id, writeSeq);
 
-      if (this.canUserManageMenu() && costPrice !== undefined) {
-        setDoc(doc(db, 'menu_item_costs', normalizedItem.id), {
-          id: normalizedItem.id,
-          costPrice,
-          updatedAt: new Date().toISOString()
-        }).catch(() => {});
+        if (!this.menuWriteExecutorOverride && db && this.canUserManageMenu() && costPrice !== undefined) {
+          setDoc(doc(db, 'menu_item_costs', normalizedItem.id), {
+            id: normalizedItem.id,
+            costPrice,
+            updatedAt: new Date().toISOString()
+          }).catch(() => {});
+        }
+        return { success: true };
+      } catch (err) {
+        const code = String((err as any)?.code || '');
+        const msg = String((err as any)?.message || err || '');
+        const isNetworkErr =
+          code === 'unavailable' ||
+          code === 'deadline-exceeded' ||
+          msg.toLowerCase().includes('offline') ||
+          msg.toLowerCase().includes('network');
+        if (!isNetworkErr) {
+          this.clearPendingMenuWrite(normalizedItem.id, writeSeq);
+        }
+        if (!this.menuWriteExecutorOverride) {
+          handleFirestoreError(err, OperationType.WRITE, `menu_items/${normalizedItem.id}`);
+        }
+        return {
+          success: false,
+          error: isNetworkErr
+            ? 'Sem conexão com o Firebase no momento. Alteração mantida localmente para sincronizar.'
+            : `Não foi possível salvar no Cloud Firestore (${code || 'erro'}): ${msg || 'tente novamente.'}`,
+        };
       }
     }
+
+    return { success: true };
+  }
+
+  public saveMenuItem(item: MenuItem): void {
+    this.saveMenuItemAsync(item).catch(() => {});
   }
 
   public setMenuDeleteExecutorForTest(executor: ((id: string) => Promise<void>) | null): void {

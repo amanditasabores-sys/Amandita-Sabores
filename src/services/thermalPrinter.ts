@@ -10,6 +10,7 @@
 
 import { Order, CustomerAddress, OrderRefundInfo } from '../types';
 import { formatCurrency, formatDateTime, getPaymentMethodLabel } from '../utils/formatters';
+import { CashClosingReportData, formatReportCurrency } from '../utils/cashClosingReport';
 
 export type PrinterPaperWidth = '58mm' | '80mm';
 export type PrinterConnectionMode = 'bluetooth_ble' | 'android_rawbt' | 'system_print';
@@ -1553,6 +1554,427 @@ class ThermalPrinterService {
       </html>
     `);
     printWindow.document.close();
+  }
+
+  // ==========================================
+  // COMPROVANTE DE FECHAMENTO / APURAÇÃO DE CAIXA
+  // ==========================================
+  private getPaperColumns(paperWidth?: PrinterPaperWidth): number {
+    const effectiveWidth = paperWidth || this.config.paperWidth;
+    return effectiveWidth === '80mm' ? 48 : 32;
+  }
+
+  private wrapMultilineText(text: string, maxLen: number, indent = ''): string[] {
+    const normalized = (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const paragraphs = normalized.split('\n');
+    const out: string[] = [];
+
+    for (const para of paragraphs) {
+      const sanitized = this.sanitizeText(
+        para
+          .replace(/\u00A0/g, ' ')
+          .replace(/[—–]/g, '-')
+      );
+      if (!sanitized.trim()) {
+        out.push('');
+        continue;
+      }
+      const words = sanitized.trim().split(/\s+/);
+      let current = indent;
+      for (const word of words) {
+        const candidate = current === indent ? indent + word : `${current} ${word}`;
+        if (candidate.length <= maxLen) {
+          current = candidate;
+        } else {
+          if (current.trim()) {
+            out.push(current);
+          }
+          // Se uma única palavra ultrapassar maxLen, fatia com segurança
+          const usable = Math.max(1, maxLen - indent.length);
+          if (word.length > usable) {
+            let pos = 0;
+            while (pos < word.length) {
+              const part = word.slice(pos, pos + usable);
+              if (pos + usable < word.length) {
+                out.push(indent + part);
+              } else {
+                current = indent + part;
+              }
+              pos += usable;
+            }
+          } else {
+            current = indent + word;
+          }
+        }
+      }
+      if (current.trim()) {
+        out.push(current);
+      }
+    }
+    return out;
+  }
+
+  private formatCashClosingPair(label: string, value: string, maxLen: number): string[] {
+    const sLabel = this.sanitizeText(label.replace(/\u00A0/g, ' ').replace(/[—–]/g, '-'));
+    const sValue = this.sanitizeText(value.replace(/\u00A0/g, ' ').replace(/[—–]/g, '-'));
+
+    if (sLabel.length + 1 + sValue.length <= maxLen) {
+      return [this.formatLine(sLabel, sValue, maxLen)];
+    }
+
+    const lines = this.wrapMultilineText(sLabel, maxLen);
+    const pad = Math.max(0, maxLen - sValue.length);
+    lines.push(' '.repeat(pad) + sValue);
+    return lines;
+  }
+
+  /**
+   * Gera o texto do demonstrativo de Fechamento e Apuração de Caixa
+   * adaptado automaticamente à largura configurada (58 mm = 32 col / 80 mm = 48 col).
+   */
+  public generateCashClosingPlainText(
+    report: CashClosingReportData,
+    options?: { paperWidth?: PrinterPaperWidth }
+  ): string {
+    const maxLen = this.getPaperColumns(options?.paperWidth);
+    const separator = '-'.repeat(maxLen);
+    const doubleSep = '='.repeat(maxLen);
+    const lines: string[] = [];
+
+    // Cabeçalho
+    lines.push(this.centerText('AMANDITA SABORES', maxLen));
+    lines.push(this.centerText(report.documentTitle.toUpperCase(), maxLen));
+    lines.push(doubleSep);
+    const bannerNormalized = this.sanitizeText(
+      report.statusBanner.toUpperCase().replace(/\u00A0/g, ' ').replace(/[—–]/g, '-')
+    );
+    if (bannerNormalized.length <= maxLen) {
+      lines.push(this.centerText(bannerNormalized, maxLen));
+    } else {
+      const bannerParts = bannerNormalized
+        .split(/\s*-\s*/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+      bannerParts.forEach((part) => {
+        lines.push(...this.wrapMultilineText(part, maxLen).map((l) => this.centerText(l, maxLen)));
+      });
+    }
+    lines.push(doubleSep);
+
+    // Dados do turno
+    lines.push(...this.wrapMultilineText(`Abertura: ${formatDateTime(report.openedAt)}`, maxLen));
+    lines.push(...this.wrapMultilineText(`Operador abertura: ${report.openedBy}`, maxLen));
+    if (report.mode === 'CLOSED_OFFICIAL' && report.closedAt) {
+      lines.push(...this.wrapMultilineText(`Fechamento: ${formatDateTime(report.closedAt)}`, maxLen));
+      if (report.closedBy) {
+        lines.push(...this.wrapMultilineText(`Operador fechamento: ${report.closedBy}`, maxLen));
+      }
+    } else {
+      lines.push(...this.wrapMultilineText(`Emissao: ${formatDateTime(report.generatedAt)}`, maxLen));
+      if (report.closedBy) {
+        lines.push(...this.wrapMultilineText(`Operador: ${report.closedBy}`, maxLen));
+      }
+    }
+    lines.push(separator);
+
+    // Apuração da gaveta (exatamente os mesmos valores da tela)
+    lines.push(...this.formatCashClosingPair('Fundo inicial de troco:', formatReportCurrency(report.initialBalance), maxLen));
+    lines.push(...this.formatCashClosingPair('Vendas em dinheiro (bruto):', `+${formatReportCurrency(report.grossCashSales)}`, maxLen));
+    if (report.cashRefunds > 0) {
+      lines.push(...this.formatCashClosingPair('Estornos em dinheiro:', `-${formatReportCurrency(report.cashRefunds)}`, maxLen));
+    }
+    lines.push(...this.formatCashClosingPair('Vendas liquidas dinheiro:', `+${formatReportCurrency(report.netCashSales)}`, maxLen));
+    lines.push(...this.formatCashClosingPair('Suprimentos adicionados:', `+${formatReportCurrency(report.totalSuprimentos)}`, maxLen));
+    lines.push(...this.formatCashClosingPair('Sangrias (retiradas):', `-${formatReportCurrency(report.totalSangrias)}`, maxLen));
+    lines.push(...this.formatCashClosingPair('Vales a funcionarios:', `-${formatReportCurrency(report.totalVales)}`, maxLen));
+    if (report.totalAjustes !== 0) {
+      const adjPrefix = report.totalAjustes > 0 ? '+' : '';
+      lines.push(...this.formatCashClosingPair('Ajustes manuais gaveta:', `${adjPrefix}${formatReportCurrency(report.totalAjustes)}`, maxLen));
+    }
+    lines.push(separator);
+
+    lines.push(...this.formatCashClosingPair('Gaveta (Dinheiro Esperado):', formatReportCurrency(report.expectedCashInDrawer), maxLen));
+    lines.push(separator);
+
+    // Meios digitais e receita líquida
+    lines.push(...this.formatCashClosingPair('Vendas PIX (bruto):', formatReportCurrency(report.grossPixSales), maxLen));
+    if (report.pixRefunds > 0) {
+      lines.push(...this.formatCashClosingPair('  Devol PIX:', `-${formatReportCurrency(report.pixRefunds)}`, maxLen));
+      lines.push(...this.formatCashClosingPair('  Liq PIX:', formatReportCurrency(report.netPixSales), maxLen));
+    }
+
+    lines.push(...this.formatCashClosingPair('Vendas Cartoes (bruto):', formatReportCurrency(report.grossCardSales), maxLen));
+    if (report.cardRefunds > 0) {
+      lines.push(...this.formatCashClosingPair('  Devol Cartoes:', `-${formatReportCurrency(report.cardRefunds)}`, maxLen));
+      lines.push(...this.formatCashClosingPair('  Liq Cartoes:', formatReportCurrency(report.netCardSales), maxLen));
+    }
+
+    lines.push(separator);
+    lines.push(...this.formatCashClosingPair('Receita Total Liquida:', formatReportCurrency(report.totalNetRevenue), maxLen));
+    lines.push(doubleSep);
+
+    // Conferência física e diferença
+    lines.push(...this.formatCashClosingPair('Dinheiro Contado Gaveta:', formatReportCurrency(report.countedCash), maxLen));
+    lines.push('Diferenca apurada:');
+    lines.push(...this.wrapMultilineText(report.differenceLabel, maxLen, '  '));
+    lines.push(separator);
+
+    // Observações de fechamento
+    lines.push('Observacoes de Fechamento:');
+    const obsText = report.closingNotes ? report.closingNotes : 'Nenhuma observacao registrada.';
+    lines.push(...this.wrapMultilineText(obsText, maxLen, '  '));
+    lines.push(separator);
+
+    lines.push(this.centerText('Amandita Sabores', maxLen));
+    return lines.join('\n');
+  }
+
+  /**
+   * Gera o payload binário ESC/POS do comprovante de Fechamento / Apuração de Caixa.
+   */
+  public generateCashClosingEscPos(
+    report: CashClosingReportData,
+    options?: { paperWidth?: PrinterPaperWidth }
+  ): Uint8Array {
+    const ESC = 0x1b;
+    const GS = 0x1d;
+    const LF = 0x0a;
+    const buffer: number[] = [];
+
+    const pushBytes = (...bytes: number[]) => buffer.push(...bytes);
+    const pushText = (text: string) => {
+      const sanitized = this.sanitizeText(text.replace(/\u00A0/g, ' '));
+      for (let i = 0; i < sanitized.length; i++) {
+        buffer.push(sanitized.charCodeAt(i));
+      }
+      buffer.push(LF);
+    };
+
+    const maxLen = this.getPaperColumns(options?.paperWidth);
+    const plainLines = this.generateCashClosingPlainText(report, options).split('\n');
+
+    // Reset da impressora + Tabela CP860 (Português) + Alinhamento esquerda
+    pushBytes(ESC, 0x40);
+    pushBytes(ESC, 0x74, 0x02);
+    pushBytes(ESC, 0x61, 0x00);
+
+    plainLines.forEach((line, idx) => {
+      const isStrongLine =
+        idx <= 1 ||
+        line.includes('CONFERENCIA DE FECHAMENTO') ||
+        line.includes('TURNO ABERTO') ||
+        line.includes('FECHAMENTO OFICIAL') ||
+        line.includes('CAIXA FECHADO') ||
+        line.startsWith('Gaveta (Dinheiro') ||
+        line.startsWith('Receita Total Liquida') ||
+        line.startsWith('Dinheiro Contado Gaveta') ||
+        line.startsWith('Diferenca apurada');
+
+      if (isStrongLine) {
+        pushBytes(ESC, 0x45, 0x01); // Negrito ON
+        pushText(line);
+        pushBytes(ESC, 0x45, 0x00); // Negrito OFF
+      } else {
+        pushText(line);
+      }
+    });
+
+    // Avanço de papel
+    pushBytes(ESC, 0x64, 0x04);
+
+    // Corte de papel (se habilitado nas configurações da impressora)
+    if (this.config.cutPaper) {
+      pushBytes(GS, 0x56, 0x41, 0x00);
+    }
+
+    // Evita variável não usada caso maxLen seja necessário em extensões
+    void maxLen;
+
+    return new Uint8Array(buffer);
+  }
+
+  /**
+   * Imprime o demonstrativo de fechamento/conferência de caixa usando exatamente
+   * o modo e a largura configurados na impressora térmica (BLE, RawBT ou Spooler).
+   * Operação estritamente somente leitura: não altera turnos, pedidos nem histórico.
+   */
+  public async printCashClosingReceipt(
+    report: CashClosingReportData,
+    options?: {
+      mode?: PrinterConnectionMode;
+      paperWidth?: PrinterPaperWidth;
+    }
+  ): Promise<{ success: boolean; message: string; printMode: PrinterConnectionMode }> {
+    const targetMode = options?.mode || this.config.connectionMode;
+    const effectiveWidth = options?.paperWidth || this.config.paperWidth;
+
+    this.isPrinting = true;
+    this.lastError = null;
+    this.notifyStatus();
+
+    try {
+      // MODO 1: WEB BLUETOOTH BLE
+      if (targetMode === 'bluetooth_ble') {
+        const escposBytes = this.generateCashClosingEscPos(report, { paperWidth: effectiveWidth });
+        const bleResult = await this.sendEscPosOverBluetooth(escposBytes);
+
+        if (!bleResult.success) {
+          this.isPrinting = false;
+          this.lastError = bleResult.message || 'Impressora Bluetooth desconectada.';
+          this.notifyStatus();
+          return {
+            success: false,
+            message: `Impressão via Bluetooth falhou: ${bleResult.message || 'Impressora desconectada'}. Verifique se a impressora está ligada e conectada em Configurações > Impressora.`,
+            printMode: 'bluetooth_ble',
+          };
+        }
+
+        this.isPrinting = false;
+        this.lastPrintedAt = new Date().toISOString();
+        this.notifyStatus();
+        return {
+          success: true,
+          message:
+            report.mode === 'OPEN_PREVIEW'
+              ? 'Conferência de fechamento impressa via Bluetooth BLE!'
+              : 'Espelho de fechamento de caixa impresso via Bluetooth BLE!',
+          printMode: 'bluetooth_ble',
+        };
+      }
+
+      // MODO 2: ANDROID RAWBT INTENT (Bluetooth Classic SPP)
+      if (targetMode === 'android_rawbt') {
+        const escposBytes = this.generateCashClosingEscPos(report, { paperWidth: effectiveWidth });
+        this.sendToAndroidRawBT(escposBytes);
+        this.isPrinting = false;
+        this.lastPrintedAt = new Date().toISOString();
+        this.notifyStatus();
+        return {
+          success: true,
+          message:
+            report.mode === 'OPEN_PREVIEW'
+              ? 'Conferência de fechamento enviada para o aplicativo Android RawBT!'
+              : 'Espelho de fechamento de caixa enviado para o aplicativo Android RawBT!',
+          printMode: 'android_rawbt',
+        };
+      }
+
+      // MODO 3: SPOOLER DO SISTEMA / NAVEGADOR (58 mm ou 80 mm)
+      const receiptText = this.generateCashClosingPlainText(report, { paperWidth: effectiveWidth });
+      this.printCashClosingViaSystemSpooler(report, receiptText, effectiveWidth);
+      this.isPrinting = false;
+      this.lastPrintedAt = new Date().toISOString();
+      this.notifyStatus();
+      return {
+        success: true,
+        message: `Comprovante de caixa aberto no spooler de impressão (${effectiveWidth}).`,
+        printMode: 'system_print',
+      };
+    } catch (err: any) {
+      this.isPrinting = false;
+      this.lastError = err?.message || String(err);
+      this.notifyStatus();
+      return {
+        success: false,
+        message: `Falha ao imprimir comprovante de caixa: ${err?.message || err}`,
+        printMode: targetMode,
+      };
+    }
+  }
+
+  private printCashClosingViaSystemSpooler(
+    report: CashClosingReportData,
+    receiptText: string,
+    paperWidth: PrinterPaperWidth
+  ): void {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const widthCss = paperWidth === '80mm' ? '80mm' : '58mm';
+    const fontSizeCss = paperWidth === '80mm' ? '12px' : '11px';
+    const safeTitle = `${report.documentTitle} - ${widthCss}`.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const safeBody = receiptText.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>${safeTitle}</title>
+          <meta charset="utf-8">
+          <style>
+            @page {
+              size: ${widthCss} auto;
+              margin: 0mm;
+            }
+            body {
+              font-family: 'Courier New', Courier, monospace;
+              font-size: ${fontSizeCss};
+              line-height: 1.25;
+              color: #000;
+              background: #fff;
+              margin: 0;
+              padding: 2mm 3mm;
+              width: ${widthCss};
+              max-width: ${widthCss};
+              box-sizing: border-box;
+            }
+            pre {
+              white-space: pre-wrap;
+              word-wrap: break-word;
+              margin: 0;
+              font-family: inherit;
+              font-size: inherit;
+            }
+          </style>
+        </head>
+        <body>
+          <pre>${safeBody}</pre>
+          <script>
+            window.onload = function() {
+              window.print();
+              setTimeout(function() { window.close(); }, 500);
+            };
+          </script>
+        </body>
+      </html>
+    `;
+
+    const printWindow = window.open('', '_blank', 'width=420,height=640');
+    if (printWindow) {
+      printWindow.document.write(html);
+      printWindow.document.close();
+      return;
+    }
+
+    // Fallback seguro sem pop-up (ex.: PWA instalado / bloqueador de pop-up): iframe oculto
+    const iframe = document.createElement('iframe');
+    iframe.style.position = 'fixed';
+    iframe.style.right = '0';
+    iframe.style.bottom = '0';
+    iframe.style.width = '0';
+    iframe.style.height = '0';
+    iframe.style.border = '0';
+    document.body.appendChild(iframe);
+
+    const frameDoc = iframe.contentWindow?.document;
+    if (frameDoc) {
+      frameDoc.open();
+      frameDoc.write(html.replace('setTimeout(function() { window.close(); }, 500);', ''));
+      frameDoc.close();
+      setTimeout(() => {
+        try {
+          iframe.contentWindow?.focus();
+          iframe.contentWindow?.print();
+        } catch {
+          // ignore
+        } finally {
+          setTimeout(() => {
+            if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+          }, 1500);
+        }
+      }, 250);
+    } else if (iframe.parentNode) {
+      iframe.parentNode.removeChild(iframe);
+    }
   }
 }
 
