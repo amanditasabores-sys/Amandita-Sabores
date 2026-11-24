@@ -24,7 +24,7 @@ export default defineConfig(({ mode }) => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        injectRegister: 'auto',
+        injectRegister: null,
         includeAssets: [
           'favicon.ico',
           'favicon-32x32.png',
@@ -71,13 +71,36 @@ export default defineConfig(({ mode }) => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          navigateFallback: '/index.html',
+          // Precache hashed JS/CSS and static assets for offline reliability,
+          // while keeping HTML navigations out of static precache so index.html
+          // is always checked against the network first on deploy.
+          globPatterns: ['**/*.{js,css,ico,png,svg,woff,woff2}'],
+          navigateFallback: null,
+          cleanupOutdatedCaches: true,
+          skipWaiting: true,
+          clientsClaim: true,
           importScripts: ['/push-worker.js'],
           maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
-          // Strictly avoid intercepting backend APIs and internal routes
-          navigateFallbackDenylist: [/^\/api\//, /^\/__/],
           runtimeCaching: [
+            {
+              // NetworkFirst for HTML navigations: loads fresh index.html on deploy when online,
+              // and falls back to cached shell when offline (ignoring query params like ?view=admin).
+              urlPattern: ({ request, url }) =>
+                request.mode === 'navigate' &&
+                !url.pathname.startsWith('/api/') &&
+                !url.pathname.startsWith('/__'),
+              handler: 'NetworkFirst',
+              options: {
+                cacheName: 'amandita-html-navigation',
+                networkTimeoutSeconds: 4,
+                matchOptions: {
+                  ignoreSearch: true,
+                },
+                cacheableResponse: {
+                  statuses: [200],
+                },
+              },
+            },
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
