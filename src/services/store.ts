@@ -123,6 +123,14 @@ class StoreService {
   private inFlightOrderDeletes = new Set<string>();
   private pendingOrderRewrites = new Set<string>();
   private orderWriteChains = new Map<string, Promise<any>>();
+  private hasReceivedFirestoreMenu = false;
+  private inFlightMenuWrites = new Map<string, { item: MenuItem; seq: number }>();
+  private inFlightMenuDeletes = new Set<string>();
+  private menuWriteSeq = 0;
+  private menuItemCostsCache = new Map<string, number>();
+  private readonly pendingMenuWritesKey = 'gf_pending_menu_writes';
+  private readonly menuSyncConfirmedKey = 'gf_menu_firestore_synced';
+  private menuDeleteExecutorOverride: ((id: string) => Promise<void>) | null = null;
   private staffSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private publicSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPublicMenuRefreshAt = 0;
@@ -414,7 +422,7 @@ class StoreService {
 
     const combos = this.getCombos().filter((c) => c.id !== id);
     localStorage.setItem('gf_combos', JSON.stringify(combos));
-    this.deleteMenuItem(id);
+    this.deleteMenuItem(id).catch(() => {});
     this.notify('COMBOS_UPDATED', { id });
   }
 
@@ -1846,13 +1854,14 @@ class StoreService {
     try {
       // Menu items robust preservation check
       const currentMenuData = localStorage.getItem('gf_menu_items');
+      const isMenuFirestoreSynced = localStorage.getItem(this.menuSyncConfirmedKey) === '1';
       let needsMenuInit = false;
       if (!currentMenuData) {
-        needsMenuInit = true;
+        needsMenuInit = !isMenuFirestoreSynced;
       } else {
         try {
           const parsed = JSON.parse(currentMenuData);
-          if (!Array.isArray(parsed) || parsed.length === 0 || currentMenuData.includes('Smash Burger')) {
+          if (!Array.isArray(parsed) || (!isMenuFirestoreSynced && parsed.length === 0) || currentMenuData.includes('Smash Burger')) {
             needsMenuInit = true;
           }
         } catch {
@@ -2272,50 +2281,187 @@ class StoreService {
     }, delayMs);
   }
 
-  private applyRemoteMenuItems(remoteDocs: Array<{ id: string; data: Partial<MenuItem> }>): void {
-    if (!Array.isArray(remoteDocs) || remoteDocs.length === 0) return;
-
-    const currentList = this.getMenuItems();
-    const currentMap = new Map<string, MenuItem>();
-    for (const it of currentList) {
-      currentMap.set(it.id, it);
+  private isMenuSyncedWithFirestore(): boolean {
+    if (this.hasReceivedFirestoreMenu) return true;
+    try {
+      return localStorage.getItem(this.menuSyncConfirmedKey) === '1';
+    } catch {
+      return false;
     }
+  }
 
-    let validRemoteCount = 0;
-    for (const entry of remoteDocs) {
-      const d = entry.data;
-      if (entry.id && d && d.name) {
-        validRemoteCount++;
-        const base = currentMap.get(entry.id);
-        currentMap.set(entry.id, {
-          ...(base || {}),
-          ...d,
-          id: entry.id,
-          available: d.available !== false,
-        } as MenuItem);
-      }
+  private markMenuSyncedWithFirestore(): void {
+    this.hasReceivedFirestoreMenu = true;
+    try {
+      localStorage.setItem(this.menuSyncConfirmedKey, '1');
+    } catch {
+      // ignore storage errors
     }
+  }
 
-    if (validRemoteCount === 0) return;
-
-    const merged = Array.from(currentMap.values());
-    if (merged.length > 0) {
-      const nextJson = JSON.stringify(merged);
-      let prevJson: string | null = null;
-      try {
-        prevJson = localStorage.getItem('gf_menu_items');
-      } catch {
-        prevJson = null;
-      }
-
-      if (nextJson !== prevJson) {
-        try {
-          localStorage.setItem('gf_menu_items', nextJson);
-        } catch (storageErr) {
-          console.warn('[Firestore Public Sync] Falha ao gravar cache local do cardápio:', storageErr);
+  private getPendingMenuWritesMap(): Record<string, { item: MenuItem; updatedAt: string }> {
+    const result: Record<string, { item: MenuItem; updatedAt: string }> = {};
+    try {
+      const raw = localStorage.getItem(this.pendingMenuWritesKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const [id, entry] of Object.entries(parsed as Record<string, any>)) {
+            if (entry && entry.item && entry.item.id === id) {
+              result[id] = {
+                item: entry.item as MenuItem,
+                updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : new Date().toISOString(),
+              };
+            }
+          }
         }
-        this.notify('FIRESTORE_MENU_SYNCED', { count: merged.length });
       }
+    } catch {
+      // ignore parse errors
+    }
+    for (const [id, inFlight] of this.inFlightMenuWrites.entries()) {
+      result[id] = {
+        item: inFlight.item,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    return result;
+  }
+
+  private getPendingMenuWrites(): MenuItem[] {
+    return Object.values(this.getPendingMenuWritesMap()).map((entry) => entry.item);
+  }
+
+  private recordPendingMenuWrite(item: MenuItem, seq: number): void {
+    this.inFlightMenuWrites.set(item.id, { item, seq });
+    try {
+      const current = this.getPendingMenuWritesMap();
+      current[item.id] = { item, updatedAt: new Date().toISOString() };
+      localStorage.setItem(this.pendingMenuWritesKey, JSON.stringify(current));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+
+  private clearPendingMenuWrite(id: string, expectedSeq?: number): void {
+    const inFlight = this.inFlightMenuWrites.get(id);
+    if (expectedSeq !== undefined && inFlight && inFlight.seq !== expectedSeq) {
+      return;
+    }
+    this.inFlightMenuWrites.delete(id);
+    try {
+      const raw = localStorage.getItem(this.pendingMenuWritesKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && id in parsed) {
+        delete parsed[id];
+        if (Object.keys(parsed).length === 0) {
+          localStorage.removeItem(this.pendingMenuWritesKey);
+        } else {
+          localStorage.setItem(this.pendingMenuWritesKey, JSON.stringify(parsed));
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  private applyRemoteMenuItems(
+    remoteDocs: Array<{ id: string; data: Partial<MenuItem> }>,
+    options?: { fromServer?: boolean; isConfirmedEmpty?: boolean }
+  ): void {
+    if (!Array.isArray(remoteDocs)) return;
+
+    const validRemoteDocs = remoteDocs.filter((entry) => Boolean(entry?.id && entry?.data && entry.data.name));
+    const isConfirmedServerEmpty = Boolean(
+      validRemoteDocs.length === 0 &&
+      remoteDocs.length === 0 &&
+      options?.fromServer === true &&
+      options?.isConfirmedEmpty === true
+    );
+
+    // Never wipe local catalog on empty/invalid snapshots unless the server explicitly confirmed empty
+    if (validRemoteDocs.length === 0 && !isConfirmedServerEmpty) {
+      return;
+    }
+
+    // Preserve local confidential costPrice and addons metadata without re-injecting INITIAL_MENU
+    const existingById = new Map<string, MenuItem>();
+    try {
+      const rawLocal = localStorage.getItem('gf_menu_items');
+      if (rawLocal) {
+        const parsedLocal = JSON.parse(rawLocal);
+        if (Array.isArray(parsedLocal)) {
+          for (const it of parsedLocal) {
+            if (it && it.id) {
+              existingById.set(it.id, it as MenuItem);
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore parse errors
+    }
+
+    const nextMap = new Map<string, MenuItem>();
+
+    // 1. Authoritative remote catalog from Firestore (exclusions on other devices are reflected)
+    for (const entry of validRemoteDocs) {
+      if (this.inFlightMenuDeletes.has(entry.id)) {
+        continue;
+      }
+      const d = entry.data;
+      const existingLocal = existingById.get(entry.id);
+      const preservedCost =
+        this.menuItemCostsCache.has(entry.id)
+          ? this.menuItemCostsCache.get(entry.id)
+          : existingLocal?.costPrice;
+
+      nextMap.set(entry.id, {
+        ...(d as MenuItem),
+        id: entry.id,
+        available: d.available !== false,
+        addons: d.addons || existingLocal?.addons || OFFICIAL_ADDONS,
+        ...(preservedCost !== undefined ? { costPrice: preservedCost } : {}),
+      });
+    }
+
+    // 2. Protect legitimate unsynced local menu writes so they are not lost before reaching Firestore
+    const pendingWrites = this.getPendingMenuWritesMap();
+    for (const [pendingId, pendingEntry] of Object.entries(pendingWrites)) {
+      if (this.inFlightMenuDeletes.has(pendingId)) continue;
+      const pendingItem = pendingEntry.item;
+      const preservedCost =
+        pendingItem.costPrice !== undefined
+          ? pendingItem.costPrice
+          : this.menuItemCostsCache.get(pendingId);
+      nextMap.set(pendingId, {
+        ...pendingItem,
+        id: pendingId,
+        available: pendingItem.available !== false,
+        addons: pendingItem.addons || OFFICIAL_ADDONS,
+        ...(preservedCost !== undefined ? { costPrice: preservedCost } : {}),
+      });
+    }
+
+    this.markMenuSyncedWithFirestore();
+
+    const nextList = Array.from(nextMap.values());
+    const nextJson = JSON.stringify(nextList);
+    let prevJson: string | null = null;
+    try {
+      prevJson = localStorage.getItem('gf_menu_items');
+    } catch {
+      prevJson = null;
+    }
+
+    if (nextJson !== prevJson) {
+      try {
+        localStorage.setItem('gf_menu_items', nextJson);
+      } catch (storageErr) {
+        console.warn('[Firestore Public Sync] Falha ao gravar cache local do cardápio:', storageErr);
+      }
+      this.notify('FIRESTORE_MENU_SYNCED', { count: nextList.length });
     }
   }
 
@@ -2324,13 +2470,14 @@ class StoreService {
     this.lastPublicMenuRefreshAt = Date.now();
     try {
       const serverSnap = await getDocsFromServer(collection(db, 'menu_items'));
-      if (!serverSnap.empty) {
-        const remoteDocs: Array<{ id: string; data: Partial<MenuItem> }> = [];
-        serverSnap.forEach((docSnap) => {
-          remoteDocs.push({ id: docSnap.id, data: docSnap.data() as Partial<MenuItem> });
-        });
-        this.applyRemoteMenuItems(remoteDocs);
-      }
+      const remoteDocs: Array<{ id: string; data: Partial<MenuItem> }> = [];
+      serverSnap.forEach((docSnap) => {
+        remoteDocs.push({ id: docSnap.id, data: docSnap.data() as Partial<MenuItem> });
+      });
+      this.applyRemoteMenuItems(remoteDocs, {
+        fromServer: true,
+        isConfirmedEmpty: serverSnap.empty,
+      });
     } catch (error: any) {
       const code = String(error?.code || '');
       const msg = String(error?.message || error || '');
@@ -2381,12 +2528,16 @@ class StoreService {
       const unsubMenu = onSnapshot(
         collection(db, 'menu_items'),
         (snapshot) => {
-          if (!snapshot.empty) {
-            const remoteDocs: Array<{ id: string; data: Partial<MenuItem> }> = [];
-            snapshot.forEach((docSnap) => {
-              remoteDocs.push({ id: docSnap.id, data: docSnap.data() as Partial<MenuItem> });
+          const isFromServer = !snapshot.metadata?.fromCache;
+          const remoteDocs: Array<{ id: string; data: Partial<MenuItem> }> = [];
+          snapshot.forEach((docSnap) => {
+            remoteDocs.push({ id: docSnap.id, data: docSnap.data() as Partial<MenuItem> });
+          });
+          if (remoteDocs.length > 0 || (snapshot.empty && isFromServer)) {
+            this.applyRemoteMenuItems(remoteDocs, {
+              fromServer: isFromServer,
+              isConfirmedEmpty: snapshot.empty && isFromServer,
             });
-            this.applyRemoteMenuItems(remoteDocs);
           }
         },
         (error: any) => {
@@ -2820,6 +2971,7 @@ class StoreService {
                 const data = docSnap.data();
                 if (typeof data.costPrice === 'number') {
                   costsMap.set(docSnap.id, data.costPrice);
+                  this.menuItemCostsCache.set(docSnap.id, data.costPrice);
                 }
               });
 
@@ -2833,7 +2985,11 @@ class StoreService {
               }
 
               if (updated) {
-                localStorage.setItem('gf_menu_items', JSON.stringify(items));
+                try {
+                  localStorage.setItem('gf_menu_items', JSON.stringify(items));
+                } catch (storageErr) {
+                  console.warn('[Firestore Staff Sync] Falha ao atualizar cache local de custos:', storageErr);
+                }
                 this.notify('MENU_UPDATED', {});
               }
             }
@@ -3504,11 +3660,12 @@ class StoreService {
       }
 
       // 2. Migrate Menu Items with deduplication and costPrice protection
-      const menuItems = this.getMenuItems();
-      for (const item of menuItems) {
-        const itemRef = doc(db, 'menu_items', item.id);
-        const itemSnap = await getDoc(itemRef);
-        if (!itemSnap.exists()) {
+      // Safety: if /menu_items is already populated in Firestore, NEVER re-create deleted INITIAL_MENU items.
+      const existingRemoteMenuSnap = await getDocs(collection(db, 'menu_items'));
+      if (existingRemoteMenuSnap.empty) {
+        const menuItems = this.getMenuItems();
+        for (const item of menuItems) {
+          const itemRef = doc(db, 'menu_items', item.id);
           const { costPrice, ...publicItem } = item;
           await setDoc(itemRef, this.cleanForFirestore(publicItem));
           if (costPrice !== undefined) {
@@ -3518,10 +3675,32 @@ class StoreService {
               updatedAt: new Date().toISOString()
             }, { merge: true }).catch(() => {});
           }
+          this.clearPendingMenuWrite(item.id);
           menuCount++;
-        } else {
-          skippedCount++;
         }
+      } else {
+        const initialMenuIds = new Set(INITIAL_MENU.map((i) => i.id));
+        const remoteMenuIds = new Set(existingRemoteMenuSnap.docs.map((d) => d.id));
+        const pendingLocalWrites = this.getPendingMenuWrites();
+        for (const item of pendingLocalWrites) {
+          if (!remoteMenuIds.has(item.id) && !initialMenuIds.has(item.id)) {
+            const itemRef = doc(db, 'menu_items', item.id);
+            const { costPrice, ...publicItem } = item;
+            await setDoc(itemRef, this.cleanForFirestore(publicItem));
+            if (costPrice !== undefined) {
+              await setDoc(doc(db, 'menu_item_costs', item.id), {
+                id: item.id,
+                costPrice,
+                updatedAt: new Date().toISOString()
+              }, { merge: true }).catch(() => {});
+            }
+            this.clearPendingMenuWrite(item.id);
+            menuCount++;
+          } else {
+            skippedCount++;
+          }
+        }
+        skippedCount += remoteMenuIds.size;
       }
       // Migrate and cleanse any legacy items on Firestore
       await this.migrateAndCleanseLegacyMenuItemCosts();
@@ -3621,43 +3800,68 @@ class StoreService {
   public getMenuItems(): MenuItem[] {
     try {
       const data = localStorage.getItem('gf_menu_items');
-      const itemMap = new Map<string, MenuItem>();
+      const isSynced = this.isMenuSyncedWithFirestore();
+      const pendingWrites = this.getPendingMenuWritesMap();
 
-      // 1. Seed with full official catalog (72 items from INITIAL_MENU)
-      for (const item of INITIAL_MENU) {
-        itemMap.set(item.id, {
-          ...item,
-          available: item.available !== false,
-          addons: item.addons || OFFICIAL_ADDONS,
-        });
-      }
-
-      // 2. Overlay any locally saved or updated items
-      if (data) {
+      if (data !== null) {
         try {
           const parsed = JSON.parse(data);
           if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              if (item && item.id) {
-                const base = itemMap.get(item.id);
-                itemMap.set(item.id, {
-                  ...(base || {}),
-                  ...item,
-                  available: item.available !== false,
-                  addons: item.addons || base?.addons || OFFICIAL_ADDONS,
-                });
+            if (parsed.length > 0 || isSynced) {
+              const itemMap = new Map<string, MenuItem>();
+              for (const item of parsed) {
+                if (item && item.id) {
+                  const cachedCost = this.menuItemCostsCache.get(item.id);
+                  itemMap.set(item.id, {
+                    ...item,
+                    available: item.available !== false,
+                    addons: item.addons || OFFICIAL_ADDONS,
+                    ...(item.costPrice !== undefined
+                      ? { costPrice: item.costPrice }
+                      : cachedCost !== undefined
+                        ? { costPrice: cachedCost }
+                        : {}),
+                  });
+                }
               }
+              for (const [pendingId, pendingEntry] of Object.entries(pendingWrites)) {
+                if (!this.inFlightMenuDeletes.has(pendingId)) {
+                  const pendingItem = pendingEntry.item;
+                  itemMap.set(pendingId, {
+                    ...pendingItem,
+                    id: pendingId,
+                    available: pendingItem.available !== false,
+                    addons: pendingItem.addons || OFFICIAL_ADDONS,
+                  });
+                }
+              }
+              return Array.from(itemMap.values());
             }
           }
         } catch {
-          // fallback
+          // Corrupted local cache falls back below
         }
       }
 
-      const mergedList = Array.from(itemMap.values());
-      return mergedList;
+      // If Firestore already confirmed this session's menu (e.g. confirmed empty), never resurrect INITIAL_MENU
+      if (this.hasReceivedFirestoreMenu) {
+        return Object.values(pendingWrites)
+          .filter((entry) => !this.inFlightMenuDeletes.has(entry.item.id))
+          .map((entry) => ({
+            ...entry.item,
+            available: entry.item.available !== false,
+            addons: entry.item.addons || OFFICIAL_ADDONS,
+          }));
+      }
+
+      // Initial fallback ONLY when there is no valid local or remote catalog yet
+      return INITIAL_MENU.map((item) => ({
+        ...item,
+        available: item.available !== false,
+        addons: item.addons || OFFICIAL_ADDONS,
+      }));
     } catch {
-      return INITIAL_MENU;
+      return this.hasReceivedFirestoreMenu ? [] : INITIAL_MENU;
     }
   }
 
@@ -3667,25 +3871,61 @@ class StoreService {
       return;
     }
 
-    const items = this.getMenuItems();
-    const index = items.findIndex((i) => i.id === item.id);
-    if (index >= 0) {
-      items[index] = item;
-    } else {
-      items.push(item);
-    }
-    localStorage.setItem('gf_menu_items', JSON.stringify(items));
-    this.notify('MENU_UPDATED', item);
+    const writeSeq = ++this.menuWriteSeq;
+    const normalizedItem: MenuItem = {
+      ...item,
+      available: item.available !== false,
+      addons: item.addons || OFFICIAL_ADDONS,
+    };
 
-    // Asynchronously sync to Firestore
+    if (normalizedItem.costPrice !== undefined) {
+      this.menuItemCostsCache.set(normalizedItem.id, normalizedItem.costPrice);
+    }
+
+    const items = this.getMenuItems();
+    const index = items.findIndex((i) => i.id === normalizedItem.id);
+    if (index >= 0) {
+      items[index] = normalizedItem;
+    } else {
+      items.push(normalizedItem);
+    }
+
+    // Track pending local write so incoming snapshots do not overwrite unsynced edits
     if (db) {
-      const { costPrice, ...publicItem } = item;
-      setDoc(doc(db, 'menu_items', item.id), this.cleanForFirestore(publicItem)).catch((err) => {
-        handleFirestoreError(err, OperationType.WRITE, `menu_items/${item.id}`);
-      });
+      this.recordPendingMenuWrite(normalizedItem, writeSeq);
+    }
+
+    try {
+      localStorage.setItem('gf_menu_items', JSON.stringify(items));
+    } catch (storageErr) {
+      console.warn('[Menu Save] Falha ao gravar cache local do cardápio:', storageErr);
+    }
+    this.notify('MENU_UPDATED', normalizedItem);
+
+    // Asynchronously sync to Firestore (strictly stripping costPrice from public menu_items)
+    if (db) {
+      const { costPrice, ...publicItem } = normalizedItem;
+      setDoc(doc(db, 'menu_items', normalizedItem.id), this.cleanForFirestore(publicItem))
+        .then(() => {
+          this.clearPendingMenuWrite(normalizedItem.id, writeSeq);
+        })
+        .catch((err) => {
+          const code = String((err as any)?.code || '');
+          const msg = String((err as any)?.message || err || '');
+          const isNetworkErr =
+            code === 'unavailable' ||
+            code === 'deadline-exceeded' ||
+            msg.toLowerCase().includes('offline') ||
+            msg.toLowerCase().includes('network');
+          if (!isNetworkErr) {
+            this.clearPendingMenuWrite(normalizedItem.id, writeSeq);
+          }
+          handleFirestoreError(err, OperationType.WRITE, `menu_items/${normalizedItem.id}`);
+        });
+
       if (this.canUserManageMenu() && costPrice !== undefined) {
-        setDoc(doc(db, 'menu_item_costs', item.id), {
-          id: item.id,
+        setDoc(doc(db, 'menu_item_costs', normalizedItem.id), {
+          id: normalizedItem.id,
           costPrice,
           updatedAt: new Date().toISOString()
         }).catch(() => {});
@@ -3693,22 +3933,142 @@ class StoreService {
     }
   }
 
-  public deleteMenuItem(id: string): void {
+  public setMenuDeleteExecutorForTest(executor: ((id: string) => Promise<void>) | null): void {
+    this.menuDeleteExecutorOverride = executor;
+  }
+
+  public async deleteMenuItem(id: string): Promise<{ success: boolean; error?: string }> {
     if (!this.canUserManageMenu()) {
       console.warn('[Security Guard] Acesso negado: Perfil não possui permissão para excluir itens do cardápio.');
-      return;
+      return {
+        success: false,
+        error: 'Permissão insuficiente: apenas Administrador ou Gerente com acesso ao cardápio podem excluir itens.',
+      };
     }
 
-    const items = this.getMenuItems().filter((i) => i.id !== id);
-    localStorage.setItem('gf_menu_items', JSON.stringify(items));
-    this.notify('MENU_UPDATED', { id });
+    const trimmedId = (id || '').trim();
+    if (!trimmedId || !/^[a-zA-Z0-9_\-]{1,128}$/.test(trimmedId)) {
+      return {
+        success: false,
+        error: 'Identificador de item inválido para exclusão no servidor.',
+      };
+    }
 
-    // Asynchronously delete from Firestore
-    if (db) {
-      deleteDoc(doc(db, 'menu_items', id)).catch((err) => {
-        handleFirestoreError(err, OperationType.DELETE, `menu_items/${id}`);
-      });
-      deleteDoc(doc(db, 'menu_item_costs', id)).catch(() => {});
+    if (this.inFlightMenuDeletes.has(trimmedId)) {
+      return {
+        success: false,
+        error: 'Exclusão já em andamento para este item. Aguarde a confirmação do servidor.',
+      };
+    }
+
+    this.inFlightMenuDeletes.add(trimmedId);
+    try {
+      const mustConfirmRemote = Boolean(this.menuDeleteExecutorOverride || (isFirebaseReady() && db));
+
+      if (mustConfirmRemote) {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          return {
+            success: false,
+            error: 'Sem conexão com a internet. O item foi mantido; reconecte-se e tente novamente.',
+          };
+        }
+
+        if (!this.menuDeleteExecutorOverride) {
+          await this.waitForFirebaseAuthReady();
+          if (!auth?.currentUser) {
+            return {
+              success: false,
+              error: 'Sessão Firebase não autenticada ou expirada. Faça login novamente com uma conta de Administrador ou Gerente para excluir itens do cardápio.',
+            };
+          }
+        }
+
+        let deleteTimeoutId: ReturnType<typeof setTimeout> | null = null;
+        try {
+          const deletePromise = this.menuDeleteExecutorOverride
+            ? this.menuDeleteExecutorOverride(trimmedId)
+            : deleteDoc(doc(db!, 'menu_items', trimmedId));
+
+          await Promise.race([
+            deletePromise,
+            new Promise<never>((_, reject) => {
+              deleteTimeoutId = setTimeout(
+                () => reject(Object.assign(new Error('Tempo limite excedido ao aguardar confirmação do servidor.'), { code: 'deadline-exceeded' })),
+                15000
+              );
+            }),
+          ]);
+        } catch (err: any) {
+          const code = String(err?.code || '').toLowerCase();
+          const rawMsg = String(err?.message || err || '');
+          const lowerMsg = rawMsg.toLowerCase();
+
+          console.error('[Menu Delete] Falha ao excluir item no Firestore:', {
+            id: trimmedId,
+            code,
+            message: rawMsg,
+          });
+
+          if (code === 'permission-denied' || lowerMsg.includes('missing or insufficient permissions') || lowerMsg.includes('permission-denied')) {
+            return {
+              success: false,
+              error: 'Permissão negada no Firestore ao excluir o item. Verifique se sua conta possui perfil ATIVO de Administrador ou Gerente.',
+            };
+          }
+
+          if (code === 'unauthenticated' || lowerMsg.includes('unauthenticated') || lowerMsg.includes('sessão')) {
+            return {
+              success: false,
+              error: 'Sessão de autenticação inválida ou expirada. Faça login novamente e tente excluir o item.',
+            };
+          }
+
+          if (
+            code === 'unavailable' ||
+            code === 'deadline-exceeded' ||
+            lowerMsg.includes('offline') ||
+            lowerMsg.includes('network') ||
+            lowerMsg.includes('failed to fetch') ||
+            lowerMsg.includes('tempo limite')
+          ) {
+            return {
+              success: false,
+              error: 'Falha de conexão com o servidor ao excluir o item. O item foi mantido; verifique sua internet e tente novamente.',
+            };
+          }
+
+          return {
+            success: false,
+            error: `Não foi possível confirmar a exclusão no servidor: ${rawMsg || 'erro desconhecido'}.`,
+          };
+        } finally {
+          if (deleteTimeoutId) {
+            clearTimeout(deleteTimeoutId);
+          }
+        }
+
+        // Best-effort cleanup of confidential cost document (never blocks confirmed menu deletion)
+        if (!this.menuDeleteExecutorOverride && db) {
+          await deleteDoc(doc(db, 'menu_item_costs', trimmedId)).catch(() => {});
+        }
+      }
+
+      // Confirmed: remove pending write, confidential cost cache, and local menu item
+      this.clearPendingMenuWrite(trimmedId);
+      this.menuItemCostsCache.delete(trimmedId);
+
+      const remainingItems = this.getMenuItems().filter((i) => i.id !== trimmedId);
+      this.markMenuSyncedWithFirestore();
+      try {
+        localStorage.setItem('gf_menu_items', JSON.stringify(remainingItems));
+      } catch (storageErr) {
+        console.warn('[Menu Delete] Falha ao atualizar cache local após exclusão confirmada:', storageErr);
+      }
+      this.notify('MENU_UPDATED', { id: trimmedId, deleted: true });
+
+      return { success: true };
+    } finally {
+      this.inFlightMenuDeletes.delete(trimmedId);
     }
   }
 
@@ -10082,6 +10442,16 @@ class StoreService {
   }
 
   public resetToSampleData(): void {
+    this.hasReceivedFirestoreMenu = false;
+    this.inFlightMenuWrites.clear();
+    this.inFlightMenuDeletes.clear();
+    this.menuItemCostsCache.clear();
+    try {
+      localStorage.removeItem(this.menuSyncConfirmedKey);
+      localStorage.removeItem(this.pendingMenuWritesKey);
+    } catch {
+      // ignore
+    }
     localStorage.setItem('gf_menu_items', JSON.stringify(INITIAL_MENU));
     localStorage.setItem('gf_orders', JSON.stringify(INITIAL_ORDERS));
     localStorage.setItem('gf_restaurant_config', JSON.stringify(INITIAL_CONFIG));

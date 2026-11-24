@@ -42,6 +42,9 @@ export const MenuManagement: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<MenuItem | null>(null);
   const [itemToDelete, setItemToDelete] = useState<{ id: string; name: string } | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteFeedback, setDeleteFeedback] = useState<string | null>(null);
 
   // Form fields
   const [name, setName] = useState('');
@@ -115,14 +118,38 @@ export const MenuManagement: React.FC = () => {
   };
 
   const handleDelete = (id: string, itemName: string) => {
+    if (isDeleting) return;
+    setDeleteError(null);
+    setDeleteFeedback(null);
     setItemToDelete({ id, name: itemName });
   };
 
-  const executeDeleteItem = () => {
-    if (!itemToDelete) return;
-    store.deleteMenuItem(itemToDelete.id);
-    setItemToDelete(null);
-    reload();
+  const executeDeleteItem = async () => {
+    if (!itemToDelete || isDeleting) return;
+    const target = itemToDelete;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      const result = await store.deleteMenuItem(target.id);
+      if (result.success) {
+        setItemToDelete(null);
+        setDeleteError(null);
+        setDeleteFeedback(`"${target.name}" excluído do cardápio com confirmação.`);
+        reload();
+      } else {
+        setDeleteError(result.error || 'Não foi possível excluir o item do cardápio. Tente novamente.');
+        reload();
+      }
+    } catch (err) {
+      setDeleteError(
+        err instanceof Error
+          ? err.message
+          : 'Erro inesperado ao excluir o item do cardápio. Tente novamente.'
+      );
+      reload();
+    } finally {
+      setIsDeleting(false);
+    }
   };
 
   const handleAddAddon = () => {
@@ -289,6 +316,23 @@ export const MenuManagement: React.FC = () => {
         </button>
       </div>
 
+      {deleteFeedback && (
+        <div className="flex items-center justify-between gap-3 px-4 py-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800">
+          <div className="flex items-center gap-2">
+            <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-medium">{deleteFeedback}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setDeleteFeedback(null)}
+            className="p-0.5 text-emerald-600 hover:text-emerald-900 rounded"
+            aria-label="Fechar aviso"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Grid of Menu Items */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {filtered.map((item) => (
@@ -346,11 +390,16 @@ export const MenuManagement: React.FC = () => {
                   <Edit2 className="w-4 h-4" />
                 </button>
                 <button
+                  type="button"
+                  disabled={isDeleting}
                   onClick={() => handleDelete(item.id, item.name)}
-                  className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer"
-                  title="Excluir prato"
+                  className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                  title={isDeleting && itemToDelete?.id === item.id ? 'Excluindo...' : 'Excluir prato'}
                 >
                   <Trash2 className="w-4 h-4" />
+                  {isDeleting && itemToDelete?.id === item.id && (
+                    <span className="text-[10px] font-bold text-rose-600">Excluindo...</span>
+                  )}
                 </button>
               </div>
             </div>
@@ -568,13 +617,24 @@ export const MenuManagement: React.FC = () => {
       {itemToDelete && (
         <ConfirmModal
           isOpen={true}
-          title="Excluir Prato do Cardápio"
-          message={`Deseja realmente excluir "${itemToDelete.name}" do cardápio? Este item deixará de aparecer para os clientes realizarem pedidos.`}
-          confirmLabel="Excluir Prato"
+          title={isDeleting ? 'Excluindo...' : 'Excluir Prato do Cardápio'}
+          message={
+            isDeleting
+              ? `Excluindo "${itemToDelete.name}"... Aguardando confirmação do servidor.`
+              : `Deseja realmente excluir "${itemToDelete.name}" do cardápio? Este item deixará de aparecer para os clientes realizarem pedidos.`
+          }
+          confirmLabel={isDeleting ? 'Excluindo...' : 'Excluir Prato'}
           cancelLabel="Cancelar"
           isDanger={true}
+          isLoading={isDeleting}
+          errorMessage={deleteError}
           onConfirm={executeDeleteItem}
-          onCancel={() => setItemToDelete(null)}
+          onCancel={() => {
+            if (!isDeleting) {
+              setItemToDelete(null);
+              setDeleteError(null);
+            }
+          }}
         />
       )}
     </div>
