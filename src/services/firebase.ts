@@ -6,13 +6,10 @@ import {
   getDocFromServer,
   enableIndexedDbPersistence
 } from 'firebase/firestore';
-import { 
-  getAuth, 
-  Auth, 
-  GoogleAuthProvider, 
-  signInWithPopup,
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
+import {
+  getAuth,
+  Auth,
+  signInWithCustomToken,
   signOut as fbSignOut,
   onAuthStateChanged,
   User as FirebaseUser
@@ -175,8 +172,37 @@ if (hasValidConfig) {
 export const db = dbInstance;
 export const auth = authInstance;
 
+export interface TestFirebaseClientAuthBridge {
+  isReady: () => boolean;
+  getCurrentUser: () => FirebaseUser | null;
+  signInWithCustomToken: (customToken: string) => Promise<FirebaseUser>;
+  signOut: () => Promise<void>;
+  subscribeToAuthChanges: (callback: (user: FirebaseUser | null) => void) => () => void;
+  waitForAuthReady?: () => Promise<void>;
+}
+
+let testClientAuthBridge: TestFirebaseClientAuthBridge | null = null;
+
+/**
+ * Strictly test-gated hook (active ONLY when DISABLE_AUTO_LISTEN=1 and ALLOW_TEST_FIREBASE_OVERRIDES=1)
+ * to validate Custom Token client auth & session recovery end-to-end without touching production Firebase.
+ */
+export function __setTestFirebaseClientAuthBridge(bridge: TestFirebaseClientAuthBridge | null): void {
+  const procEnv = typeof process !== 'undefined' ? process.env : undefined;
+  if (!procEnv || procEnv.DISABLE_AUTO_LISTEN !== '1' || procEnv.ALLOW_TEST_FIREBASE_OVERRIDES !== '1') {
+    throw new Error('Test Firebase client auth overrides are strictly disabled outside test harness.');
+  }
+  testClientAuthBridge = bridge;
+}
+
 export function isFirebaseReady(): boolean {
+  if (testClientAuthBridge) return testClientAuthBridge.isReady();
   return Boolean(app && dbInstance && authInstance);
+}
+
+export function isFirebaseAuthAvailable(): boolean {
+  if (testClientAuthBridge) return testClientAuthBridge.isReady();
+  return Boolean(authInstance);
 }
 
 export function saveCustomFirebaseConfig(cfg: { apiKey: string; appId?: string; authDomain?: string; projectId?: string; messagingSenderId?: string; storageBucket?: string }): void {
@@ -301,38 +327,66 @@ export async function testFirestoreConnection(): Promise<{ success: boolean; mes
   }
 }
 
-export async function signInWithEmail(email: string, pass: string): Promise<FirebaseUser> {
-  if (!authInstance) {
-    throw new Error('Firebase Auth não inicializado.');
+export async function waitForFirebaseAuthStateReady(): Promise<void> {
+  if (testClientAuthBridge?.waitForAuthReady) {
+    await testClientAuthBridge.waitForAuthReady();
+    return;
   }
-  const creds = await signInWithEmailAndPassword(authInstance, email.trim(), pass);
+  if (authInstance && typeof (authInstance as any).authStateReady === 'function') {
+    try {
+      await (authInstance as any).authStateReady();
+    } catch {
+      // non-fatal
+    }
+  }
+}
+
+export async function signInWithFirebaseCustomToken(customToken: string): Promise<FirebaseUser> {
+  const cleanToken = typeof customToken === 'string' ? customToken.trim() : '';
+  if (!cleanToken) {
+    throw new Error('Token de autenticação inválido ou vazio.');
+  }
+  if (testClientAuthBridge) {
+    return testClientAuthBridge.signInWithCustomToken(cleanToken);
+  }
+  if (!authInstance) {
+    throw new Error('Firebase Auth não inicializado neste dispositivo.');
+  }
+  const creds = await signInWithCustomToken(authInstance, cleanToken);
   return creds.user;
 }
 
-export async function createUserWithEmail(email: string, pass: string): Promise<FirebaseUser> {
-  if (!authInstance) {
-    throw new Error('Firebase Auth não inicializado.');
+export async function getFirebaseIdToken(forceRefresh = false): Promise<string | null> {
+  await waitForFirebaseAuthStateReady();
+  const current = getCurrentFirebaseUser();
+  if (!current) return null;
+  try {
+    const token = await current.getIdToken(forceRefresh);
+    return token && token.trim() ? token : null;
+  } catch {
+    return null;
   }
-  const creds = await createUserWithEmailAndPassword(authInstance, email.trim(), pass);
-  return creds.user;
 }
 
 export function getCurrentFirebaseUser(): FirebaseUser | null {
+  if (testClientAuthBridge) {
+    return testClientAuthBridge.getCurrentUser();
+  }
   return authInstance?.currentUser || null;
 }
 
 export function formatFirebaseAuthError(error: unknown): string {
   if (!error) return 'Erro desconhecido na autenticação.';
-  const code = (error as any)?.code || (error instanceof Error ? error.message : String(error));
-  
-  if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) {
-    return 'E-mail ou senha incorretos no Firebase Authentication.';
+  const code = String((error as any)?.code || (error instanceof Error ? error.message : String(error)));
+
+  if (code.includes('invalid-custom-token') || code.includes('custom-token-mismatch')) {
+    return 'Token de autenticação inválido ou expirado. Tente entrar novamente.';
   }
-  if (code.includes('invalid-email')) {
-    return 'Endereço de e-mail inválido.';
+  if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) {
+    return 'Nome de login ou senha incorretos.';
   }
   if (code.includes('user-disabled')) {
-    return 'Esta conta de usuário foi desativada pelo administrador.';
+    return 'Esta conta de usuário foi bloqueada ou desativada pelo administrador.';
   }
   if (code.includes('too-many-requests')) {
     return 'Muitas tentativas consecutivas. Aguarde alguns instantes antes de tentar novamente.';
@@ -340,28 +394,46 @@ export function formatFirebaseAuthError(error: unknown): string {
   if (code.includes('network-request-failed')) {
     return 'Falha de comunicação com o servidor Firebase. Verifique sua conexão de rede.';
   }
-  if (code.includes('popup-closed-by-user')) {
-    return 'Janela de autenticação Google fechada antes da conclusão.';
-  }
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Legacy compatibility stub — Google authentication has been permanently disabled.
+ * Never authenticates or opens a Google OAuth popup.
+ */
 export async function signInWithGoogle(): Promise<FirebaseUser | null> {
-  if (!authInstance) {
-    throw new Error('Firebase Auth não inicializado.');
-  }
-  const provider = new GoogleAuthProvider();
-  const creds = await signInWithPopup(authInstance, provider);
-  return creds.user;
+  throw new Error('O login com Google foi desativado por segurança. Utilize seu nome de login e senha.');
+}
+
+/**
+ * Legacy compatibility stub — direct client email/password login has been disabled in favor of
+ * server-verified username + password with Firebase Custom Token.
+ */
+export async function signInWithEmail(_email: string, _pass: string): Promise<FirebaseUser> {
+  throw new Error('O login direto por e-mail foi desativado. Utilize seu nome de login e senha.');
+}
+
+/**
+ * Legacy compatibility stub — direct client user creation has been disabled.
+ */
+export async function createUserWithEmail(_email: string, _pass: string): Promise<FirebaseUser> {
+  throw new Error('A criação direta de conta no cliente foi desativada. Utilize o painel do Administrador.');
 }
 
 export async function signOutFirebase(): Promise<void> {
+  if (testClientAuthBridge) {
+    await testClientAuthBridge.signOut();
+    return;
+  }
   if (authInstance) {
     await fbSignOut(authInstance);
   }
 }
 
 export function subscribeToAuthChanges(callback: (user: FirebaseUser | null) => void) {
+  if (testClientAuthBridge) {
+    return testClientAuthBridge.subscribeToAuthChanges(callback);
+  }
   if (!authInstance) {
     callback(null);
     return () => {};

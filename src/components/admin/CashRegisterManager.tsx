@@ -294,6 +294,11 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
     if (isSubmittingShiftOp) return;
     setShiftActionError(null);
 
+    if (cashSyncState.status !== 'CONFIRMED') {
+      setShiftActionError('Aguardando confirmação do estado do caixa com o servidor antes de abrir um novo turno.');
+      return;
+    }
+
     const val = parseFloat(initialBalanceInput);
     if (isNaN(val) || val < 0) {
       setShiftActionError('Informe um valor de fundo inicial válido (maior ou igual a zero).');
@@ -548,18 +553,48 @@ export const CashRegisterManager: React.FC<CashRegisterManagerProps> = ({ onStat
               </button>
             </>
           ) : (
-            <button
-              onClick={() => {
-                pendingShiftIdRef.current = `shift-${Date.now()}`;
-                setShiftActionError(null);
-                setIsOpenModalActive(true);
-              }}
-              disabled={cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'}
-              className="flex items-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
-            >
-              <Unlock className="w-4 h-4" />
-              <span>{cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE' ? 'Sincronizando...' : 'Abrir Novo Caixa'}</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => {
+                  if (cashSyncState.status !== 'CONFIRMED') return;
+                  pendingShiftIdRef.current = `shift-${Date.now()}`;
+                  setShiftActionError(null);
+                  setIsOpenModalActive(true);
+                }}
+                disabled={cashSyncState.status !== 'CONFIRMED'}
+                title={
+                  cashSyncState.status === 'ERROR'
+                    ? 'Aguardando confirmação do servidor para evitar abertura de caixa duplicado.'
+                    : cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                    ? 'Aguardando sincronização inicial do caixa com o servidor.'
+                    : 'Abrir um novo turno de caixa'
+                }
+                className="flex items-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+              >
+                <Unlock className="w-4 h-4" />
+                <span>
+                  {cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE'
+                    ? 'Sincronizando...'
+                    : cashSyncState.status === 'ERROR'
+                    ? 'Aguardando reconexão...'
+                    : 'Abrir Novo Caixa'}
+                </span>
+              </button>
+
+              {cashSyncState.status === 'ERROR' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    store.refreshStaffSync().catch(() => {});
+                  }}
+                  className="flex items-center gap-1.5 px-3.5 py-2.5 bg-white hover:bg-[#F8FAFC] text-[#0F2342] border border-[#E2E8F0] rounded-xl text-xs font-bold transition cursor-pointer"
+                  title="Tentar verificar novamente o estado do caixa no servidor"
+                >
+                  <Clock className="w-4 h-4 text-[#EA580C]" />
+                  <span>Tentar reconectar</span>
+                </button>
+              )}
+            </div>
           )}
 
           <button

@@ -5,6 +5,8 @@ import {
   OrderMovementLog,
   RestaurantConfig,
   User,
+  UserStatus,
+  AppModule,
   PaymentMethod,
   CashRegisterShift,
   CashMovement,
@@ -22,7 +24,13 @@ import {
   PublicStoreAvailability,
   StoreClosedSettings,
   DayOperatingHours,
-  LegacyComboSyncCandidate
+  LegacyComboSyncCandidate,
+  AuthBootstrapStatus,
+  BootstrapAdminPayload,
+  CreateStaffPayload,
+  UpdateStaffPayload,
+  UpdateOwnCredentialsPayload,
+  AuthActionResult
 } from '../types';
 import { formatCurrency, getFortalezaDateKey } from '../utils/formatters';
 import { soundService } from './audio';
@@ -50,15 +58,17 @@ const roundCurrency = (value: number): number => {
   if (!Number.isFinite(value)) return 0;
   return Math.round((value + Number.EPSILON) * 100) / 100;
 };
-import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_USERS, INITIAL_ORDERS, OFFICIAL_ADDONS, INITIAL_COMBOS, INITIAL_DAILY_MENU } from '../data/initialData';
-import { 
-  db, 
-  auth, 
-  isFirebaseReady, 
-  testFirestoreConnection, 
-  signInWithGoogle, 
-  signInWithEmail,
-  createUserWithEmail,
+import { INITIAL_MENU, INITIAL_CONFIG, INITIAL_ORDERS, OFFICIAL_ADDONS, INITIAL_COMBOS, INITIAL_DAILY_MENU } from '../data/initialData';
+import {
+  db,
+  auth,
+  isFirebaseReady,
+  isFirebaseAuthAvailable,
+  testFirestoreConnection,
+  signInWithFirebaseCustomToken,
+  getFirebaseIdToken,
+  getCurrentFirebaseUser,
+  waitForFirebaseAuthStateReady,
   signOutFirebase,
   handleFirestoreError,
   formatFirebaseAuthError,
@@ -126,8 +136,13 @@ class StoreService {
   private broadcastChannel: BroadcastChannel | null = null;
   private publicUnsubscribers: Unsubscribe[] = [];
   private staffUnsubscribers: Unsubscribe[] = [];
+  private ordersUnsubscriber: Unsubscribe | null = null;
+  private cashShiftsUnsubscriber: Unsubscribe | null = null;
   private isPublicSyncActive = false;
   private isStaffSyncActive = false;
+  private isOrdersSyncActive = false;
+  private isCashShiftsSyncActive = false;
+  private isStaffAuxSyncActive = false;
   private isFlushingPendingQueue = false;
   private inFlightOrderWrites = new Set<string>();
   private inFlightOrderDeletes = new Set<string>();
@@ -143,8 +158,19 @@ class StoreService {
   private menuDeleteExecutorOverride: ((id: string) => Promise<void>) | null = null;
   private menuWriteExecutorOverride: ((id: string, payload: Record<string, any>) => Promise<void>) | null = null;
   private staffSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private ordersSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private cashShiftsSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private cashReconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private publicSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private ordersSyncRetryAttempt = 0;
+  private cashShiftsSyncRetryAttempt = 0;
+  private cashReconcileRetryAttempt = 0;
+  private staffSyncInitPromise: Promise<void> | null = null;
+  private activeStaffRole: UserRole | null = null;
+  private activeStaffUid: string | null = null;
+  private lastStaffRefreshAt = 0;
   private lastPublicMenuRefreshAt = 0;
+  private publicAvailabilityInFlightPromise: Promise<PublicStoreAvailability> | null = null;
   private serverAtomicPaymentTestOverride = false;
   private requireExplicitCashConfirmationTestOverride = false;
   private cashShiftSyncPromise: Promise<boolean> | null = null;
@@ -281,18 +307,14 @@ class StoreService {
     const current = this.getCurrentUser();
     if (!current) return 'unauthenticated';
     if (isFirebaseReady()) {
-      return auth?.currentUser ? 'firebase_cloud' : 'unauthenticated';
+      return getCurrentFirebaseUser() ? 'firebase_cloud' : 'unauthenticated';
     }
     return 'local_contingency';
   }
 
   private async waitForFirebaseAuthReady(): Promise<void> {
-    if (isFirebaseReady() && auth && !auth.currentUser && typeof (auth as any).authStateReady === 'function') {
-      try {
-        await (auth as any).authStateReady();
-      } catch {
-        // ignore
-      }
+    if (isFirebaseAuthAvailable()) {
+      await waitForFirebaseAuthStateReady();
     }
   }
 
@@ -1138,14 +1160,9 @@ class StoreService {
 
   private async getFirebaseAuthHeaders(forceRefresh = false): Promise<Record<string, string>> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    await this.waitForFirebaseAuthReady();
-    if (auth?.currentUser) {
-      try {
-        const idToken = await auth.currentUser.getIdToken(forceRefresh);
-        if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
-      } catch {
-        // fallback
-      }
+    const idToken = await getFirebaseIdToken(forceRefresh);
+    if (idToken) {
+      headers['Authorization'] = `Bearer ${idToken}`;
     }
     return headers;
   }
@@ -2007,70 +2024,31 @@ class StoreService {
   }
 
   /**
-   * Synchronizes the active authenticated Firebase user profile to /users/{uid}
-   * WITHOUT silently falling back to hardcoded default passwords or faking sessions.
+   * Synchronizes the active authenticated Firebase user profile from the authoritative
+   * server/Firestore record WITHOUT ever self-granting privileges or writing client roles.
    */
   public async ensureFirebaseAuthForStaff(): Promise<void> {
-    if (!isFirebaseReady() || !auth) return;
+    if (!isFirebaseAuthAvailable()) return;
 
     await this.waitForFirebaseAuthReady();
-    if (!auth.currentUser) {
+    const fbUser = getCurrentFirebaseUser();
+    if (!fbUser) {
       return;
     }
 
-    const user = this.getCurrentUser();
-    if (!user || !this.isAuthorizedStaffRole(user.role) || user.status !== 'ATIVO') return;
-
-    const fbUid = auth.currentUser.uid;
-
-    // Ensure staff profile document exists at /users/{uid} so hasActiveProfile() rule succeeds
-    try {
-      const idToken = await auth.currentUser.getIdToken();
-      if (idToken && typeof window !== 'undefined') {
-        await fetch('/api/auth/sync-profile', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify({
-            name: user.name,
-            username: user.username,
-            allowedModules: user.allowedModules,
-          }),
-        }).catch(() => {});
-      }
-    } catch {
-      // ignore network fetch error
+    const recovered = await this.recoverAuthenticatedProfile(fbUser, { allowTransientOfflinePreserve: true });
+    if (recovered.profile) {
+      this.upsertLocalUserCleanly(recovered.profile);
+      this.setCurrentUser(recovered.profile);
+      return;
     }
 
-    if (db) {
-      try {
-        const userDocRef = doc(db, 'users', fbUid);
-        const snap = await getDoc(userDocRef);
-        if (!snap.exists()) {
-          const verifiedRole = await this.verifyStaffRole(auth.currentUser);
-          if (verifiedRole) {
-            const profile: User = {
-              id: fbUid,
-              name: user.name || 'Colaborador',
-              username: user.username || 'colaborador',
-              email: auth.currentUser.email || user.email || '',
-              role: verifiedRole,
-              status: 'ATIVO',
-              allowedModules: user.allowedModules || [],
-              createdAt: user.createdAt || new Date().toISOString(),
-              lastLoginAt: new Date().toISOString(),
-              isEmailVerified: Boolean(auth.currentUser.emailVerified),
-              authProvider: user.authProvider || 'firebase_email',
-              firebaseUid: fbUid,
-            };
-            await setDoc(userDocRef, this.cleanForFirestore(profile));
-          }
-        }
-      } catch {
-        // Handled safely by caller / rules
-      }
+    if (recovered.revoked) {
+      this.activeStaffRole = null;
+      this.activeStaffUid = null;
+      this.stopStaffFirestoreSync();
+      this.setCurrentUser(null);
+      signOutFirebase().catch(() => {});
     }
   }
 
@@ -2109,7 +2087,7 @@ class StoreService {
         this.syncDailyMenuWithServer(true).catch(() => {});
         const current = this.getCurrentUser();
         if (current && this.isAuthorizedStaffRole(current.role)) {
-          this.refreshStaffSync();
+          this.refreshStaffSync().catch(() => {});
         }
       });
 
@@ -2127,69 +2105,56 @@ class StoreService {
             this.syncDailyMenuWithServer(true).catch(() => {});
             const current = this.getCurrentUser();
             if (current && this.isAuthorizedStaffRole(current.role)) {
-              this.refreshStaffSync();
+              this.refreshStaffSync().catch(() => {});
             }
           }
         });
       }
 
-      // Background heartbeat to retry pending sync queue and keep daily menu & public listener alive across all devices
+      // Background heartbeat to retry pending sync queue and keep daily menu & listeners alive across all devices
       setInterval(() => {
         this.flushPendingSyncQueue();
         if (!this.isPublicSyncActive && !this.publicSyncRetryTimer) {
           this.initPublicFirestoreSync();
         }
+        const current = this.getCurrentUser();
+        if (db && current && this.isAuthorizedStaffRole(current.role)) {
+          const roleUpper = (current.role || '').toUpperCase();
+          const needsCashListener =
+            roleUpper === 'ADMINISTRADOR' ||
+            roleUpper === 'GERENTE' ||
+            roleUpper === 'CAIXA' ||
+            roleUpper === 'ATENDENTE';
+          const missingOrders = !this.isOrdersSyncActive && !this.ordersSyncRetryTimer;
+          const missingCash = needsCashListener && !this.isCashShiftsSyncActive && !this.cashShiftsSyncRetryTimer;
+          if (missingOrders || missingCash) {
+            this.initStaffFirestoreSync().catch(() => {});
+          }
+        }
         this.syncDailyMenuWithServer().catch(() => {});
       }, 10000);
     }
 
-    // Condition staff-only listeners to authenticated Firebase Auth sessions with confirmed staff role
+    // Condition staff-only listeners to authenticated Firebase Auth sessions with confirmed active staff profile
     if (typeof window !== 'undefined') {
       subscribeToAuthChanges(async (firebaseUser) => {
         if (firebaseUser) {
           try {
-            const confirmedRole = await this.verifyStaffRole(firebaseUser);
-            if (confirmedRole) {
-              let profile: User | null = null;
-              if (db) {
-                try {
-                  const snap = await getDoc(doc(db, 'users', firebaseUser.uid));
-                  if (snap.exists()) {
-                    profile = snap.data() as User;
-                  }
-                } catch {
-                  // Fallback to local profile check if offline
-                }
-              }
-              if (!profile) {
-                const localUsers = this.getUsers();
-                const matched = localUsers.find(
-                  (u) => u.id === firebaseUser.uid || (firebaseUser.email && (u.email || '').toLowerCase() === firebaseUser.email.toLowerCase())
-                );
-                if (matched) {
-                  profile = {
-                    ...matched,
-                    id: firebaseUser.uid,
-                    firebaseUid: firebaseUser.uid,
-                    role: confirmedRole,
-                  };
-                }
-              }
-              if (profile && profile.status === 'ATIVO') {
-                this.setCurrentUser(profile);
-                await this.initStaffFirestoreSync(firebaseUser);
-                this.flushPendingSyncQueue();
-              } else {
-                this.stopStaffFirestoreSync();
-                if (isFirebaseReady()) {
-                  this.setCurrentUser(null);
-                  signOutFirebase().catch(() => {});
-                }
-              }
-            } else {
+            const recovered = await this.recoverAuthenticatedProfile(firebaseUser, { allowTransientOfflinePreserve: true });
+            if (recovered.profile && recovered.profile.status === 'ATIVO') {
+              this.activeStaffRole = recovered.profile.role;
+              this.activeStaffUid = firebaseUser.uid;
+              this.upsertLocalUserCleanly(recovered.profile);
+              this.setCurrentUser(recovered.profile);
+              await this.initStaffFirestoreSync(firebaseUser);
+              this.flushPendingSyncQueue();
+            } else if (recovered.revoked) {
+              this.activeStaffRole = null;
+              this.activeStaffUid = null;
               this.stopStaffFirestoreSync();
-              if (isFirebaseReady()) {
+              if (isFirebaseAuthAvailable()) {
                 this.setCurrentUser(null);
+                signOutFirebase().catch(() => {});
               }
             }
           } catch (e) {
@@ -2197,10 +2162,12 @@ class StoreService {
           }
         } else {
           await this.waitForFirebaseAuthReady();
-          if (auth?.currentUser) return;
+          if (getCurrentFirebaseUser()) return;
+          this.activeStaffRole = null;
+          this.activeStaffUid = null;
           this.stopStaffFirestoreSync();
-          // When Firebase is configured, never allow a stale local session without a real Firebase Auth session
-          if (isFirebaseReady()) {
+          // When Firebase Auth is configured, never allow a stale local session without a real Firebase Auth session
+          if (isFirebaseAuthAvailable()) {
             const curr = this.getCurrentUser();
             if (curr) {
               this.setCurrentUser(null);
@@ -2257,48 +2224,10 @@ class StoreService {
         }
       }
 
-      // Users and permissions migration check
-      const currentUsersData = localStorage.getItem('gf_users');
-      if (!currentUsersData || !currentUsersData.includes('allowedModules')) {
-        localStorage.setItem('gf_users', JSON.stringify(INITIAL_USERS));
-      }
-
-      // Default passwords storage for staff
-      if (!localStorage.getItem('gf_user_passwords')) {
-        const defaultPasswords: Record<string, string> = {
-          'user-admin': '123456',
-          'user-caixa': '123456',
-          'user-cozinha': '123456',
-          'user-entregador': '123456',
-          'user-gerente': '123456',
-          'user-atendente': '123456',
-        };
-        localStorage.setItem('gf_user_passwords', JSON.stringify(defaultPasswords));
-      }
-
-      // Access logs storage
+      // Etapa 2B: Preservar dados locais pré-existentes (gf_users e gf_user_passwords) sem apagar nem sobrescrever,
+      // e NUNCA criar usuários padrão ou senhas padrão ('123456') em texto puro.
       if (!localStorage.getItem('gf_access_logs')) {
-        const initialLogs: UserAccessLog[] = [
-          {
-            id: 'log-1',
-            userId: 'user-admin',
-            username: 'admin',
-            role: 'ADMINISTRADOR',
-            timestamp: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-            action: 'LOGIN_SUCESSO',
-            details: 'Acesso inicial ao Painel Administrativo Amandita Sabores',
-          },
-          {
-            id: 'log-2',
-            userId: 'user-caixa',
-            username: 'caixa',
-            role: 'CAIXA',
-            timestamp: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
-            action: 'LOGIN_SUCESSO',
-            details: 'Abertura do Caixa e Frente de Vendas PDV',
-          }
-        ];
-        localStorage.setItem('gf_access_logs', JSON.stringify(initialLogs));
+        localStorage.setItem('gf_access_logs', JSON.stringify([]));
       }
 
       // Security Isolation: Never auto-log in visitors as staff.
@@ -2308,7 +2237,7 @@ class StoreService {
       if (currUser) {
         try {
           const parsed = JSON.parse(currUser);
-          if (!parsed || !parsed.allowedModules || !parsed.role) {
+          if (!parsed || !parsed.id || !parsed.allowedModules || !parsed.role) {
             localStorage.removeItem('gf_current_user');
           }
         } catch {
@@ -2366,22 +2295,23 @@ class StoreService {
   }
 
   /**
-   * Specific role permission verifiers to enforce RBAC rules across store operations
+   * Specific role permission verifiers to enforce RBAC rules across store operations.
+   * Authorization depends strictly on the verified role, NEVER on username === 'admin' or email.
    */
   public canUserManageMenu(): boolean {
     const user = this.getCurrentUser();
-    if (!user) return false;
+    if (!user || user.status !== 'ATIVO') return false;
     const role = user.role?.toUpperCase();
-    if (role === 'ADMINISTRADOR' || user.username === 'admin') return true;
+    if (role === 'ADMINISTRADOR') return true;
     if (role === 'GERENTE' && user.allowedModules?.includes('menu')) return true;
     return false;
   }
 
   public canUserManageUsers(): boolean {
     const user = this.getCurrentUser();
-    if (!user) return false;
+    if (!user || user.status !== 'ATIVO') return false;
     const role = user.role?.toUpperCase();
-    return role === 'ADMINISTRADOR' || user.username === 'admin';
+    return role === 'ADMINISTRADOR';
   }
 
   public setServerAtomicPaymentMode(enabled: boolean): void {
@@ -2451,8 +2381,7 @@ class StoreService {
     const user = this.getCurrentUser();
     if (!user || user.status !== 'ATIVO') return false;
     const role = user.role?.toUpperCase();
-    if (role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA') return true;
-    return user.username === 'admin' && role !== 'ATENDENTE' && role !== 'COZINHA' && role !== 'ENTREGADOR';
+    return role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA';
   }
 
   public canUserConfirmPayments(user?: User | null): boolean {
@@ -2466,7 +2395,7 @@ class StoreService {
     const target = user !== undefined ? user : this.getCurrentUser();
     if (!target || target.status !== 'ATIVO') return false;
     const role = (target.role || '').toUpperCase();
-    return role === 'ADMINISTRADOR' || role === 'GERENTE' || (target.username === 'admin' && role !== 'ATENDENTE' && role !== 'CAIXA' && role !== 'COZINHA' && role !== 'ENTREGADOR');
+    return role === 'ADMINISTRADOR' || role === 'GERENTE';
   }
 
   public canUserManageConfig(user?: User | null): boolean {
@@ -2480,7 +2409,7 @@ class StoreService {
     if (!user || user.status !== 'ATIVO') return false;
     if (targetStatus === 'CANCELADO') return false;
     const role = user.role?.toUpperCase();
-    if (role === 'ADMINISTRADOR' || user.username === 'admin' || role === 'GERENTE') {
+    if (role === 'ADMINISTRADOR' || role === 'GERENTE') {
       return ['NOVO', 'EM_PREPARO', 'PRONTO', 'EM_ROTA', 'ENTREGUE'].includes(targetStatus);
     }
     if (role === 'COZINHA') {
@@ -2496,119 +2425,46 @@ class StoreService {
   }
 
   /**
-   * Safe resolution for the initial bootstrap administrator email
-   * Priority: Environment variable VITE_INITIAL_ADMIN_EMAIL, followed by owner account fallback
+   * Verifies if an authenticated Firebase User has a confirmed active staff role.
+   * Trusts ONLY Firestore /users/{uid} or authenticated server /api/auth/sync-profile.
+   * Never elevates based on email, Gmail, domain, username, or localStorage.
    */
-  public getInitialAdminEmail(): string {
-    const rawVite = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.VITE_INITIAL_ADMIN_EMAIL : undefined;
-    const rawProc = typeof process !== 'undefined' && process.env ? process.env.VITE_INITIAL_ADMIN_EMAIL : undefined;
-    return (rawVite || rawProc || 'dvrmercadinho@gmail.com').trim().toLowerCase();
-  }
+  public async verifyStaffRole(
+    firebaseUser: { uid: string; email?: string | null; getIdToken?: (forceRefresh?: boolean) => Promise<string> } | null
+  ): Promise<UserRole | null> {
+    if (!firebaseUser || !firebaseUser.uid) return null;
 
-  /**
-   * Helper to identify bootstrapped emergency administrator accounts
-   */
-  public isBootstrappedAdminEmail(email?: string | null): boolean {
-    if (!email) return false;
-    const clean = email.trim().toLowerCase();
-    const configuredAdmin = this.getInitialAdminEmail();
-    return (
-      clean === configuredAdmin ||
-      clean === 'admin@amanditasabores.com.br' ||
-      clean === 'amanditasabore@gmail.com' ||
-      clean === 'amanditasabores@gmail.com' ||
-      clean === 'dvrmercadinho@gmail.com'
-    );
-  }
-
-  /**
-   * Verifies if an authenticated Firebase User has a confirmed authorized staff role.
-   * Trusts Firestore /users/{uid} authoritatively when reachable and never auto-promotes
-   * non-bootstrap users to ADMINISTRADOR from local storage.
-   */
-  public async verifyStaffRole(firebaseUser: { uid: string; email?: string | null } | null): Promise<UserRole | null> {
-    if (!firebaseUser) return null;
-
-    // 1. Check remote Firestore users/{uid} document first (authoritative source of truth)
-    if (db) {
-      try {
-        const userDocRef = doc(db, 'users', firebaseUser.uid);
-        const userSnap = await getDoc(userDocRef);
-        if (userSnap.exists()) {
-          const remoteData = userSnap.data() as Partial<User>;
-          if (remoteData.status && remoteData.status !== 'ATIVO') {
-            return null;
-          }
-          if (remoteData.role && this.isAuthorizedStaffRole(remoteData.role)) {
-            return remoteData.role.toUpperCase() as UserRole;
-          }
-          return null;
-        }
-      } catch (err) {
-        console.warn('[Store Security] Verificação de papel no Firestore remoto falhou:', err);
-      }
-    }
-
-    // 2. Whitelisted bootstrap administrator emails (matches firestore.rules isBootstrappedAdmin())
-    if (firebaseUser.email && this.isBootstrappedAdminEmail(firebaseUser.email)) {
-      return 'ADMINISTRADOR';
-    }
-
-    // 3. Seeded Gerente account (matches firestore.rules line 530)
-    if (firebaseUser.email && firebaseUser.email.trim().toLowerCase() === 'gerente@amanditasabores.com.br') {
-      return 'GERENTE';
-    }
-
-    // 4. Local operational staff registry match (never elevates to ADMINISTRADOR via localStorage)
-    const localUsers = this.getUsers();
-    const cleanEmail = (firebaseUser.email || '').trim().toLowerCase();
-    const matched = localUsers.find(
-      (u) => u.id === firebaseUser.uid || (cleanEmail && (u.email || '').trim().toLowerCase() === cleanEmail)
-    );
-
-    if (matched) {
-      if (matched.status !== 'ATIVO') return null;
-      const roleUpper = (matched.role || '').toUpperCase();
-      if (roleUpper !== 'ADMINISTRADOR' && this.isAuthorizedStaffRole(roleUpper)) {
-        return roleUpper as UserRole;
-      }
-    }
-
-    // 5. Base operational roles for @staff.amanditasabores.com.br (matches firestore.rules line 534-537)
-    if (cleanEmail.endsWith('@staff.amanditasabores.com.br') || cleanEmail.endsWith('@amanditasabores.com.br')) {
-      const username = cleanEmail.split('@')[0].toLowerCase();
-      const byUser = localUsers.find((u) => (u.username || '').toLowerCase() === username);
-      if (byUser) {
-        if (byUser.status !== 'ATIVO') return null;
-        const roleUpper = (byUser.role || '').toUpperCase();
-        if (roleUpper !== 'ADMINISTRADOR' && this.isAuthorizedStaffRole(roleUpper)) {
-          return roleUpper as UserRole;
-        }
-      }
-      if (username.startsWith('cozinha')) return 'COZINHA';
-      if (username.startsWith('entregador')) return 'ENTREGADOR';
-      if (username.startsWith('caixa')) return 'CAIXA';
-      if (username.startsWith('atendente')) return 'ATENDENTE';
+    const recovered = await this.recoverAuthenticatedProfile(firebaseUser, { allowTransientOfflinePreserve: false });
+    if (recovered.profile && recovered.profile.status === 'ATIVO') {
+      return recovered.profile.role;
     }
 
     return null;
   }
 
   /**
-   * Synchronous check to determine if the active Firebase Auth user is a confirmed staff member
+   * Synchronous check to determine if the active Firebase Auth user is a confirmed staff member.
    */
   public isFirebaseAuthStaff(): boolean {
-    const currentFbUser = auth?.currentUser;
+    const currentFbUser = getCurrentFirebaseUser();
     if (!currentFbUser) return false;
 
-    if (currentFbUser.email && this.isBootstrappedAdminEmail(currentFbUser.email)) return true;
+    if (
+      this.activeStaffUid === currentFbUser.uid &&
+      this.activeStaffRole &&
+      this.isAuthorizedStaffRole(this.activeStaffRole)
+    ) {
+      return true;
+    }
 
-    const localUsers = this.getUsers();
-    const matched = localUsers.find(
-      (u) => u.id === currentFbUser.uid || (currentFbUser.email && u.email?.toLowerCase() === currentFbUser.email.toLowerCase())
+    const currentUser = this.getCurrentUser();
+    return Boolean(
+      currentUser &&
+      currentUser.id === currentFbUser.uid &&
+      currentUser.status === 'ATIVO' &&
+      (currentUser.provisioningState === undefined || currentUser.provisioningState === 'ACTIVE') &&
+      this.isAuthorizedStaffRole(currentUser.role)
     );
-
-    return Boolean(matched && matched.status === 'ATIVO' && this.isAuthorizedStaffRole(matched.role));
   }
 
   public initFirestoreSync(): void {
@@ -3021,384 +2877,557 @@ class StoreService {
    * 2. Confirms that the authenticated user possesses an authorized staff role.
    * Never leaks internal operational order lists to unauthenticated visitors.
    */
-  public async initStaffFirestoreSync(_firebaseUser?: unknown): Promise<void> {
-    if (!db || this.isStaffSyncActive) return;
+  private computeReconnectBackoffMs(attempt: number, baseMs = 2000, maxMs = 30000): number {
+    const safeAttempt = Math.max(1, attempt);
+    return Math.min(maxMs, baseMs * Math.pow(2, safeAttempt - 1));
+  }
 
-    await this.waitForFirebaseAuthReady();
-    if (!auth?.currentUser) {
-      console.info('[Firestore Security] Aguardando sessão real de colaborador no Firebase Auth para sincronização interna.');
-      return;
+  private detachOrdersListenerOnly(): void {
+    if (this.ordersUnsubscriber) {
+      try {
+        this.ordersUnsubscriber();
+      } catch {
+        // ignore unsubscribe error
+      }
+      this.ordersUnsubscriber = null;
+    }
+    this.isOrdersSyncActive = false;
+  }
+
+  private detachCashShiftsListenerOnly(): void {
+    if (this.cashShiftsUnsubscriber) {
+      try {
+        this.cashShiftsUnsubscriber();
+      } catch {
+        // ignore unsubscribe error
+      }
+      this.cashShiftsUnsubscriber = null;
+    }
+    this.isCashShiftsSyncActive = false;
+  }
+
+  private scheduleOrdersReconnect(needsAuthRefresh: boolean): void {
+    if (this.ordersSyncRetryTimer) {
+      clearTimeout(this.ordersSyncRetryTimer);
+      this.ordersSyncRetryTimer = null;
+    }
+    this.ordersSyncRetryAttempt = Math.min(this.ordersSyncRetryAttempt + 1, 6);
+    const delayMs = this.computeReconnectBackoffMs(this.ordersSyncRetryAttempt, 2000, 30000);
+    this.ordersSyncRetryTimer = setTimeout(() => {
+      this.ordersSyncRetryTimer = null;
+      if (!db || !this.isStaffSyncActive) return;
+      if (needsAuthRefresh) {
+        this.ensureFirebaseAuthForStaff()
+          .then(() => {
+            if (this.isStaffSyncActive) {
+              this.attachOrdersListener();
+            }
+          })
+          .catch(() => {
+            if (this.isStaffSyncActive) {
+              this.scheduleOrdersReconnect(false);
+            }
+          });
+      } else {
+        this.attachOrdersListener();
+      }
+    }, delayMs);
+  }
+
+  private scheduleCashShiftsReconnect(canAccessCash: boolean, role: string | undefined, needsAuthRefresh: boolean): void {
+    if (this.cashShiftsSyncRetryTimer) {
+      clearTimeout(this.cashShiftsSyncRetryTimer);
+      this.cashShiftsSyncRetryTimer = null;
+    }
+    this.cashShiftsSyncRetryAttempt = Math.min(this.cashShiftsSyncRetryAttempt + 1, 6);
+    const delayMs = this.computeReconnectBackoffMs(this.cashShiftsSyncRetryAttempt, 2000, 30000);
+    this.cashShiftsSyncRetryTimer = setTimeout(() => {
+      this.cashShiftsSyncRetryTimer = null;
+      if (!db || !this.isStaffSyncActive) return;
+      const reattach = () => {
+        if (!this.isStaffSyncActive) return;
+        this.attachCashShiftsListener(canAccessCash, role);
+        this.reconcileCashShiftWithServerOnSync(canAccessCash).catch(() => {});
+      };
+      if (needsAuthRefresh) {
+        this.ensureFirebaseAuthForStaff()
+          .then(reattach)
+          .catch(() => {
+            if (this.isStaffSyncActive) {
+              this.scheduleCashShiftsReconnect(canAccessCash, role, false);
+            }
+          });
+      } else {
+        reattach();
+      }
+    }, delayMs);
+  }
+
+  private scheduleCashReconcileRetry(canAccessCash: boolean): void {
+    if (this.cashReconcileRetryTimer) {
+      clearTimeout(this.cashReconcileRetryTimer);
+      this.cashReconcileRetryTimer = null;
+    }
+    if (!this.isCloudCashConfirmationRequired()) return;
+    if (this.cashShiftSyncState.status === 'CONFIRMED') return;
+    this.cashReconcileRetryAttempt = Math.min(this.cashReconcileRetryAttempt + 1, 6);
+    const delayMs = this.computeReconnectBackoffMs(this.cashReconcileRetryAttempt, 2500, 30000);
+    this.cashReconcileRetryTimer = setTimeout(() => {
+      this.cashReconcileRetryTimer = null;
+      const curr = this.getCurrentUser();
+      if (!curr || !this.isAuthorizedStaffRole(curr.role)) return;
+      if (this.cashShiftSyncState.status === 'CONFIRMED') return;
+      this.reconcileCashShiftWithServerOnSync(canAccessCash).catch(() => {});
+    }, delayMs);
+  }
+
+  private attachOrdersListener(): void {
+    if (!db || this.isOrdersSyncActive) return;
+    this.detachOrdersListenerOnly();
+
+    if (this.ordersSyncRetryTimer) {
+      clearTimeout(this.ordersSyncRetryTimer);
+      this.ordersSyncRetryTimer = null;
     }
 
-    // 2. Confirm that the authenticated user possesses an authorized staff role
-    const confirmedRole = await this.verifyStaffRole(auth.currentUser);
-    if (!confirmedRole) {
-      console.warn('[Firestore Security] Usuário autenticado no Firebase não possui confirmação de papel de colaborador autorizado para sincronizar dados internos.');
+    this.isOrdersSyncActive = true;
+    const unsubOrders = onSnapshot(
+      collection(db, 'orders'),
+      (snapshot) => {
+        this.ordersSyncRetryAttempt = 0;
+        if (this.ordersSyncRetryTimer) {
+          clearTimeout(this.ordersSyncRetryTimer);
+          this.ordersSyncRetryTimer = null;
+        }
+
+        // Process explicit Firestore removals immediately
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === 'removed') {
+            this.recordDeletedOrderId(change.doc.id);
+            this.removeOrderFromSyncQueue(change.doc.id);
+            this.removeSyncedOrderId(change.doc.id);
+          }
+        });
+
+        const remoteOrders: Order[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as Order;
+          remoteOrders.push(data);
+        });
+
+        const reconcileSummary = this.reconcileRemoteOrders(remoteOrders, {
+          authoritative: !snapshot.metadata.fromCache,
+        });
+        this.cloudSyncState = {
+          status: 'CONNECTED',
+          lastSyncedAt: new Date().toISOString(),
+          lastError: null,
+        };
+
+        this.notify('FIRESTORE_ORDERS_SYNCED', { count: reconcileSummary.count });
+        this.notify('ORDERS_UPDATED', { count: reconcileSummary.count });
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_ORDERS_SYNCED' } }));
+        }
+      },
+      (error) => {
+        console.warn('[Firestore Staff Sync] Aviso no listener de pedidos (isolado do caixa):', error.message);
+        this.cloudSyncState = {
+          status: 'ERROR',
+          lastSyncedAt: this.cloudSyncState.lastSyncedAt,
+          lastError: error.message || 'Erro no listener em tempo real de pedidos do Firestore.',
+        };
+        // Detach ONLY the orders listener — NEVER tear down cash_shifts or reset confirmed cash state.
+        this.detachOrdersListenerOnly();
+        this.notify('FIRESTORE_SYNC_ERROR', { error: error.message }, { skipBroadcast: true });
+        this.scheduleOrdersReconnect(error.code === 'permission-denied');
+      }
+    );
+    this.ordersUnsubscriber = unsubOrders;
+  }
+
+  private attachCashShiftsListener(canAccessCash: boolean, role: string | undefined): void {
+    if (!db || this.isCashShiftsSyncActive) return;
+    if (!canAccessCash && role !== 'ATENDENTE') return;
+
+    this.detachCashShiftsListenerOnly();
+    if (this.cashShiftsSyncRetryTimer) {
+      clearTimeout(this.cashShiftsSyncRetryTimer);
+      this.cashShiftsSyncRetryTimer = null;
+    }
+
+    // Never downgrade an already CONFIRMED cash state back to SYNCING during background reattach
+    if (this.cashShiftSyncState.status !== 'CONFIRMED') {
       this.cashShiftSyncState = {
-        status: 'ERROR',
+        status: 'SYNCING',
         confirmedAt: null,
         source: 'none',
-        error: 'Papel de colaborador não confirmado no Firestore.',
+        error: null,
       };
-      this.notify('CASH_SHIFT_UPDATED', null);
-      return;
+      this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState(), { skipBroadcast: true });
     }
 
-    try {
-      this.isStaffSyncActive = true;
+    this.isCashShiftsSyncActive = true;
 
-      // Ensure catalog and store config exist in Firestore
-      this.ensureInitialDataSeededToFirestore().catch(() => {});
-
-      const currentLocalUser = this.getCurrentUser();
-      const role = currentLocalUser?.role?.toUpperCase();
-      const allowedModules = currentLocalUser?.allowedModules || [];
-
-      const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA';
-      const canAccessUsers = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('usuarios');
-      const canManageMenu = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('menu') || allowedModules.includes('relatorios');
-
-      if (canAccessCash || role === 'ATENDENTE') {
-        this.cashShiftSyncState = {
-          status: 'SYNCING',
-          confirmedAt: null,
-          source: 'none',
-          error: null,
-        };
-        this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState());
-      }
-
-      // Sync shared tombstones before attaching snapshot so deleted orders never resurrect
-      this.syncTombstonesFromServer().catch(() => {});
-
-      // 1. Synchronize All Orders in Real Time (Staff only: Kitchen KDS, POS Balcão, Entregadores, Admin)
-      const unsubOrders = onSnapshot(
-        collection(db, 'orders'),
+    if (canAccessCash) {
+      const unsubShifts = onSnapshot(
+        collection(db, 'cash_shifts'),
         (snapshot) => {
-          // Process explicit Firestore removals immediately
-          snapshot.docChanges().forEach((change) => {
-            if (change.type === 'removed') {
-              this.recordDeletedOrderId(change.doc.id);
-              this.removeOrderFromSyncQueue(change.doc.id);
-              this.removeSyncedOrderId(change.doc.id);
+          if (!snapshot.metadata.fromCache) {
+            this.cashShiftsSyncRetryAttempt = 0;
+            this.cashReconcileRetryAttempt = 0;
+            if (this.cashShiftsSyncRetryTimer) {
+              clearTimeout(this.cashShiftsSyncRetryTimer);
+              this.cashShiftsSyncRetryTimer = null;
             }
-          });
-
-          const remoteOrders: Order[] = [];
-          snapshot.forEach((docSnap) => {
-            const data = docSnap.data() as Order;
-            remoteOrders.push(data);
-          });
-
-          const reconcileSummary = this.reconcileRemoteOrders(remoteOrders, {
-            authoritative: !snapshot.metadata.fromCache,
-          });
-          this.cloudSyncState = {
-            status: 'CONNECTED',
-            lastSyncedAt: new Date().toISOString(),
-            lastError: null,
-          };
-
-          this.notify('FIRESTORE_ORDERS_SYNCED', { count: reconcileSummary.count });
-          this.notify('ORDERS_UPDATED', { count: reconcileSummary.count });
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_ORDERS_SYNCED' } }));
+            if (this.cashReconcileRetryTimer) {
+              clearTimeout(this.cashReconcileRetryTimer);
+              this.cashReconcileRetryTimer = null;
+            }
           }
+          const shifts: CashRegisterShift[] = [];
+          snapshot.forEach((docSnap) => {
+            shifts.push(docSnap.data() as CashRegisterShift);
+          });
+          this.applyFirestoreCashShiftSnapshot(shifts, {
+            fromCache: snapshot.metadata.fromCache,
+            isFullCollection: true,
+          });
         },
         (error) => {
-          console.warn('[Firestore Staff Sync] Aviso no listener de pedidos:', error.message);
-          this.cloudSyncState = {
-            status: 'ERROR',
-            lastSyncedAt: this.cloudSyncState.lastSyncedAt,
-            lastError: error.message || 'Erro no listener em tempo real do Firestore.',
-          };
-          this.stopStaffFirestoreSync();
-          this.notify('FIRESTORE_SYNC_ERROR', { error: error.message });
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('gestaofood_state_changed', { detail: { type: 'FIRESTORE_SYNC_ERROR' } }));
+          console.warn('[Firestore Staff Sync] Cash shift listener notice (isolado):', error.message);
+          this.detachCashShiftsListenerOnly();
+          if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+            this.cashShiftSyncState = {
+              status: 'ERROR',
+              confirmedAt: null,
+              source: 'none',
+              error: error.message || 'Erro ao sincronizar turnos de caixa.',
+            };
+            this.notify('CASH_SHIFT_UPDATED', null, { skipBroadcast: true });
           }
-          // Reschedule resilient reconnect on ANY transient or permission error
-          if (this.staffSyncRetryTimer) {
-            clearTimeout(this.staffSyncRetryTimer);
-          }
-          this.staffSyncRetryTimer = setTimeout(() => {
-            this.staffSyncRetryTimer = null;
-            if (error.code === 'permission-denied') {
-              this.ensureFirebaseAuthForStaff().then(() => this.initStaffFirestoreSync()).catch(() => {});
-            } else {
-              this.initStaffFirestoreSync().catch(() => {});
-            }
-          }, 5000);
+          this.reconcileCashShiftWithServerOnSync(true).catch(() => {});
+          this.scheduleCashShiftsReconnect(true, role, error.code === 'permission-denied');
         }
       );
-      this.staffUnsubscribers.push(unsubOrders);
+      this.cashShiftsUnsubscriber = unsubShifts;
+    } else if (role === 'ATENDENTE') {
+      // ATENDENTE can strictly observe ONLY active ABERTO shift (zero access to closed shifts/history)
+      const openShiftsQuery = query(collection(db, 'cash_shifts'), where('status', '==', 'ABERTO'));
+      const unsubOpenShift = onSnapshot(
+        openShiftsQuery,
+        (snapshot) => {
+          if (!snapshot.metadata.fromCache) {
+            this.cashShiftsSyncRetryAttempt = 0;
+            this.cashReconcileRetryAttempt = 0;
+            if (this.cashShiftsSyncRetryTimer) {
+              clearTimeout(this.cashShiftsSyncRetryTimer);
+              this.cashShiftsSyncRetryTimer = null;
+            }
+            if (this.cashReconcileRetryTimer) {
+              clearTimeout(this.cashReconcileRetryTimer);
+              this.cashReconcileRetryTimer = null;
+            }
+          }
+          const shifts: CashRegisterShift[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as CashRegisterShift;
+            if (data) shifts.push(data);
+          });
+          this.applyFirestoreCashShiftSnapshot(shifts, {
+            fromCache: snapshot.metadata.fromCache,
+            isFullCollection: false,
+          });
+        },
+        (error) => {
+          console.warn('[Firestore Staff Sync] Open shift notice (Atendente, isolado):', error.message);
+          this.detachCashShiftsListenerOnly();
+          if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+            this.cashShiftSyncState = {
+              status: 'ERROR',
+              confirmedAt: null,
+              source: 'none',
+              error: error.message || 'Erro ao sincronizar caixa aberto.',
+            };
+            this.notify('CASH_SHIFT_UPDATED', null, { skipBroadcast: true });
+          }
+          this.reconcileCashShiftWithServerOnSync(false).catch(() => {});
+          this.scheduleCashShiftsReconnect(false, role, error.code === 'permission-denied');
+        }
+      );
+      this.cashShiftsUnsubscriber = unsubOpenShift;
+    }
+  }
 
-      // 2. Synchronize Cash Register Shifts in Real Time
-      if (canAccessCash) {
-        const unsubShifts = onSnapshot(
-          collection(db, 'cash_shifts'),
-          (snapshot) => {
-            const shifts: CashRegisterShift[] = [];
-            snapshot.forEach((docSnap) => {
-              shifts.push(docSnap.data() as CashRegisterShift);
-            });
-            this.applyFirestoreCashShiftSnapshot(shifts, {
-              fromCache: snapshot.metadata.fromCache,
-              isFullCollection: true,
-            });
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Cash shift notice:', error.message);
-            if (this.cashShiftSyncState.status !== 'CONFIRMED') {
-              this.cashShiftSyncState = {
-                status: 'ERROR',
-                confirmedAt: null,
-                source: 'none',
-                error: error.message || 'Erro ao sincronizar turnos de caixa.',
-              };
-              this.notify('CASH_SHIFT_UPDATED', null);
-            }
-            this.reconcileCashShiftWithServerOnSync(true).catch(() => {});
-          }
-        );
-        this.staffUnsubscribers.push(unsubShifts);
-      } else if (role === 'ATENDENTE') {
-        // ATENDENTE can strictly observe ONLY active ABERTO shift (zero access to closed shifts/history)
-        const openShiftsQuery = query(collection(db, 'cash_shifts'), where('status', '==', 'ABERTO'));
-        const unsubOpenShift = onSnapshot(
-          openShiftsQuery,
-          (snapshot) => {
-            const shifts: CashRegisterShift[] = [];
-            snapshot.forEach((docSnap) => {
-              const data = docSnap.data() as CashRegisterShift;
-              if (data) shifts.push(data);
-            });
-            this.applyFirestoreCashShiftSnapshot(shifts, {
-              fromCache: snapshot.metadata.fromCache,
-              isFullCollection: false,
-            });
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Open shift notice (Atendente):', error.message);
-            if (this.cashShiftSyncState.status !== 'CONFIRMED') {
-              this.cashShiftSyncState = {
-                status: 'ERROR',
-                confirmedAt: null,
-                source: 'none',
-                error: error.message || 'Erro ao sincronizar caixa aberto.',
-              };
-              this.notify('CASH_SHIFT_UPDATED', null);
-            }
-            this.reconcileCashShiftWithServerOnSync(false).catch(() => {});
-          }
-        );
-        this.staffUnsubscribers.push(unsubOpenShift);
+  public async initStaffFirestoreSync(_firebaseUser?: unknown): Promise<void> {
+    if (!db) return;
+    const firestoreDb = db;
+
+    if (this.staffSyncInitPromise) {
+      return this.staffSyncInitPromise;
+    }
+
+    const runInit = async (): Promise<void> => {
+      await this.waitForFirebaseAuthReady();
+      const currentFbUser = getCurrentFirebaseUser();
+      if (!currentFbUser) {
+        console.info('[Firestore Security] Aguardando sessão real de colaborador no Firebase Auth para sincronização interna.');
+        return;
       }
 
-      // 2b. Synchronize Internal Config for Administrator (receipt footer, default driver, push flags)
-      if (role === 'ADMINISTRADOR') {
-        const unsubInternalConfig = onSnapshot(
-          doc(db, 'configs', 'internal'),
-          (docSnap) => {
-            if (docSnap.exists()) {
-              const remoteInternal = docSnap.data() as Partial<RestaurantConfig>;
-              const currentLocal = this.getRestaurantConfig();
-              const mergedConfig: RestaurantConfig = {
-                ...currentLocal,
-                ...remoteInternal,
-              };
-              localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
-              this.notify('CONFIG_UPDATED', mergedConfig);
-            }
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Internal config notice:', error.message);
-          }
-        );
-        this.staffUnsubscribers.push(unsubInternalConfig);
+      // 2. Confirm that the authenticated user possesses an authorized staff role
+      let confirmedRole = await this.verifyStaffRole(currentFbUser);
+      if (!confirmedRole && this.activeStaffRole && this.activeStaffUid === currentFbUser.uid) {
+        // Preserve already-verified role for this exact Firebase Auth UID during transient offline reconnects
+        confirmedRole = this.activeStaffRole;
+      }
+      if (!confirmedRole) {
+        console.warn('[Firestore Security] Usuário autenticado no Firebase não possui confirmação de papel de colaborador autorizado para sincronizar dados internos.');
+        if (this.cashShiftSyncState.status !== 'CONFIRMED') {
+          this.cashShiftSyncState = {
+            status: 'ERROR',
+            confirmedAt: null,
+            source: 'none',
+            error: 'Papel de colaborador não confirmado no Firestore.',
+          };
+          this.notify('CASH_SHIFT_UPDATED', null, { skipBroadcast: true });
+        }
+        return;
       }
 
-      // 2c. Synchronize Store Schedule & Closed Messages for Administrator & Gerente
-      if (role === 'ADMINISTRADOR' || role === 'GERENTE') {
-        const unsubScheduleConfig = onSnapshot(
-          doc(db, 'configs', 'store_schedule'),
-          (docSnap) => {
-            if (docSnap.exists()) {
-              const closedSettings = normalizeClosedSettings(docSnap.data() as Partial<StoreClosedSettings>);
-              const currentLocal = this.getRestaurantConfig();
-              const mergedConfig: RestaurantConfig = {
-                ...currentLocal,
-                operatingHours: closedSettings.operatingHours,
-                closedPrimaryMessage: closedSettings.closedPrimaryMessage,
-                closedSecondaryMessage: closedSettings.closedSecondaryMessage,
-              };
-              localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
-              this.notify('CONFIG_UPDATED', mergedConfig);
-            }
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Store schedule notice:', error.message);
-          }
-        );
-        this.staffUnsubscribers.push(unsubScheduleConfig);
-      }
+      this.activeStaffRole = confirmedRole;
+      this.activeStaffUid = currentFbUser.uid;
 
-      // 3. Synchronize Staff Users in Real Time (Restricted to Administrator & Management)
-      if (canAccessUsers) {
-        const unsubUsers = onSnapshot(
-          collection(db, 'users'),
-          (snapshot) => {
-            if (!snapshot.empty) {
-              const rawRemoteUsers: User[] = [];
-              snapshot.forEach((docSnap) => {
-                const data = docSnap.data() as Partial<User>;
-                if (data) {
-                  const sanitizedUser: User = {
-                    id: docSnap.id || data.id || `user-${Date.now()}`,
-                    name: data.name || (data.email ? data.email.split('@')[0] : 'Colaborador'),
-                    username: (data.username || (data.email ? data.email.split('@')[0] : `user_${docSnap.id.slice(0, 6)}`)).toLowerCase(),
-                    email: data.email || '',
-                    isEmailVerified: Boolean(data.isEmailVerified),
-                    role: data.role || 'ATENDENTE',
-                    status: data.status || 'ATIVO',
-                    allowedModules: Array.isArray(data.allowedModules) ? data.allowedModules : [],
-                    phone: data.phone || '',
-                    lastLoginAt: data.lastLoginAt,
-                    createdAt: data.createdAt || new Date().toISOString(),
-                    authProvider: data.authProvider,
-                    firebaseUid: data.firebaseUid || (docSnap.id && !docSnap.id.startsWith('user-') && !docSnap.id.startsWith('usr-') ? docSnap.id : undefined),
+      try {
+        const wasAlreadyActive = this.isStaffSyncActive;
+        this.isStaffSyncActive = true;
+
+        if (!wasAlreadyActive) {
+          // Ensure catalog and store config exist in Firestore
+          this.ensureInitialDataSeededToFirestore().catch(() => {});
+          // Sync shared tombstones before attaching snapshot so deleted orders never resurrect
+          this.syncTombstonesFromServer().catch(() => {});
+        }
+
+        const currentLocalUser = this.getCurrentUser();
+        const role = (currentLocalUser?.role || confirmedRole)?.toUpperCase();
+        const allowedModules = currentLocalUser?.allowedModules || [];
+
+        const canAccessCash = role === 'ADMINISTRADOR' || role === 'GERENTE' || role === 'CAIXA';
+        const canAccessUsers = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('usuarios');
+        const canManageMenu = role === 'ADMINISTRADOR' || role === 'GERENTE' || allowedModules.includes('menu') || allowedModules.includes('relatorios');
+
+        // 1. Orders listener (independent slot — error never tears down cash_shifts)
+        this.attachOrdersListener();
+
+        // 2. Cash Register Shifts listener (independent slot — preserves CONFIRMED state)
+        if (canAccessCash || role === 'ATENDENTE') {
+          this.attachCashShiftsListener(canAccessCash, role);
+        }
+
+        // 3. Auxiliary staff listeners (attached once per active session, never duplicated)
+        if (!this.isStaffAuxSyncActive) {
+          this.isStaffAuxSyncActive = true;
+
+          // 2b. Synchronize Internal Config for Administrator (receipt footer, default driver, push flags)
+          if (role === 'ADMINISTRADOR') {
+            const unsubInternalConfig = onSnapshot(
+              doc(firestoreDb, 'configs', 'internal'),
+              (docSnap) => {
+                if (docSnap.exists()) {
+                  const remoteInternal = docSnap.data() as Partial<RestaurantConfig>;
+                  const currentLocal = this.getRestaurantConfig();
+                  const mergedConfig: RestaurantConfig = {
+                    ...currentLocal,
+                    ...remoteInternal,
                   };
-                  rawRemoteUsers.push(sanitizedUser);
+                  localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+                  this.notify('CONFIG_UPDATED', mergedConfig);
                 }
-              });
+              },
+              (error) => {
+                console.warn('[Firestore Staff Sync] Internal config notice:', error.message);
+              }
+            );
+            this.staffUnsubscribers.push(unsubInternalConfig);
+          }
 
-              // Deduplicate remote users preferring real Firebase UID documents over legacy placeholder IDs
-              const dedupedRemote: User[] = [];
-              const findMatchIdx = (candidate: User) => {
-                const cUser = (candidate.username || '').trim().toLowerCase();
-                const cEmail = (candidate.email || '').trim().toLowerCase();
-                return dedupedRemote.findIndex((existing) => {
-                  if (existing.id === candidate.id) return true;
-                  const eEmail = (existing.email || '').trim().toLowerCase();
-                  if (cEmail && eEmail && cEmail === eEmail) return true;
-                  const eUser = (existing.username || '').trim().toLowerCase();
-                  if (cUser && eUser && cUser === eUser) return true;
-                  return false;
-                });
-              };
-              const isRealUid = (id: string) => Boolean(id && !id.startsWith('user-') && !id.startsWith('usr-'));
+          // 2c. Synchronize Store Schedule & Closed Messages for Administrator & Gerente
+          if (role === 'ADMINISTRADOR' || role === 'GERENTE') {
+            const unsubScheduleConfig = onSnapshot(
+              doc(firestoreDb, 'configs', 'store_schedule'),
+              (docSnap) => {
+                if (docSnap.exists()) {
+                  const closedSettings = normalizeClosedSettings(docSnap.data() as Partial<StoreClosedSettings>);
+                  const currentLocal = this.getRestaurantConfig();
+                  const mergedConfig: RestaurantConfig = {
+                    ...currentLocal,
+                    operatingHours: closedSettings.operatingHours,
+                    closedPrimaryMessage: closedSettings.closedPrimaryMessage,
+                    closedSecondaryMessage: closedSettings.closedSecondaryMessage,
+                  };
+                  localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
+                  this.notify('CONFIG_UPDATED', mergedConfig);
+                }
+              },
+              (error) => {
+                console.warn('[Firestore Staff Sync] Store schedule notice:', error.message);
+              }
+            );
+            this.staffUnsubscribers.push(unsubScheduleConfig);
+          }
 
-              for (const ru of rawRemoteUsers) {
-                const idx = findMatchIdx(ru);
-                if (idx === -1) {
-                  dedupedRemote.push(ru);
-                } else {
-                  const existing = dedupedRemote[idx];
-                  if (isRealUid(ru.id) && !isRealUid(existing.id)) {
-                    dedupedRemote[idx] = ru;
+          // 3. Synchronize Staff Users in Real Time (Restricted to Administrator & Management)
+          if (canAccessUsers) {
+            const unsubUsers = onSnapshot(
+              collection(firestoreDb, 'users'),
+              (snapshot) => {
+                if (!snapshot.empty) {
+                  const rawRemoteUsers: User[] = [];
+                  snapshot.forEach((docSnap) => {
+                    const data = docSnap.data() as Partial<User>;
+                    if (data) {
+                      if (data.provisioningState !== undefined && data.provisioningState !== 'ACTIVE') {
+                        return;
+                      }
+                      const sanitizedUser = this.sanitizeClientUserProfile(data, docSnap.id);
+                      rawRemoteUsers.push(sanitizedUser);
+                    }
+                  });
+
+                  // Deduplicate remote users preferring real Firebase UID documents over legacy placeholder IDs
+                  const dedupedRemote: User[] = [];
+                  const findMatchIdx = (candidate: User) => {
+                    const cUser = (candidate.username || '').trim().toLowerCase();
+                    const cEmail = (candidate.email || '').trim().toLowerCase();
+                    return dedupedRemote.findIndex((existing) => {
+                      if (existing.id === candidate.id) return true;
+                      const eEmail = (existing.email || '').trim().toLowerCase();
+                      if (cEmail && eEmail && cEmail === eEmail) return true;
+                      const eUser = (existing.username || '').trim().toLowerCase();
+                      if (cUser && eUser && cUser === eUser) return true;
+                      return false;
+                    });
+                  };
+                  const isRealUid = (id: string) => Boolean(id && !id.startsWith('user-') && !id.startsWith('usr-'));
+
+                  for (const ru of rawRemoteUsers) {
+                    const idx = findMatchIdx(ru);
+                    if (idx === -1) {
+                      dedupedRemote.push(ru);
+                    } else {
+                      const existing = dedupedRemote[idx];
+                      if (isRealUid(ru.id) && !isRealUid(existing.id)) {
+                        dedupedRemote[idx] = ru;
+                      }
+                    }
+                  }
+
+                  const localUsers = this.getUsers();
+                  const merged = [...dedupedRemote];
+                  for (const lu of localUsers) {
+                    const luUser = (lu.username || '').trim().toLowerCase();
+                    const luEmail = (lu.email || '').trim().toLowerCase();
+                    const alreadyInMerged = merged.some((ru) => {
+                      if (ru.id && lu.id && ru.id === lu.id) return true;
+                      const ruUser = (ru.username || '').trim().toLowerCase();
+                      if (ruUser && luUser && ruUser === luUser) return true;
+                      const ruEmail = (ru.email || '').trim().toLowerCase();
+                      if (ruEmail && luEmail && ruEmail === luEmail) return true;
+                      return false;
+                    });
+                    if (!alreadyInMerged) {
+                      merged.push(lu);
+                    }
+                  }
+
+                  localStorage.setItem('gf_users', JSON.stringify(merged));
+                  this.notify('USERS_UPDATED', { count: merged.length });
+                }
+              },
+              (error) => {
+                console.warn('[Firestore Staff Sync] Users listener notice:', error.message);
+              }
+            );
+            this.staffUnsubscribers.push(unsubUsers);
+          }
+
+          // 4. Synchronize Confidential Menu Costs in Real Time (Restricted to Manager / Admin)
+          if (canManageMenu) {
+            const unsubCosts = onSnapshot(
+              collection(firestoreDb, 'menu_item_costs'),
+              (snapshot) => {
+                if (!snapshot.empty) {
+                  const costsMap = new Map<string, number>();
+                  snapshot.forEach((docSnap) => {
+                    const data = docSnap.data();
+                    if (typeof data.costPrice === 'number') {
+                      costsMap.set(docSnap.id, data.costPrice);
+                      this.menuItemCostsCache.set(docSnap.id, data.costPrice);
+                    }
+                  });
+
+                  const items = this.getMenuItems();
+                  let updated = false;
+                  for (const item of items) {
+                    if (costsMap.has(item.id) && item.costPrice !== costsMap.get(item.id)) {
+                      item.costPrice = costsMap.get(item.id);
+                      updated = true;
+                    }
+                  }
+
+                  if (updated) {
+                    try {
+                      localStorage.setItem('gf_menu_items', JSON.stringify(items));
+                    } catch (storageErr) {
+                      console.warn('[Firestore Staff Sync] Falha ao atualizar cache local de custos:', storageErr);
+                    }
+                    this.notify('MENU_UPDATED', {});
                   }
                 }
+              },
+              (error) => {
+                console.warn('[Firestore Staff Sync] Confidential cost listener notice:', error.message);
               }
+            );
+            this.staffUnsubscribers.push(unsubCosts);
 
-              const localUsers = this.getUsers();
-              const merged = [...dedupedRemote];
-              for (const lu of localUsers) {
-                const luUser = (lu.username || '').trim().toLowerCase();
-                const luEmail = (lu.email || '').trim().toLowerCase();
-                const alreadyInMerged = merged.some((ru) => {
-                  if (ru.id && lu.id && ru.id === lu.id) return true;
-                  const ruUser = (ru.username || '').trim().toLowerCase();
-                  if (ruUser && luUser && ruUser === luUser) return true;
-                  const ruEmail = (ru.email || '').trim().toLowerCase();
-                  if (ruEmail && luEmail && ruEmail === luEmail) return true;
-                  return false;
-                });
-                if (!alreadyInMerged) {
-                  merged.push(lu);
+            // 5. Synchronize Daily Menu Config in Real Time (Staff / Admin)
+            const unsubDailyMenu = onSnapshot(
+              doc(firestoreDb, 'configs', 'daily_menu'),
+              (docSnap) => {
+                if (docSnap.exists()) {
+                  const remote = docSnap.data() as DailyMenuConfig;
+                  if (remote && typeof remote.enabled === 'boolean') {
+                    const local = this.getDailyMenuConfig();
+                    const changed =
+                      local.enabled !== remote.enabled ||
+                      local.publishedAt !== remote.publishedAt ||
+                      (local.selectedItemIds?.length !== remote.selectedItemIds?.length) ||
+                      (local.selectedComboIds?.length !== remote.selectedComboIds?.length);
+                    if (changed) {
+                      localStorage.setItem('gf_daily_menu', JSON.stringify(remote));
+                      this.notify('DAILY_MENU_UPDATED', remote);
+                    }
+                  }
                 }
+              },
+              (error) => {
+                console.warn('[Firestore Staff Sync] Daily menu notice:', error.message);
               }
-
-              localStorage.setItem('gf_users', JSON.stringify(merged));
-              this.notify('USERS_UPDATED', { count: merged.length });
-            }
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Users listener notice:', error.message);
+            );
+            this.staffUnsubscribers.push(unsubDailyMenu);
           }
-        );
-        this.staffUnsubscribers.push(unsubUsers);
+        }
+      } catch (err) {
+        console.warn('[Firestore Staff Sync Setup Error]:', err);
       }
+    };
 
-      // 4. Synchronize Confidential Menu Costs in Real Time (Restricted to Manager / Admin)
-      if (canManageMenu) {
-        const unsubCosts = onSnapshot(
-          collection(db, 'menu_item_costs'),
-          (snapshot) => {
-            if (!snapshot.empty) {
-              const costsMap = new Map<string, number>();
-              snapshot.forEach((docSnap) => {
-                const data = docSnap.data();
-                if (typeof data.costPrice === 'number') {
-                  costsMap.set(docSnap.id, data.costPrice);
-                  this.menuItemCostsCache.set(docSnap.id, data.costPrice);
-                }
-              });
-
-              const items = this.getMenuItems();
-              let updated = false;
-              for (const item of items) {
-                if (costsMap.has(item.id) && item.costPrice !== costsMap.get(item.id)) {
-                  item.costPrice = costsMap.get(item.id);
-                  updated = true;
-                }
-              }
-
-              if (updated) {
-                try {
-                  localStorage.setItem('gf_menu_items', JSON.stringify(items));
-                } catch (storageErr) {
-                  console.warn('[Firestore Staff Sync] Falha ao atualizar cache local de custos:', storageErr);
-                }
-                this.notify('MENU_UPDATED', {});
-              }
-            }
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Confidential cost listener notice:', error.message);
-          }
-        );
-        this.staffUnsubscribers.push(unsubCosts);
-
-        // 5. Synchronize Daily Menu Config in Real Time (Staff / Admin)
-        const unsubDailyMenu = onSnapshot(
-          doc(db, 'configs', 'daily_menu'),
-          (docSnap) => {
-            if (docSnap.exists()) {
-              const remote = docSnap.data() as DailyMenuConfig;
-              if (remote && typeof remote.enabled === 'boolean') {
-                const local = this.getDailyMenuConfig();
-                const changed =
-                  local.enabled !== remote.enabled ||
-                  local.publishedAt !== remote.publishedAt ||
-                  (local.selectedItemIds?.length !== remote.selectedItemIds?.length) ||
-                  (local.selectedComboIds?.length !== remote.selectedComboIds?.length);
-                if (changed) {
-                  localStorage.setItem('gf_daily_menu', JSON.stringify(remote));
-                  this.notify('DAILY_MENU_UPDATED', remote);
-                }
-              }
-            }
-          },
-          (error) => {
-            console.warn('[Firestore Staff Sync] Daily menu notice:', error.message);
-          }
-        );
-        this.staffUnsubscribers.push(unsubDailyMenu);
-      }
-
-    } catch (err) {
-      console.warn('[Firestore Staff Sync Setup Error]:', err);
-    }
+    this.staffSyncInitPromise = runInit().finally(() => {
+      this.staffSyncInitPromise = null;
+    });
+    return this.staffSyncInitPromise;
   }
 
   /**
@@ -3765,6 +3794,7 @@ class StoreService {
 
     if (options.fromCache) {
       // Cached IndexedDB data is NOT authoritative server confirmation.
+      // However, if a shift was ALREADY confirmed in this session, preserve CONFIRMED while reconciling quietly.
       if (this.cashShiftSyncState.status !== 'CONFIRMED') {
         this.cashShiftSyncState = {
           status: 'SYNCING',
@@ -3772,7 +3802,7 @@ class StoreService {
           source: 'none',
           error: null,
         };
-        this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState());
+        this.notify('CASH_SHIFT_SYNC_STATE', this.getCashShiftSyncState(), { skipBroadcast: true });
       }
       if (!options.skipServerReconcileOnCache) {
         this.reconcileCashShiftWithServerOnSync(options.isFullCollection).catch(() => {});
@@ -3802,6 +3832,11 @@ class StoreService {
       }
     } catch {}
 
+    this.cashReconcileRetryAttempt = 0;
+    if (this.cashReconcileRetryTimer) {
+      clearTimeout(this.cashReconcileRetryTimer);
+      this.cashReconcileRetryTimer = null;
+    }
     this.cashShiftSyncState = {
       status: 'CONFIRMED',
       confirmedAt: new Date().toISOString(),
@@ -3839,12 +3874,24 @@ class StoreService {
 
       if (typeof fetch === 'function' && typeof window !== 'undefined') {
         try {
-          const avail = await this.fetchPublicStoreAvailability({ timeoutMs: 5000 });
+          // Internal cash reconciliation NEVER broadcasts or overrides public menu on transient errors
+          const avail = await this.fetchPublicStoreAvailability({
+            timeoutMs: 5000,
+            maxRetries: 1,
+            retryDelayMs: 300,
+            notifyOnFailure: false,
+            broadcastOnFailure: false,
+          });
           if (avail.verified) {
             if (!avail.isOpen || !avail.activeShiftId) {
               try {
                 localStorage.setItem('gf_current_cash_shift', 'null');
               } catch {}
+              this.cashReconcileRetryAttempt = 0;
+              if (this.cashReconcileRetryTimer) {
+                clearTimeout(this.cashReconcileRetryTimer);
+                this.cashReconcileRetryTimer = null;
+              }
               this.cashShiftSyncState = {
                 status: 'CONFIRMED',
                 confirmedAt: new Date().toISOString(),
@@ -3858,16 +3905,39 @@ class StoreService {
               const authHeaders = await this.getFirebaseAuthHeaders();
               const state = await this.consultCashShiftState(avail.activeShiftId, authHeaders);
               if (state.verified && state.exists && state.shift?.status === 'ABERTO') {
+                this.cashReconcileRetryAttempt = 0;
+                if (this.cashReconcileRetryTimer) {
+                  clearTimeout(this.cashReconcileRetryTimer);
+                  this.cashReconcileRetryTimer = null;
+                }
                 this.commitOpenShiftLocally(state.shift);
                 return true;
+              }
+            } else if (this.cashShiftSyncState.status === 'CONFIRMED') {
+              // For ATENDENTE: server authoritatively confirmed this exact activeShiftId is still open
+              try {
+                const raw = localStorage.getItem('gf_current_cash_shift');
+                const parsed = raw ? (JSON.parse(raw) as CashRegisterShift | null) : null;
+                if (parsed && parsed.id === avail.activeShiftId && parsed.status === 'ABERTO') {
+                  this.cashShiftSyncState = {
+                    status: 'CONFIRMED',
+                    confirmedAt: new Date().toISOString(),
+                    source: 'server_api',
+                    error: null,
+                  };
+                  return true;
+                }
+              } catch {
+                // ignore parse issue
               }
             }
           }
         } catch {
-          // ignore and mark error below
+          // ignore and preserve confirmed state or mark error below
         }
       }
 
+      // NEVER downgrade an already CONFIRMED state to ERROR on a transient network failure
       if (this.cashShiftSyncState.status !== 'CONFIRMED') {
         this.cashShiftSyncState = {
           status: 'ERROR',
@@ -3875,7 +3945,8 @@ class StoreService {
           source: 'none',
           error: 'Não foi possível confirmar o estado do caixa com o servidor.',
         };
-        this.notify('CASH_SHIFT_UPDATED', null);
+        this.notify('CASH_SHIFT_UPDATED', null, { skipBroadcast: true });
+        this.scheduleCashReconcileRetry(canAccessCash);
       }
       return false;
     };
@@ -3928,9 +3999,36 @@ class StoreService {
       clearTimeout(this.staffSyncRetryTimer);
       this.staffSyncRetryTimer = null;
     }
-    this.staffUnsubscribers.forEach((unsub) => unsub());
+    if (this.ordersSyncRetryTimer) {
+      clearTimeout(this.ordersSyncRetryTimer);
+      this.ordersSyncRetryTimer = null;
+    }
+    if (this.cashShiftsSyncRetryTimer) {
+      clearTimeout(this.cashShiftsSyncRetryTimer);
+      this.cashShiftsSyncRetryTimer = null;
+    }
+    if (this.cashReconcileRetryTimer) {
+      clearTimeout(this.cashReconcileRetryTimer);
+      this.cashReconcileRetryTimer = null;
+    }
+    this.detachOrdersListenerOnly();
+    this.detachCashShiftsListenerOnly();
+    this.staffUnsubscribers.forEach((unsub) => {
+      try {
+        unsub();
+      } catch {
+        // ignore unsubscribe error
+      }
+    });
     this.staffUnsubscribers = [];
     this.isStaffSyncActive = false;
+    this.isStaffAuxSyncActive = false;
+    this.ordersSyncRetryAttempt = 0;
+    this.cashShiftsSyncRetryAttempt = 0;
+    this.cashReconcileRetryAttempt = 0;
+    this.activeStaffRole = null;
+    this.activeStaffUid = null;
+    this.staffSyncInitPromise = null;
     this.cashShiftSyncPromise = null;
     if (this.isCloudCashConfirmationRequired()) {
       this.cashShiftSyncState = {
@@ -3942,10 +4040,37 @@ class StoreService {
     }
   }
 
-  public async refreshStaffSync(): Promise<void> {
-    if (!db) return;
-    this.stopStaffFirestoreSync();
-    await this.initStaffFirestoreSync();
+  public async refreshStaffSync(options?: { forceReset?: boolean }): Promise<void> {
+    if (options?.forceReset) {
+      if (!db) return;
+      this.stopStaffFirestoreSync();
+      await this.initStaffFirestoreSync();
+      return;
+    }
+
+    // Non-destructive refresh: NEVER tear down healthy active listeners or reset a CONFIRMED cash state
+    const current = this.getCurrentUser();
+    const roleUpper = (current?.role || '').toUpperCase();
+    const canAccessCash = roleUpper === 'ADMINISTRADOR' || roleUpper === 'GERENTE' || roleUpper === 'CAIXA';
+    const needsCash = canAccessCash || roleUpper === 'ATENDENTE';
+
+    const now = Date.now();
+    const allHealthy =
+      (!db || (this.isStaffSyncActive && this.isOrdersSyncActive && (!needsCash || this.isCashShiftsSyncActive))) &&
+      (!needsCash || this.cashShiftSyncState.status === 'CONFIRMED');
+
+    if (allHealthy && now - this.lastStaffRefreshAt < 1500) {
+      return;
+    }
+    this.lastStaffRefreshAt = now;
+
+    if (db) {
+      await this.initStaffFirestoreSync();
+    }
+
+    if (needsCash && this.isCloudCashConfirmationRequired()) {
+      await this.reconcileCashShiftWithServerOnSync(canAccessCash);
+    }
   }
 
   public stopFirestoreSync(): void {
@@ -4150,8 +4275,8 @@ class StoreService {
     }
   }
 
-  private notify(type: string, payload?: unknown) {
-    if (this.broadcastChannel) {
+  private notify(type: string, payload?: unknown, options?: { skipBroadcast?: boolean }) {
+    if (this.broadcastChannel && !options?.skipBroadcast) {
       try {
         this.broadcastChannel.postMessage({ type, payload });
       } catch {
@@ -5584,6 +5709,11 @@ class StoreService {
     const order = orders.find((o) => o.id === orderId);
     if (!order || order.status === 'CANCELADO') return null;
 
+    if (newStatus === 'EM_ROTA' && order.fulfillmentType === 'RETIRADA') {
+      console.warn(`[Domain Guard] Pedido ${order.orderNumber} é de Retirada no Balcão e não pode ir para EM_ROTA (motoboy).`);
+      return null;
+    }
+
     const previousStatus = order.status;
     if (previousStatus === newStatus) return order;
 
@@ -5597,21 +5727,24 @@ class StoreService {
       this.markDriverReadyOrderSeen(order.id);
       soundService.stopDriverReadyAlert();
 
-      const cleanDriverName = author.replace(/^Entregador\s*/i, '').trim() || 'Entregador de Plantão';
-      if (!order.deliveryPerson) {
-        order.deliveryPerson = {
-          id: currentUser?.id || `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-          name: cleanDriverName,
-          phone: currentUser?.phone || '',
-          assignedAt: now,
-          deliveredAt: now,
-        };
-        order.deliveryPersonId = order.deliveryPerson.id;
-        order.deliveryPersonName = order.deliveryPerson.name;
-      } else {
-        order.deliveryPerson.deliveredAt = now;
-        if (!order.deliveryPerson.name || order.deliveryPerson.name === 'Entregador de Plantão') {
-          order.deliveryPerson.name = cleanDriverName;
+      // Apenas pedidos DELIVERY vinculam entregador; pedidos RETIRADA não atribuem motoboy
+      if (order.fulfillmentType === 'DELIVERY') {
+        const cleanDriverName = author.replace(/^Entregador\s*/i, '').trim() || 'Entregador de Plantão';
+        if (!order.deliveryPerson) {
+          order.deliveryPerson = {
+            id: currentUser?.id || `driver-${cleanDriverName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+            name: cleanDriverName,
+            phone: currentUser?.phone || '',
+            assignedAt: now,
+            deliveredAt: now,
+          };
+          order.deliveryPersonId = order.deliveryPerson.id;
+          order.deliveryPersonName = order.deliveryPerson.name;
+        } else {
+          order.deliveryPerson.deliveredAt = now;
+          if (!order.deliveryPerson.name || order.deliveryPerson.name === 'Entregador de Plantão') {
+            order.deliveryPerson.name = cleanDriverName;
+          }
         }
       }
     } else if (newStatus === 'EM_ROTA') {
@@ -5634,13 +5767,18 @@ class StoreService {
       }
     }
 
+    const defaultStatusNote =
+      order.fulfillmentType === 'RETIRADA' && newStatus === 'ENTREGUE'
+        ? 'Retirada confirmada no balcão'
+        : `Status alterado de ${previousStatus} para ${newStatus}`;
+
     const newMovement: OrderMovementLog = {
       id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       timestamp: now,
       fromStatus: previousStatus,
       toStatus: newStatus,
       author,
-      notes: notes || `Status alterado de ${previousStatus} para ${newStatus}`,
+      notes: notes || defaultStatusNote,
     };
 
     order.movements.push(newMovement);
@@ -5701,6 +5839,14 @@ class StoreService {
     const previousOrder = this.getOrderById(orderId);
     if (!previousOrder) {
       return { order: null, synced: false, rejected: true, error: 'Pedido não encontrado.' };
+    }
+    if (newStatus === 'EM_ROTA' && previousOrder.fulfillmentType === 'RETIRADA') {
+      return {
+        order: previousOrder,
+        synced: false,
+        rejected: true,
+        error: 'Pedidos de Retirada no Balcão não utilizam motoboy e não podem ir para Em Rota. Utilize "Confirmar Retirada".',
+      };
     }
     if (previousOrder.status === newStatus) {
       return { order: previousOrder, synced: previousOrder._cloudSyncStatus === 'SYNCED' };
@@ -6443,6 +6589,11 @@ class StoreService {
     const order = orders.find((o) => o.id === orderId);
     if (!order) return null;
 
+    if (order.fulfillmentType === 'RETIRADA' && deliveryPerson !== null) {
+      console.warn(`[Domain Guard] Pedido ${order.orderNumber} é de Retirada no Balcão e não pode receber entregador.`);
+      return null;
+    }
+
     const previousDriverId = order.deliveryPersonId || order.deliveryPerson?.id;
     const previousDriverName = order.deliveryPersonName || order.deliveryPerson?.name;
 
@@ -6551,6 +6702,19 @@ class StoreService {
         synced: false,
         rejected: true,
         error: 'Sessão Firebase não autenticada. Faça login novamente para atribuir entregador.',
+      };
+    }
+
+    const existingOrder = this.getOrderById(orderId);
+    if (!existingOrder) {
+      return { order: null, synced: false, rejected: true, error: 'Pedido não encontrado.' };
+    }
+    if (existingOrder.fulfillmentType === 'RETIRADA' && deliveryPerson !== null) {
+      return {
+        order: existingOrder,
+        synced: false,
+        rejected: true,
+        error: 'Pedidos de Retirada no Balcão não podem ser atribuídos a um entregador.',
       };
     }
 
@@ -8883,101 +9047,163 @@ class StoreService {
     }
   }
 
-  public async fetchPublicStoreAvailability(options?: { timeoutMs?: number }): Promise<PublicStoreAvailability> {
-    const cfg = this.getRestaurantConfig();
-    const fallbackClosedSettings = normalizeClosedSettings(cfg);
-    const failClosed = (message?: string): PublicStoreAvailability => {
-      const result: PublicStoreAvailability = {
-        verified: false,
-        isOpen: false,
-        reason: 'UNABLE_TO_VERIFY_CASH',
-        message: message || 'Não foi possível verificar no servidor se o estabelecimento está aberto no momento.',
-        activeShiftId: null,
-        closedSettings: this.lastPublicAvailability?.closedSettings || fallbackClosedSettings,
-        restaurantPublicInfo: this.lastPublicAvailability?.restaurantPublicInfo || {
-          name: cfg.name || 'Amandita Sabores',
-          whatsapp: cfg.whatsapp || '',
-          phone: cfg.phone || '',
-          address: cfg.address || '',
-          city: cfg.city || '',
-        },
-        checkedAt: new Date().toISOString(),
-      };
-      this.lastPublicAvailability = result;
-      this.notify('STORE_AVAILABILITY_UPDATED', result);
-      return result;
-    };
+  public async fetchPublicStoreAvailability(options?: {
+    timeoutMs?: number;
+    maxRetries?: number;
+    retryDelayMs?: number;
+    notifyOnFailure?: boolean;
+    broadcastOnFailure?: boolean;
+  }): Promise<PublicStoreAvailability> {
+    const notifyOnFailure = options?.notifyOnFailure !== false;
+    const broadcastOnFailure = options?.broadcastOnFailure === true;
 
-    if (typeof fetch !== 'function') {
-      return failClosed('Cliente HTTP indisponível para verificar abertura do caixa.');
+    // Coalesce concurrent standard public availability requests to avoid redundant overlapping HTTP calls
+    if (notifyOnFailure && !broadcastOnFailure && this.publicAvailabilityInFlightPromise) {
+      return this.publicAvailabilityInFlightPromise;
     }
 
-    const timeoutMs = options?.timeoutMs ?? 8000;
-    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    const execute = async (): Promise<PublicStoreAvailability> => {
+      const cfg = this.getRestaurantConfig();
+      const fallbackClosedSettings = normalizeClosedSettings(cfg);
+      const failClosed = (message?: string): PublicStoreAvailability => {
+        const result: PublicStoreAvailability = {
+          verified: false,
+          isOpen: false,
+          reason: 'UNABLE_TO_VERIFY_CASH',
+          message: message || 'Não foi possível verificar no servidor se o estabelecimento está aberto no momento.',
+          activeShiftId: null,
+          closedSettings: this.lastPublicAvailability?.closedSettings || fallbackClosedSettings,
+          restaurantPublicInfo: this.lastPublicAvailability?.restaurantPublicInfo || {
+            name: cfg.name || 'Amandita Sabores',
+            whatsapp: cfg.whatsapp || '',
+            phone: cfg.phone || '',
+            address: cfg.address || '',
+            city: cfg.city || '',
+          },
+          checkedAt: new Date().toISOString(),
+        };
+        if (notifyOnFailure) {
+          this.lastPublicAvailability = result;
+          // NEVER broadcast transient unverified availability failures to other tabs via BroadcastChannel
+          this.notify('STORE_AVAILABILITY_UPDATED', result, { skipBroadcast: !broadcastOnFailure });
+        }
+        return result;
+      };
 
-    try {
-      const res = await fetch('/api/store/availability', {
-        method: 'GET',
-        headers: { 'Cache-Control': 'no-cache' },
-        ...(controller ? { signal: controller.signal } : {}),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data || typeof data !== 'object' || data.success === false) {
-        return failClosed(data?.message || `Servidor retornou erro HTTP ${res.status} ao verificar disponibilidade.`);
+      if (typeof fetch !== 'function') {
+        return failClosed('Cliente HTTP indisponível para verificar abertura do caixa.');
       }
 
-      const closedSettings = normalizeClosedSettings(data.closedSettings || cfg);
-      const serverInfo = (data.restaurantPublicInfo || {}) as Partial<PublicStoreAvailability['restaurantPublicInfo']>;
-      const hasServerInfo = Boolean(data.hasServerRestaurantInfo);
+      const timeoutMs = options?.timeoutMs ?? 8000;
+      const maxRetries = Math.max(0, Math.min(2, options?.maxRetries ?? 2));
+      const baseRetryDelayMs = Math.max(50, options?.retryDelayMs ?? 300);
 
-      const mergedRestaurantInfo = {
-        name: (hasServerInfo && serverInfo.name) ? serverInfo.name : (cfg.name || 'Amandita Sabores'),
-        whatsapp: (hasServerInfo && serverInfo.whatsapp) ? serverInfo.whatsapp : (cfg.whatsapp || ''),
-        phone: (hasServerInfo && serverInfo.phone) ? serverInfo.phone : (cfg.phone || ''),
-        address: (hasServerInfo && serverInfo.address) ? serverInfo.address : (cfg.address || ''),
-        city: (hasServerInfo && serverInfo.city) ? serverInfo.city : (cfg.city || ''),
-      };
+      let lastErrorMessage = 'Não foi possível verificar no servidor se o estabelecimento está aberto no momento.';
 
-      const availability: PublicStoreAvailability = {
-        verified: Boolean(data.verified),
-        isOpen: Boolean(data.verified && data.isOpen),
-        reason: data.reason || (data.verified && data.isOpen ? 'CASH_OPEN' : 'CASH_CLOSED'),
-        message: typeof data.message === 'string' ? data.message : undefined,
-        activeShiftId: typeof data.activeShiftId === 'string' ? data.activeShiftId : null,
-        closedSettings,
-        restaurantPublicInfo: mergedRestaurantInfo,
-        hasServerRestaurantInfo: hasServerInfo,
-        checkedAt: typeof data.checkedAt === 'string' ? data.checkedAt : new Date().toISOString(),
-      };
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, baseRetryDelayMs * attempt));
+        }
 
-      this.lastPublicAvailability = availability;
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
-      const nextCfg: RestaurantConfig = {
-        ...cfg,
-        isOpen: availability.isOpen,
-        operatingHours: closedSettings.operatingHours,
-        closedPrimaryMessage: closedSettings.closedPrimaryMessage,
-        closedSecondaryMessage: closedSettings.closedSecondaryMessage,
-        ...(hasServerInfo && serverInfo.name ? { name: serverInfo.name } : {}),
-        ...(hasServerInfo && serverInfo.whatsapp ? { whatsapp: serverInfo.whatsapp } : {}),
-        ...(hasServerInfo && serverInfo.phone ? { phone: serverInfo.phone } : {}),
-        ...(hasServerInfo && serverInfo.address ? { address: serverInfo.address } : {}),
-        ...(hasServerInfo && serverInfo.city ? { city: serverInfo.city } : {}),
-      };
+        try {
+          const res = await fetch('/api/store/availability', {
+            method: 'GET',
+            headers: { 'Cache-Control': 'no-cache' },
+            ...(controller ? { signal: controller.signal } : {}),
+          });
+          const data = await res.json().catch(() => null);
 
-      try {
-        localStorage.setItem('gf_restaurant_config', JSON.stringify(nextCfg));
-      } catch {}
+          if (!res.ok || !data || typeof data !== 'object' || data.success === false) {
+            lastErrorMessage = data?.message || `Servidor retornou erro HTTP ${res.status} ao verificar disponibilidade.`;
+            const isTransientStatus = res.status >= 500 || res.status === 429 || res.status === 408;
+            if (isTransientStatus && attempt < maxRetries) {
+              continue;
+            }
+            return failClosed(lastErrorMessage);
+          }
 
-      this.notify('STORE_AVAILABILITY_UPDATED', availability);
-      return availability;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return failClosed(msg);
-    } finally {
-      if (timer) clearTimeout(timer);
+          const verified = Boolean(data.verified);
+          if (!verified) {
+            lastErrorMessage =
+              typeof data.message === 'string' && data.message.trim()
+                ? data.message
+                : 'Não foi possível verificar no servidor se o estabelecimento está aberto no momento.';
+            if (attempt < maxRetries) {
+              continue;
+            }
+            return failClosed(lastErrorMessage);
+          }
+
+          const closedSettings = normalizeClosedSettings(data.closedSettings || cfg);
+          const serverInfo = (data.restaurantPublicInfo || {}) as Partial<PublicStoreAvailability['restaurantPublicInfo']>;
+          const hasServerInfo = Boolean(data.hasServerRestaurantInfo);
+
+          const mergedRestaurantInfo = {
+            name: (hasServerInfo && serverInfo.name) ? serverInfo.name : (cfg.name || 'Amandita Sabores'),
+            whatsapp: (hasServerInfo && serverInfo.whatsapp) ? serverInfo.whatsapp : (cfg.whatsapp || ''),
+            phone: (hasServerInfo && serverInfo.phone) ? serverInfo.phone : (cfg.phone || ''),
+            address: (hasServerInfo && serverInfo.address) ? serverInfo.address : (cfg.address || ''),
+            city: (hasServerInfo && serverInfo.city) ? serverInfo.city : (cfg.city || ''),
+          };
+
+          const availability: PublicStoreAvailability = {
+            verified: true,
+            isOpen: Boolean(data.isOpen),
+            reason: data.reason || (data.isOpen ? 'CASH_OPEN' : 'CASH_CLOSED'),
+            message: typeof data.message === 'string' ? data.message : undefined,
+            activeShiftId: typeof data.activeShiftId === 'string' ? data.activeShiftId : null,
+            closedSettings,
+            restaurantPublicInfo: mergedRestaurantInfo,
+            hasServerRestaurantInfo: hasServerInfo,
+            checkedAt: typeof data.checkedAt === 'string' ? data.checkedAt : new Date().toISOString(),
+          };
+
+          this.lastPublicAvailability = availability;
+
+          const nextCfg: RestaurantConfig = {
+            ...cfg,
+            isOpen: availability.isOpen,
+            operatingHours: closedSettings.operatingHours,
+            closedPrimaryMessage: closedSettings.closedPrimaryMessage,
+            closedSecondaryMessage: closedSettings.closedSecondaryMessage,
+            ...(hasServerInfo && serverInfo.name ? { name: serverInfo.name } : {}),
+            ...(hasServerInfo && serverInfo.whatsapp ? { whatsapp: serverInfo.whatsapp } : {}),
+            ...(hasServerInfo && serverInfo.phone ? { phone: serverInfo.phone } : {}),
+            ...(hasServerInfo && serverInfo.address ? { address: serverInfo.address } : {}),
+            ...(hasServerInfo && serverInfo.city ? { city: serverInfo.city } : {}),
+          };
+
+          try {
+            localStorage.setItem('gf_restaurant_config', JSON.stringify(nextCfg));
+          } catch {}
+
+          this.notify('STORE_AVAILABILITY_UPDATED', availability);
+          return availability;
+        } catch (err: unknown) {
+          lastErrorMessage = err instanceof Error ? err.message : String(err);
+          if (attempt < maxRetries) {
+            continue;
+          }
+          return failClosed(lastErrorMessage);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+
+      return failClosed(lastErrorMessage);
+    };
+
+    if (notifyOnFailure && !broadcastOnFailure) {
+      this.publicAvailabilityInFlightPromise = execute().finally(() => {
+        this.publicAvailabilityInFlightPromise = null;
+      });
+      return this.publicAvailabilityInFlightPromise;
     }
+
+    return execute();
   }
 
   public async loadStoreSettingsFromCloud(): Promise<{
@@ -9419,24 +9645,325 @@ class StoreService {
   }
 
   // ==========================================
-  // USERS, STAFF & AUTHENTICATION
+  // USERS, STAFF & AUTHENTICATION (ETAPA 2B)
   // ==========================================
+  private sanitizeClientUserProfile(raw: Partial<User> & Record<string, unknown>, fallbackUid?: string): User {
+    const resolvedId = String(fallbackUid || raw.id || raw.firebaseUid || '').trim() || `usr-${Date.now()}`;
+    const rawRole = String(raw.role || 'ATENDENTE').trim().toUpperCase();
+    const normalizedRole = (rawRole === 'ADMIN' ? 'ADMINISTRADOR' : rawRole) as UserRole;
+    const rawStatus = String(raw.status || 'ATIVO').trim().toUpperCase();
+    const normalizedStatus: UserStatus =
+      rawStatus === 'BLOQUEADO' || rawStatus === 'DESATIVADO' ? (rawStatus as UserStatus) : 'ATIVO';
+    const rawUsername = String(raw.username || '').trim().toLowerCase();
+    const fallbackUsername =
+      rawUsername ||
+      (typeof raw.email === 'string' && raw.email.includes('@') ? raw.email.split('@')[0].trim().toLowerCase() : '') ||
+      resolvedId.toLowerCase();
+
+    return {
+      id: resolvedId,
+      firebaseUid: String(raw.firebaseUid || resolvedId),
+      name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : fallbackUsername,
+      username: fallbackUsername,
+      email: typeof raw.email === 'string' ? raw.email.trim().toLowerCase() : '',
+      isEmailVerified: Boolean(raw.isEmailVerified),
+      role: normalizedRole,
+      status: normalizedStatus,
+      allowedModules: Array.isArray(raw.allowedModules) ? (raw.allowedModules as AppModule[]) : [],
+      deliveryPermissions:
+        raw.deliveryPermissions && typeof raw.deliveryPermissions === 'object'
+          ? (raw.deliveryPermissions as DeliveryPermissions)
+          : undefined,
+      phone: typeof raw.phone === 'string' ? raw.phone.trim() : '',
+      createdAt: typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : new Date().toISOString(),
+      updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : undefined,
+      lastLoginAt: typeof raw.lastLoginAt === 'string' ? raw.lastLoginAt : undefined,
+      authProvider: raw.authProvider || 'firebase_custom_token',
+      provisioningState:
+        raw.provisioningState === 'PENDING' ||
+        raw.provisioningState === 'FINALIZING' ||
+        raw.provisioningState === 'ACTIVE'
+          ? raw.provisioningState
+          : undefined,
+    };
+  }
+
+  private generateAuthOperationId(prefix: string): string {
+    const rand =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID().replace(/-/g, '')
+        : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+    return `${prefix}_${rand}`.slice(0, 80);
+  }
+
+  private async callAuthenticatedAuthEndpoint(
+    url: string,
+    options: { method: 'GET' | 'POST' | 'PUT' | 'DELETE'; body?: Record<string, unknown>; forceRefreshToken?: boolean }
+  ): Promise<{
+    ok: boolean;
+    status: number;
+    data: Record<string, any> | null;
+    errorMessage?: string;
+    code?: string;
+    networkError?: boolean;
+  }> {
+    if (typeof fetch !== 'function') {
+      return {
+        ok: false,
+        status: 0,
+        data: null,
+        code: 'FETCH_UNAVAILABLE',
+        errorMessage: 'API de rede indisponível neste ambiente.',
+        networkError: true,
+      };
+    }
+
+    const idToken = await getFirebaseIdToken(Boolean(options.forceRefreshToken));
+    if (!idToken) {
+      return {
+        ok: false,
+        status: 401,
+        data: null,
+        code: 'UNAUTHORIZED',
+        errorMessage: 'Sessão Firebase não autenticada. Faça login novamente.',
+      };
+    }
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${idToken}`,
+    };
+    if (options.body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    try {
+      const res = await fetch(url, {
+        method: options.method,
+        headers,
+        credentials: 'same-origin',
+        ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      if (parsed.isHtml || !parsed.isValidJson || !parsed.data) {
+        return {
+          ok: false,
+          status: parsed.status,
+          data: null,
+          code: 'INVALID_SERVER_RESPONSE',
+          errorMessage: `Resposta inválida do servidor de autenticação (HTTP ${parsed.status}).`,
+        };
+      }
+      return {
+        ok: parsed.ok && Boolean(parsed.data.success),
+        status: parsed.status,
+        data: parsed.data,
+        code: typeof parsed.data.code === 'string' ? parsed.data.code : undefined,
+        errorMessage:
+          typeof parsed.data.message === 'string' && parsed.data.message.trim()
+            ? parsed.data.message.trim()
+            : undefined,
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        status: 0,
+        data: null,
+        code: 'NETWORK_ERROR',
+        errorMessage: `Falha de comunicação com o servidor de autenticação: ${msg}`,
+        networkError: true,
+      };
+    }
+  }
+
+  /**
+   * Recovers the authoritative user profile for an authenticated Firebase UID from
+   * Firestore /users/{uid} or authenticated server endpoint /api/auth/sync-profile.
+   * Never creates accounts, never accepts client-supplied roles, and rejects blocked or incomplete accounts.
+   */
+  private async recoverAuthenticatedProfile(
+    firebaseUser: { uid: string; getIdToken?: (forceRefresh?: boolean) => Promise<string> },
+    options?: { allowTransientOfflinePreserve?: boolean }
+  ): Promise<{
+    profile: User | null;
+    revoked: boolean;
+    error?: string;
+    code?: string;
+  }> {
+    if (!firebaseUser || !firebaseUser.uid) {
+      return { profile: null, revoked: true, code: 'NO_FIREBASE_USER', error: 'Sessão Firebase ausente.' };
+    }
+
+    let rawProfile: (Partial<User> & Record<string, unknown>) | null = null;
+    let transientError = false;
+    let explicitRevoked = false;
+    let explicitError: string | undefined;
+    let explicitCode: string | undefined;
+
+    // 1. Authoritative Firestore /users/{uid} read when Firestore client SDK is available
+    if (db) {
+      try {
+        const snap = await getDoc(doc(db, 'users', firebaseUser.uid));
+        if (snap.exists()) {
+          rawProfile = { ...(snap.data() as Record<string, unknown>), id: firebaseUser.uid };
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (this.isOfflineErrorMessage(msg)) {
+          transientError = true;
+        }
+      }
+    }
+
+    // 2. Authoritative server lookup (/api/auth/sync-profile) using Firebase ID Token
+    if (!rawProfile && typeof fetch === 'function') {
+      try {
+        const idToken =
+          typeof firebaseUser.getIdToken === 'function'
+            ? await firebaseUser.getIdToken()
+            : await getFirebaseIdToken();
+        if (idToken) {
+          const res = await fetch('/api/auth/sync-profile', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${idToken}`,
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({}),
+          });
+          const parsed = await this.readServerJsonResponse(res);
+          if (parsed.ok && parsed.isValidJson && parsed.data?.success && parsed.data?.profile) {
+            rawProfile = { ...(parsed.data.profile as Record<string, unknown>), id: firebaseUser.uid };
+          } else if (parsed.status === 401 || parsed.status === 403 || parsed.status === 404) {
+            explicitRevoked = true;
+            explicitCode = typeof parsed.data?.code === 'string' ? parsed.data.code : `HTTP_${parsed.status}`;
+            explicitError =
+              typeof parsed.data?.message === 'string'
+                ? parsed.data.message
+                : 'Perfil de colaborador não encontrado ou desativado.';
+          } else if (parsed.status >= 500 || parsed.isHtml || !parsed.isValidJson) {
+            transientError = true;
+            explicitError =
+              typeof parsed.data?.message === 'string'
+                ? parsed.data.message
+                : `Servidor de perfil indisponível (HTTP ${parsed.status}).`;
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (this.isOfflineErrorMessage(msg)) {
+          transientError = true;
+        }
+        explicitError = `Não foi possível confirmar seu perfil no servidor: ${msg}`;
+      }
+    }
+
+    if (rawProfile) {
+      if (rawProfile.provisioningState !== undefined && rawProfile.provisioningState !== 'ACTIVE') {
+        return {
+          profile: null,
+          revoked: true,
+          code: 'PROVISIONING_INCOMPLETE',
+          error: 'Cadastro ainda em finalização. Aguarde a confirmação completa pelo administrador.',
+        };
+      }
+
+      const normalized = this.sanitizeClientUserProfile(rawProfile, firebaseUser.uid);
+
+      if (normalized.status === 'BLOQUEADO') {
+        return {
+          profile: null,
+          revoked: true,
+          code: 'ACCOUNT_BLOCKED',
+          error: 'Esta conta está bloqueada pelo administrador.',
+        };
+      }
+      if (normalized.status === 'DESATIVADO') {
+        return {
+          profile: null,
+          revoked: true,
+          code: 'ACCOUNT_DEACTIVATED',
+          error: 'Esta conta foi desativada pelo administrador.',
+        };
+      }
+      if (!this.isAuthorizedStaffRole(normalized.role)) {
+        return {
+          profile: null,
+          revoked: true,
+          code: 'UNAUTHORIZED_ROLE',
+          error: 'Esta conta não possui função autorizada de colaborador.',
+        };
+      }
+
+      return { profile: normalized, revoked: false };
+    }
+
+    // During a transient offline blip on an ALREADY active session for the SAME UID, preserve the existing session
+    if (options?.allowTransientOfflinePreserve && transientError && !explicitRevoked) {
+      const existing = this.getCurrentUser();
+      if (
+        existing &&
+        existing.id === firebaseUser.uid &&
+        existing.status === 'ATIVO' &&
+        (existing.provisioningState === undefined || existing.provisioningState === 'ACTIVE') &&
+        this.isAuthorizedStaffRole(existing.role)
+      ) {
+        return { profile: existing, revoked: false };
+      }
+    }
+
+    return {
+      profile: null,
+      revoked: true,
+      code: explicitCode || 'PROFILE_NOT_CONFIRMED',
+      error:
+        explicitError ||
+        'Não foi possível confirmar o perfil ativo do colaborador no servidor. Tente entrar novamente.',
+    };
+  }
+
+  /**
+   * Deterministic helper to reload the authenticated user profile from the active Firebase session.
+   */
+  public async refreshSessionProfileFromAuth(): Promise<User | null> {
+    await this.waitForFirebaseAuthReady();
+    const fbUser = getCurrentFirebaseUser();
+    if (!fbUser) {
+      if (isFirebaseAuthAvailable()) {
+        this.activeStaffRole = null;
+        this.activeStaffUid = null;
+        this.stopStaffFirestoreSync();
+        this.setCurrentUser(null);
+      }
+      return null;
+    }
+
+    const recovered = await this.recoverAuthenticatedProfile(fbUser, { allowTransientOfflinePreserve: false });
+    if (recovered.profile && recovered.profile.status === 'ATIVO') {
+      this.activeStaffRole = recovered.profile.role;
+      this.activeStaffUid = fbUser.uid;
+      this.upsertLocalUserCleanly(recovered.profile);
+      this.setCurrentUser(recovered.profile);
+      return recovered.profile;
+    }
+
+    this.activeStaffRole = null;
+    this.activeStaffUid = null;
+    this.stopStaffFirestoreSync();
+    this.setCurrentUser(null);
+    await signOutFirebase().catch(() => {});
+    return null;
+  }
+
   public getUsers(): User[] {
     try {
       const data = localStorage.getItem('gf_users');
-      const list: User[] = data ? JSON.parse(data) : INITIAL_USERS;
-      return (Array.isArray(list) ? list : INITIAL_USERS).map((u) => ({
-        ...u,
-        name: u.name || 'Colaborador',
-        username: (u.username || (u.email ? u.email.split('@')[0] : u.id) || 'usuario').toLowerCase(),
-        email: u.email || '',
-        isEmailVerified: Boolean(u.isEmailVerified),
-        role: u.role || 'ATENDENTE',
-        status: u.status || 'ATIVO',
-        allowedModules: Array.isArray(u.allowedModules) ? u.allowedModules : [],
-      }));
+      if (!data) return [];
+      const list: User[] = JSON.parse(data);
+      return (Array.isArray(list) ? list : []).map((u) => this.sanitizeClientUserProfile(u as any, u.id));
     } catch {
-      return INITIAL_USERS;
+      return [];
     }
   }
 
@@ -9457,7 +9984,7 @@ class StoreService {
       };
     }
     const role = (user.role || '').toUpperCase();
-    if (role === 'ADMINISTRADOR' || user.username === 'admin') {
+    if (role === 'ADMINISTRADOR') {
       return {
         canViewDeliveryDashboard: true,
         canManageDrivers: true,
@@ -9527,258 +10054,602 @@ class StoreService {
     this.notify('AUTH_CHANGED', user);
   }
 
-  private getUserPasswords(): Record<string, string> {
+  /**
+   * Compatibility method preserved for legacy StaffManager screen (updated in Etapa 2C).
+   * Passwords are NEVER stored or returned in plaintext on the client.
+   */
+  public getUserPassword(_userId: string): string {
+    return '';
+  }
+
+  /**
+   * Checks whether initial administrator setup is required (fail-closed on errors).
+   */
+  public async getAuthBootstrapStatus(): Promise<AuthBootstrapStatus> {
+    if (typeof fetch !== 'function') {
+      return {
+        initialized: true,
+        mode: 'unavailable',
+        message: 'Serviço de autenticação indisponível neste ambiente.',
+      };
+    }
     try {
-      const data = localStorage.getItem('gf_user_passwords');
-      return data ? JSON.parse(data) : {};
-    } catch {
-      return {};
-    }
-  }
-
-  private saveUserPasswords(passwords: Record<string, string>): void {
-    localStorage.setItem('gf_user_passwords', JSON.stringify(passwords));
-  }
-
-  public getUserPassword(userId: string): string {
-    const passwords = this.getUserPasswords();
-    return passwords[userId] || '123456';
-  }
-
-  public createUser(
-    userData: Omit<User, 'id' | 'createdAt'>,
-    initialPassword = '123456'
-  ): { success: boolean; user?: User; message: string } {
-    // 1. RBAC authorization check
-    const actor = this.getCurrentUser();
-    const actorRole = actor?.role?.toUpperCase();
-    if (!actor || !['ADMINISTRADOR', 'GERENTE'].includes(actorRole || '')) {
-      return { success: false, message: 'Acesso negado: apenas Administrador ou Gerente possuem autorização para cadastrar colaboradores.' };
-    }
-
-    if (actorRole === 'GERENTE') {
-      if (userData.role === 'ADMINISTRADOR') {
-        return { success: false, message: 'Permissão insuficiente: Gerente não pode cadastrar um Administrador Geral.' };
+      const res = await fetch('/api/auth/bootstrap-status', {
+        method: 'GET',
+        credentials: 'same-origin',
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      if (!parsed.isValidJson || parsed.isHtml || !parsed.data) {
+        return {
+          initialized: true,
+          mode: 'unavailable',
+          message: `Resposta inválida do servidor (HTTP ${parsed.status}).`,
+        };
       }
-      if (userData.allowedModules?.includes('usuarios')) {
-        return { success: false, message: 'Permissão insuficiente: Gerente não pode conceder acesso ao módulo de Gestão de Usuários.' };
-      }
+      const mode =
+        parsed.data.mode === 'setup_required' || parsed.data.mode === 'login' || parsed.data.mode === 'unavailable'
+          ? parsed.data.mode
+          : parsed.data.initialized === false && parsed.ok
+            ? 'setup_required'
+            : 'unavailable';
+      return {
+        initialized: mode !== 'setup_required',
+        mode,
+        message: typeof parsed.data.message === 'string' ? parsed.data.message : undefined,
+        checkedAt: typeof parsed.data.checkedAt === 'string' ? parsed.data.checkedAt : new Date().toISOString(),
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        initialized: true,
+        mode: 'unavailable',
+        message: `Não foi possível verificar o status inicial de autenticação: ${msg}`,
+      };
+    }
+  }
+
+  /**
+   * Executes one-time initial ADMINISTRADOR setup via POST /api/auth/bootstrap-admin
+   * and signs in with the returned Firebase Custom Token after full server confirmation.
+   */
+  public async bootstrapInitialAdmin(payload: BootstrapAdminPayload): Promise<AuthActionResult<User>> {
+    if (!isFirebaseAuthAvailable()) {
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'FIREBASE_NOT_CONFIGURED',
+        message: 'Firebase Authentication não está configurado neste dispositivo.',
+      };
     }
 
-    const users = this.getUsers();
-    const cleanUsername = userData.username.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '');
-    
-    if (!cleanUsername) {
-      return { success: false, message: 'Nome de usuário inválido ou vazio.' };
+    const cleanUsername = String(payload.username || '').trim().toLowerCase();
+    if (!cleanUsername || cleanUsername.includes('@')) {
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'INVALID_USERNAME',
+        message: 'Informe um nome de login válido (sem e-mail ou @).',
+      };
     }
 
-    if (users.some((u) => (u.username || '').toLowerCase() === cleanUsername)) {
-      return { success: false, message: 'Nome de usuário já cadastrado. Escolha outro nome de login.' };
-    }
+    const operationId = payload.idempotencyKey?.trim() || this.generateAuthOperationId('boot');
 
-    // Resolve or generate synthetic email if user did not provide an email
-    const cleanEmail = userData.email && userData.email.includes('@')
-      ? userData.email.trim().toLowerCase()
-      : `${cleanUsername}@staff.amanditasabores.com.br`;
-
-    if (userData.email && userData.email.trim().length > 0 && users.some((u) => (u.email || '').toLowerCase() === cleanEmail)) {
-      return { success: false, message: 'E-mail já registrado para outro colaborador.' };
-    }
-
-    // Secure, collision-resistant identifier
-    const entropy = Math.random().toString(36).substring(2, 9);
-    const secureId = `usr-${Date.now()}-${entropy}`;
-
-    const newUser: User = {
-      ...userData,
-      id: secureId,
-      name: userData.name?.trim() || cleanUsername,
-      username: cleanUsername,
-      email: cleanEmail,
-      isEmailVerified: true,
-      status: userData.status || 'ATIVO',
-      allowedModules: userData.allowedModules || ['pdv', 'kanban'],
-      createdAt: new Date().toISOString(),
-    };
-
-    users.push(newUser);
-    localStorage.setItem('gf_users', JSON.stringify(users));
-
-    // Save initial password locally
-    const passwords = this.getUserPasswords();
-    passwords[newUser.id] = initialPassword;
-    this.saveUserPasswords(passwords);
-
-    // Call backend API safely for credential registration
-    if (typeof window !== 'undefined') {
-      fetch('/api/auth/register-staff', {
+    try {
+      const res = await fetch('/api/auth/bootstrap-admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
         body: JSON.stringify({
+          name: String(payload.name || '').trim(),
           username: cleanUsername,
-          name: newUser.name,
-          role: newUser.role,
-          allowedModules: newUser.allowedModules,
-          requesterRole: actor.role,
-        })
-      }).catch(() => {
-        // Non-blocking in case server is starting
+          phone: String(payload.phone || '').trim(),
+          password: String(payload.password || ''),
+          idempotencyKey: operationId,
+        }),
       });
-    }
+      const parsed = await this.readServerJsonResponse(res);
+      if (parsed.isHtml || !parsed.isValidJson || !parsed.data) {
+        return {
+          success: false,
+          isCloudAuth: false,
+          code: 'INVALID_SERVER_RESPONSE',
+          message: `Resposta inválida do servidor na configuração inicial (HTTP ${parsed.status}).`,
+        };
+      }
 
-    // Audit log
-    this.logAccess({
-      userId: newUser.id,
-      username: newUser.username,
-      role: newUser.role,
-      action: 'LOGIN_SUCESSO',
-      details: `Novo funcionário cadastrado por ${actor.username}: ${newUser.name || newUser.username} (${newUser.role})`,
-    });
+      if (!parsed.ok || !parsed.data.success) {
+        return {
+          success: false,
+          isCloudAuth: false,
+          code: typeof parsed.data.code === 'string' ? parsed.data.code : undefined,
+          retryAfterSeconds: typeof parsed.data.retryAfterSeconds === 'number' ? parsed.data.retryAfterSeconds : undefined,
+          message: parsed.data.message || 'Não foi possível concluir a configuração inicial do administrador.',
+        };
+      }
 
-    this.notify('USERS_UPDATED', newUser);
+      const customToken = typeof parsed.data.customToken === 'string' ? parsed.data.customToken.trim() : '';
+      const serverUser = parsed.data.user as Partial<User> | undefined;
+      if (!customToken || !serverUser?.id) {
+        return {
+          success: false,
+          isCloudAuth: false,
+          code: 'INCOMPLETE_AUTH_RESPONSE',
+          message: 'O servidor não retornou um token de autenticação válido. Tente entrar pela tela de login.',
+        };
+      }
 
-    // Asynchronously save user profile & permissions to Firestore (WITHOUT plain text password)
-    if (db) {
-      setDoc(doc(db, 'users', newUser.id), newUser).catch((err) => {
-        console.warn('[Firestore User Sync]:', err?.message || err);
+      return this.completeCustomTokenSignIn(customToken, serverUser, {
+        successMessage: parsed.data.message || 'Administrador inicial configurado com sucesso!',
+        idempotentReplay: Boolean(parsed.data.idempotentReplay),
+        auditAction: 'PRIMEIRO_ACESSO_ADMIN',
       });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'NETWORK_ERROR',
+        message: `Falha de comunicação ao configurar o administrador inicial: ${msg}`,
+      };
     }
-
-    return { success: true, user: newUser, message: 'Funcionário cadastrado com sucesso!' };
   }
 
-  public updateUser(id: string, updates: Partial<User>): { success: boolean; user?: User; message: string } {
-    const actor = this.getCurrentUser();
-    const actorRole = actor?.role?.toUpperCase();
-    if (!actor || !['ADMINISTRADOR', 'GERENTE'].includes(actorRole || '')) {
-      return { success: false, message: 'Acesso negado: apenas Administrador ou Gerente possuem autorização para alterar funcionários.' };
+  /**
+   * Fetches the authoritative staff list from GET /api/auth/staff (ADMINISTRADOR only).
+   */
+  public async fetchStaffListAsync(): Promise<AuthActionResult<User[]>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode gerenciar funcionários.',
+      };
     }
 
-    const users = this.getUsers();
-    const index = users.findIndex((u) => u.id === id);
-    if (index === -1) {
-      return { success: false, message: 'Funcionário não encontrado.' };
+    const res = await this.callAuthenticatedAuthEndpoint('/api/auth/staff', { method: 'GET' });
+    if (!res.ok || !res.data || !Array.isArray(res.data.users)) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível carregar a lista de funcionários.',
+      };
     }
 
-    const target = users[index];
+    const authoritativeUsers = res.data.users.map((u: Record<string, unknown>) =>
+      this.sanitizeClientUserProfile(u, String(u.id || ''))
+    );
 
-    // Gerente restrictions
-    if (actorRole === 'GERENTE') {
-      if (target.role === 'ADMINISTRADOR') {
-        return { success: false, message: 'Permissão insuficiente: Gerente não pode modificar o Administrador Geral.' };
-      }
-      if (updates.role === 'ADMINISTRADOR') {
-        return { success: false, message: 'Permissão insuficiente: Gerente não pode promover colaboradores a Administrador.' };
-      }
-      if (updates.allowedModules?.includes('usuarios')) {
-        return { success: false, message: 'Permissão insuficiente: Gerente não pode conceder acesso ao módulo de Gestão de Usuários.' };
+    // Preserve any legacy un-migrated local entries whose id/username do not conflict with authoritative server users
+    const existingLocal = this.getUsers();
+    const merged: User[] = [...authoritativeUsers];
+    for (const lu of existingLocal) {
+      const luUsername = (lu.username || '').trim().toLowerCase();
+      const exists = merged.some(
+        (au) => au.id === lu.id || (luUsername && (au.username || '').trim().toLowerCase() === luUsername)
+      );
+      if (!exists) {
+        merged.push(lu);
       }
     }
 
-    const updatedUser: User = { 
-      ...target, 
-      ...updates,
-      updatedAt: new Date().toISOString()
+    try {
+      localStorage.setItem('gf_users', JSON.stringify(merged));
+    } catch {
+      // storage quota fallback
+    }
+    this.notify('USERS_UPDATED', { count: merged.length });
+
+    return {
+      success: true,
+      message: 'Lista de funcionários atualizada.',
+      users: authoritativeUsers,
     };
+  }
 
-    users[index] = updatedUser;
-    localStorage.setItem('gf_users', JSON.stringify(users));
+  /**
+   * Registers a new staff member via POST /api/auth/register-staff (ADMINISTRADOR only).
+   * Never stores plaintext passwords locally and never trusts client-supplied privileges.
+   */
+  public async createUserAsync(payload: CreateStaffPayload): Promise<AuthActionResult<User>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode cadastrar funcionários.',
+      };
+    }
+
+    const operationId = payload.idempotencyKey?.trim() || this.generateAuthOperationId('staff');
+    const res = await this.callAuthenticatedAuthEndpoint('/api/auth/register-staff', {
+      method: 'POST',
+      body: {
+        name: String(payload.name || '').trim(),
+        username: String(payload.username || '').trim().toLowerCase(),
+        phone: String(payload.phone || '').trim(),
+        password: String(payload.password || ''),
+        role: payload.role,
+        allowedModules: payload.allowedModules,
+        ...(payload.deliveryPermissions ? { deliveryPermissions: payload.deliveryPermissions } : {}),
+        idempotencyKey: operationId,
+      },
+    });
+
+    if (!res.ok || !res.data?.user) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível cadastrar o funcionário.',
+      };
+    }
+
+    const createdUser = this.sanitizeClientUserProfile(res.data.user, String(res.data.user.id || ''));
+    this.upsertLocalUserCleanly(createdUser);
+    this.notify('USERS_UPDATED', createdUser);
+
+    return {
+      success: true,
+      idempotentReplay: Boolean(res.data.idempotentReplay),
+      user: createdUser,
+      message: res.data.message || 'Funcionário cadastrado com sucesso!',
+    };
+  }
+
+  /**
+   * Updates an existing staff member via PUT /api/auth/update-staff/:uid (ADMINISTRADOR only).
+   */
+  public async updateUserAsync(uid: string, updates: UpdateStaffPayload): Promise<AuthActionResult<User>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode alterar funcionários.',
+      };
+    }
+
+    const cleanUid = String(uid || '').trim();
+    if (!cleanUid) {
+      return { success: false, code: 'INVALID_UID', message: 'Identificador do funcionário é obrigatório.' };
+    }
+
+    const existing = this.getUsers().find((u) => u.id === cleanUid);
+
+    const body: Record<string, unknown> = {
+      name: updates.name !== undefined ? String(updates.name).trim() : String(existing?.name || '').trim(),
+      username:
+        updates.username !== undefined
+          ? String(updates.username).trim().toLowerCase()
+          : String(existing?.username || '').trim().toLowerCase(),
+      phone: updates.phone !== undefined ? String(updates.phone).trim() : String(existing?.phone || '').trim(),
+      role: updates.role !== undefined ? updates.role : existing?.role,
+      status: updates.status !== undefined ? updates.status : existing?.status || 'ATIVO',
+    };
+    if (updates.allowedModules !== undefined) {
+      body.allowedModules = updates.allowedModules;
+    } else if (existing?.allowedModules) {
+      body.allowedModules = existing.allowedModules;
+    }
+    if (updates.deliveryPermissions !== undefined) {
+      body.deliveryPermissions = updates.deliveryPermissions;
+    } else if (existing?.deliveryPermissions) {
+      body.deliveryPermissions = existing.deliveryPermissions;
+    }
+
+    const res = await this.callAuthenticatedAuthEndpoint(
+      `/api/auth/update-staff/${encodeURIComponent(cleanUid)}`,
+      { method: 'PUT', body }
+    );
+
+    if (!res.ok || !res.data?.user) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível atualizar os dados do funcionário.',
+      };
+    }
+
+    const updatedUser = this.sanitizeClientUserProfile(res.data.user, cleanUid);
+    this.upsertLocalUserCleanly(updatedUser, cleanUid);
 
     const current = this.getCurrentUser();
-    if (current && current.id === id) {
+    if (current && current.id === updatedUser.id) {
       this.setCurrentUser(updatedUser);
     }
 
     this.notify('USERS_UPDATED', updatedUser);
-
-    if (db) {
-      setDoc(doc(db, 'users', id), updatedUser).catch((err) => {
-        console.warn('[Firestore User Update]:', err?.message || err);
-      });
-    }
-
-    return { success: true, user: updatedUser, message: 'Dados do funcionário atualizados!' };
+    return {
+      success: true,
+      user: updatedUser,
+      message: res.data.message || 'Dados do funcionário atualizados com sucesso!',
+    };
   }
 
-  public resetUserPassword(userId: string, newPassword: string): { success: boolean; message: string } {
-    const actor = this.getCurrentUser();
-    const actorRole = actor?.role?.toUpperCase();
-    if (!actor || !['ADMINISTRADOR', 'GERENTE'].includes(actorRole || '')) {
-      return { success: false, message: 'Acesso negado: apenas Administrador ou Gerente podem redefinir senhas.' };
+  /**
+   * Resets a staff member's password via POST /api/auth/reset-password (ADMINISTRADOR only).
+   * Never writes plaintext passwords to localStorage.
+   */
+  public async resetUserPasswordAsync(targetUid: string, newPassword: string): Promise<AuthActionResult<void>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode redefinir senhas.',
+      };
     }
 
-    const user = this.getUserById(userId);
-    if (!user) {
-      return { success: false, message: 'Colaborador não encontrado.' };
-    }
-
-    if (actorRole === 'GERENTE' && user.role === 'ADMINISTRADOR') {
-      return { success: false, message: 'Permissão insuficiente: Gerente não pode alterar a senha do Administrador Geral.' };
-    }
-
-    if (!newPassword || newPassword.length < 4) {
-      return { success: false, message: 'A nova senha deve ter no mínimo 4 caracteres.' };
-    }
-
-    const passwords = this.getUserPasswords();
-    passwords[userId] = newPassword;
-    this.saveUserPasswords(passwords);
-
-    if (typeof window !== 'undefined') {
-      fetch('/api/auth/reset-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          targetUserId: userId,
-          targetUserRole: user.role,
-          newPassword,
-          requesterRole: actor.role,
-        })
-      }).catch(() => {});
-    }
-
-    this.logAccess({
-      userId,
-      username: user.username,
-      role: user.role,
-      action: 'SENHA_ALTERADA',
-      details: `Senha redefinida por @${actor.username} para ${user.name || user.username}`,
+    const res = await this.callAuthenticatedAuthEndpoint('/api/auth/reset-password', {
+      method: 'POST',
+      body: {
+        targetUid: String(targetUid || '').trim(),
+        newPassword: String(newPassword || ''),
+      },
     });
 
-    this.notify('USERS_UPDATED', { userId });
-    return { success: true, message: 'Senha redefinida com sucesso!' };
+    if (!res.ok) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível redefinir a senha do funcionário.',
+      };
+    }
+
+    this.notify('USERS_UPDATED', { userId: targetUid });
+    return {
+      success: true,
+      message: res.data?.message || 'Senha redefinida com sucesso!',
+    };
   }
 
-  public deleteUser(id: string): { success: boolean; message: string } {
-    const actor = this.getCurrentUser();
-    if (!actor || actor.role !== 'ADMINISTRADOR') {
-      return { success: false, message: 'Apenas o Administrador Geral possui autorização para excluir funcionários.' };
+  /**
+   * Toggles a staff member's status via POST /api/auth/toggle-status (ADMINISTRADOR only).
+   */
+  public async toggleUserStatusAsync(targetUid: string, status: UserStatus): Promise<AuthActionResult<User>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode bloquear ou desbloquear funcionários.',
+      };
     }
 
-    const users = this.getUsers();
-    const user = users.find((u) => u.id === id);
-    if (!user) return { success: false, message: 'Usuário não encontrado.' };
+    const res = await this.callAuthenticatedAuthEndpoint('/api/auth/toggle-status', {
+      method: 'POST',
+      body: {
+        targetUid: String(targetUid || '').trim(),
+        status,
+      },
+    });
 
-    if (user.username === 'admin' || user.role === 'ADMINISTRADOR') {
-      return { success: false, message: 'A conta do Administrador Geral não pode ser excluída.' };
+    if (!res.ok || !res.data?.user) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível alterar o status do funcionário.',
+      };
     }
 
-    const filtered = users.filter((u) => u.id !== id);
-    localStorage.setItem('gf_users', JSON.stringify(filtered));
+    const updatedUser = this.sanitizeClientUserProfile(res.data.user, targetUid);
+    this.upsertLocalUserCleanly(updatedUser, targetUid);
+    this.notify('USERS_UPDATED', updatedUser);
 
-    const passwords = this.getUserPasswords();
-    delete passwords[id];
-    this.saveUserPasswords(passwords);
+    return {
+      success: true,
+      user: updatedUser,
+      message: res.data.message || `Status atualizado para ${status}.`,
+    };
+  }
 
-    this.notify('USERS_UPDATED', { id });
+  /**
+   * Deletes a staff member via DELETE /api/auth/delete-staff/:uid (ADMINISTRADOR only).
+   * Preserves legacy local password records untouched until migration is planned.
+   */
+  public async deleteUserAsync(uid: string): Promise<AuthActionResult<void>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode excluir funcionários.',
+      };
+    }
 
-    if (db) {
-      deleteDoc(doc(db, 'users', id)).catch((err) => {
-        handleFirestoreError(err, OperationType.DELETE, `users/${id}`);
+    const cleanUid = String(uid || '').trim();
+    if (!cleanUid) {
+      return { success: false, code: 'INVALID_UID', message: 'Identificador do funcionário é obrigatório.' };
+    }
+
+    const res = await this.callAuthenticatedAuthEndpoint(
+      `/api/auth/delete-staff/${encodeURIComponent(cleanUid)}`,
+      { method: 'DELETE' }
+    );
+
+    if (!res.ok) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível excluir o funcionário.',
+      };
+    }
+
+    const filtered = this.getUsers().filter((u) => u.id !== cleanUid);
+    try {
+      localStorage.setItem('gf_users', JSON.stringify(filtered));
+    } catch {
+      // storage quota fallback
+    }
+    this.notify('USERS_UPDATED', { id: cleanUid });
+
+    return {
+      success: true,
+      message: res.data?.message || 'Funcionário removido com sucesso!',
+    };
+  }
+
+  /**
+   * Updates the authenticated ADMINISTRADOR's own credentials (username, password, name, phone)
+   * via POST /api/auth/account/credentials while strictly preserving role and all permissions.
+   */
+  public async updateOwnAdminCredentialsAsync(
+    payload: UpdateOwnCredentialsPayload
+  ): Promise<AuthActionResult<User>> {
+    if (!this.canUserManageUsers()) {
+      return {
+        success: false,
+        code: 'FORBIDDEN',
+        message: 'Acesso negado: somente o Administrador pode alterar suas credenciais administrativas.',
+      };
+    }
+
+    const res = await this.callAuthenticatedAuthEndpoint('/api/auth/account/credentials', {
+      method: 'POST',
+      body: {
+        currentPassword: String(payload.currentPassword || ''),
+        ...(payload.newUsername !== undefined ? { newUsername: String(payload.newUsername).trim().toLowerCase() } : {}),
+        ...(payload.newPassword !== undefined ? { newPassword: String(payload.newPassword) } : {}),
+        ...(payload.name !== undefined ? { name: String(payload.name).trim() } : {}),
+        ...(payload.phone !== undefined ? { phone: String(payload.phone).trim() } : {}),
+      },
+    });
+
+    if (!res.ok || !res.data?.user) {
+      return {
+        success: false,
+        code: res.code,
+        message: res.errorMessage || 'Não foi possível atualizar suas credenciais.',
+      };
+    }
+
+    const updatedAdmin = this.sanitizeClientUserProfile(res.data.user, String(res.data.user.id || ''));
+    this.upsertLocalUserCleanly(updatedAdmin, updatedAdmin.id);
+    this.setCurrentUser(updatedAdmin);
+    this.notify('USERS_UPDATED', updatedAdmin);
+
+    return {
+      success: true,
+      user: updatedAdmin,
+      message: res.data.message || 'Credenciais atualizadas com sucesso!',
+    };
+  }
+
+  /**
+   * Temporary synchronous compatibility wrapper for legacy StaffManager.tsx (replaced in Etapa 2C).
+   * Enforces ADMINISTRADOR-only RBAC, forbids default password '123456', never writes plaintext passwords
+   * to localStorage, and dispatches to the authenticated server endpoint.
+   */
+  public createUser(
+    userData: Omit<User, 'id' | 'createdAt'>,
+    initialPassword?: string
+  ): { success: boolean; user?: User; message: string } {
+    if (!this.canUserManageUsers()) {
+      return { success: false, message: 'Acesso negado: somente o Administrador pode cadastrar funcionários.' };
+    }
+
+    const cleanUsername = String(userData.username || '').trim().toLowerCase();
+    if (!cleanUsername || cleanUsername.includes('@')) {
+      return { success: false, message: 'Informe um nome de login válido (sem e-mail).' };
+    }
+
+    const cleanPassword = typeof initialPassword === 'string' ? initialPassword : '';
+    if (!cleanPassword || cleanPassword.length < 6) {
+      return { success: false, message: 'A senha inicial deve possuir no mínimo 6 caracteres.' };
+    }
+
+    this.createUserAsync({
+      name: userData.name?.trim() || cleanUsername,
+      username: cleanUsername,
+      phone: userData.phone?.trim() || '',
+      password: cleanPassword,
+      role: userData.role,
+      allowedModules: userData.allowedModules || ['pdv', 'kanban'],
+      deliveryPermissions: userData.deliveryPermissions,
+    }).catch((err) => {
+      console.warn('[Store Auth] Falha ao cadastrar funcionário via API:', err);
+    });
+
+    return {
+      success: true,
+      message: 'Solicitação de cadastro enviada ao servidor de autenticação.',
+    };
+  }
+
+  /**
+   * Temporary synchronous compatibility wrapper for legacy StaffManager.tsx (replaced in Etapa 2C).
+   */
+  public updateUser(id: string, updates: Partial<User>): { success: boolean; user?: User; message: string } {
+    if (!this.canUserManageUsers()) {
+      return { success: false, message: 'Acesso negado: somente o Administrador pode alterar funcionários.' };
+    }
+
+    const target = this.getUserById(id);
+    if (!target) {
+      return { success: false, message: 'Funcionário não encontrado.' };
+    }
+
+    if (updates.status && Object.keys(updates).length === 1) {
+      this.toggleUserStatusAsync(id, updates.status).catch((err) => {
+        console.warn('[Store Auth] Falha ao alterar status do funcionário via API:', err);
+      });
+    } else {
+      this.updateUserAsync(id, {
+        name: updates.name,
+        username: updates.username,
+        phone: updates.phone,
+        role: updates.role,
+        status: updates.status,
+        allowedModules: updates.allowedModules,
+        deliveryPermissions: updates.deliveryPermissions,
+      }).catch((err) => {
+        console.warn('[Store Auth] Falha ao atualizar funcionário via API:', err);
       });
     }
 
-    return { success: true, message: 'Funcionário removido com sucesso!' };
+    return { success: true, user: target, message: 'Atualização enviada ao servidor de autenticação.' };
+  }
+
+  /**
+   * Temporary synchronous compatibility wrapper for legacy StaffManager.tsx (replaced in Etapa 2C).
+   * Never stores plaintext passwords in localStorage.
+   */
+  public resetUserPassword(userId: string, newPassword: string): { success: boolean; message: string } {
+    if (!this.canUserManageUsers()) {
+      return { success: false, message: 'Acesso negado: somente o Administrador pode redefinir senhas.' };
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      return { success: false, message: 'A nova senha deve ter no mínimo 6 caracteres.' };
+    }
+
+    this.resetUserPasswordAsync(userId, newPassword).catch((err) => {
+      console.warn('[Store Auth] Falha ao redefinir senha via API:', err);
+    });
+
+    return { success: true, message: 'Solicitação de redefinição de senha enviada ao servidor.' };
+  }
+
+  /**
+   * Temporary synchronous compatibility wrapper for legacy StaffManager.tsx (replaced in Etapa 2C).
+   * Never erases legacy gf_user_passwords automatically.
+   */
+  public deleteUser(id: string): { success: boolean; message: string } {
+    if (!this.canUserManageUsers()) {
+      return { success: false, message: 'Apenas o Administrador possui autorização para excluir funcionários.' };
+    }
+
+    const actor = this.getCurrentUser();
+    if (actor && actor.id === id) {
+      return { success: false, message: 'Você não pode excluir sua própria conta de Administrador.' };
+    }
+
+    const user = this.getUserById(id);
+    if (!user) return { success: false, message: 'Usuário não encontrado.' };
+
+    if ((user.role || '').toUpperCase() === 'ADMINISTRADOR') {
+      return { success: false, message: 'A conta de Administrador Geral não pode ser excluída.' };
+    }
+
+    this.deleteUserAsync(id).catch((err) => {
+      console.warn('[Store Auth] Falha ao remover funcionário via API:', err);
+    });
+
+    return { success: true, message: 'Solicitação de remoção enviada ao servidor.' };
   }
 
   // ---- Audit Access Logs ----
@@ -10292,476 +11163,262 @@ class StoreService {
     localStorage.setItem('gf_users', JSON.stringify(filtered));
   }
 
-  public async loginWithGoogle(): Promise<{ success: boolean; message: string; user?: User; isCloudAuth?: boolean }> {
-    if (!isFirebaseReady() || !auth) {
+  /**
+   * Google authentication is permanently disabled.
+   * Signature preserved temporarily for compile compatibility with legacy login screens (updated in Etapa 2C).
+   */
+  public async loginWithGoogle(): Promise<AuthActionResult<User>> {
+    return {
+      success: false,
+      isCloudAuth: false,
+      code: 'GOOGLE_AUTH_DISABLED',
+      message: 'O login com Google foi desativado por segurança. Utilize seu nome de login e senha.',
+    };
+  }
+
+  /**
+   * Shared secure helper to complete Firebase Custom Token authentication,
+   * verify UID consistency, recover the authoritative profile, and activate session cleanly.
+   * Never leaves a partial session on any error.
+   */
+  private async completeCustomTokenSignIn(
+    customToken: string,
+    serverUser: Partial<User>,
+    options: {
+      successMessage: string;
+      idempotentReplay?: boolean;
+      auditAction: UserAccessLog['action'];
+    }
+  ): Promise<AuthActionResult<User>> {
+    const expectedUid = String(serverUser.id || serverUser.firebaseUid || '').trim();
+    if (!expectedUid) {
       return {
         success: false,
         isCloudAuth: false,
-        message: 'Firebase Authentication não está configurado neste dispositivo.',
+        code: 'INVALID_USER_PAYLOAD',
+        message: 'Resposta de autenticação inválida: identificador de usuário ausente.',
       };
     }
 
+    // Ensure no previous Firebase Auth session for a different UID remains active
+    const existingFbUser = getCurrentFirebaseUser();
+    if (existingFbUser && existingFbUser.uid !== expectedUid) {
+      this.stopStaffFirestoreSync();
+      await signOutFirebase().catch(() => {});
+    }
+
+    let fbUser: Awaited<ReturnType<typeof signInWithFirebaseCustomToken>>;
     try {
-      const fbUser = await signInWithGoogle();
-      if (!fbUser) {
-        return { success: false, isCloudAuth: false, message: 'Operação de login com Google cancelada.' };
-      }
-
-      const fbEmail = (fbUser.email || '').trim().toLowerCase();
-      const isBootstrapAdmin = this.isBootstrappedAdminEmail(fbEmail);
-      const users = this.getUsers();
-      const localMatch = users.find((u) => u.id === fbUser.uid || (fbEmail && (u.email || '').trim().toLowerCase() === fbEmail));
-      const legacyId = localMatch && localMatch.id !== fbUser.uid ? localMatch.id : undefined;
-
-      let remoteProfile: User | null = null;
-      if (db) {
-        try {
-          const snap = await getDoc(doc(db, 'users', fbUser.uid));
-          if (snap.exists()) {
-            remoteProfile = snap.data() as User;
-          }
-        } catch (readErr) {
-          console.warn('[Auth Google] Falha ao ler /users/{uid}:', readErr);
-        }
-      }
-
-      const now = new Date().toISOString();
-      let resolvedProfile: User | null = null;
-
-      if (remoteProfile) {
-        if (remoteProfile.status === 'BLOQUEADO') {
-          await signOutFirebase().catch(() => {});
-          return { success: false, isCloudAuth: false, message: 'Esta conta está bloqueada pelo administrador.' };
-        }
-        if (remoteProfile.status === 'DESATIVADO') {
-          await signOutFirebase().catch(() => {});
-          return { success: false, isCloudAuth: false, message: 'Esta conta foi desativada.' };
-        }
-        resolvedProfile = {
-          ...remoteProfile,
-          id: fbUser.uid,
-          email: fbUser.email || remoteProfile.email,
-          isEmailVerified: fbUser.emailVerified,
-          authProvider: 'firebase_google',
-          firebaseUid: fbUser.uid,
-          lastLoginAt: now,
-        };
-      } else if (localMatch) {
-        if (localMatch.status === 'BLOQUEADO' || localMatch.status === 'DESATIVADO') {
-          await signOutFirebase().catch(() => {});
-          return { success: false, isCloudAuth: false, message: 'Esta conta de colaborador está bloqueada ou desativada.' };
-        }
-        resolvedProfile = {
-          ...localMatch,
-          id: fbUser.uid,
-          email: fbUser.email || localMatch.email,
-          isEmailVerified: fbUser.emailVerified,
-          authProvider: 'firebase_google',
-          firebaseUid: fbUser.uid,
-          lastLoginAt: now,
-          ...(isBootstrapAdmin ? { role: 'ADMINISTRADOR' as UserRole } : {}),
-        };
-      } else if (isBootstrapAdmin) {
-        resolvedProfile = {
-          id: fbUser.uid,
-          name: fbUser.displayName || 'Amanda Silveira (Admin)',
-          username: fbEmail.split('@')[0] || 'admin',
-          email: fbUser.email || fbEmail,
-          isEmailVerified: fbUser.emailVerified,
-          role: 'ADMINISTRADOR',
-          status: 'ATIVO',
-          allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
-          authProvider: 'firebase_google',
-          firebaseUid: fbUser.uid,
-          createdAt: now,
-          lastLoginAt: now,
-        };
-      } else {
-        await signOutFirebase().catch(() => {});
-        return {
-          success: false,
-          isCloudAuth: false,
-          message: 'Esta conta Google não está vinculada a nenhum colaborador ativo em /users/{uid}. Solicite seu cadastro ao administrador.',
-        };
-      }
-
-      let finalProfile: User = resolvedProfile;
-
-      // Confirm /users/{uid} existence/sync in Firestore before declaring cloud login successful
-      if (db) {
-        try {
-          if (remoteProfile) {
-            await updateDoc(doc(db, 'users', fbUser.uid), { lastLoginAt: now });
-          } else {
-            await setDoc(doc(db, 'users', fbUser.uid), this.cleanForFirestore(finalProfile));
-          }
-        } catch (fsErr: any) {
-          // Try backend /api/auth/sync-profile if client self-create was blocked (e.g. non-bootstrap email linking)
-          let syncedViaBackend = false;
-          if (typeof window !== 'undefined') {
-            try {
-              const idToken = await fbUser.getIdToken();
-              const syncRes = await fetch('/api/auth/sync-profile', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${idToken}`,
-                },
-                body: JSON.stringify({
-                  name: finalProfile.name,
-                  username: finalProfile.username,
-                  allowedModules: finalProfile.allowedModules,
-                }),
-              });
-              const syncData = await syncRes.json().catch(() => ({}));
-              if (syncRes.ok && syncData.success && syncData.profile) {
-                finalProfile = { ...finalProfile, ...syncData.profile, id: fbUser.uid, firebaseUid: fbUser.uid, authProvider: 'firebase_google' };
-                syncedViaBackend = true;
-              }
-            } catch {}
-          }
-          if (!syncedViaBackend) {
-            await signOutFirebase().catch(() => {});
-            return {
-              success: false,
-              isCloudAuth: false,
-              message: `Conta Google autenticada, mas não foi possível confirmar seu perfil ativo no Firestore (/users/${fbUser.uid}): ${fsErr?.message || 'Erro de permissão'}`,
-            };
-          }
-        }
-      }
-
-      this.upsertLocalUserCleanly(finalProfile, legacyId);
-      this.setCurrentUser(finalProfile);
-      await this.initStaffFirestoreSync(fbUser);
-
-      this.logAccess({
-        userId: finalProfile.id,
-        username: finalProfile.username,
-        role: finalProfile.role,
-        action: 'LOGIN_SUCESSO',
-        details: `Login via Firebase Google Auth (${finalProfile.email})`,
-      });
-
+      fbUser = await signInWithFirebaseCustomToken(customToken);
+    } catch (tokenErr: unknown) {
+      this.activeStaffRole = null;
+      this.activeStaffUid = null;
+      this.stopStaffFirestoreSync();
+      this.setCurrentUser(null);
       return {
-        success: true,
-        message: 'Autenticado com sucesso via Firebase Google Auth!',
-        user: finalProfile,
-        isCloudAuth: true,
+        success: false,
+        isCloudAuth: false,
+        code: 'CUSTOM_TOKEN_SIGNIN_FAILED',
+        message: formatFirebaseAuthError(tokenErr),
       };
-    } catch (err: unknown) {
-      const msg = formatFirebaseAuthError(err);
-      return { success: false, isCloudAuth: false, message: `Falha na autenticação Google: ${msg}` };
-    }
-  }
-
-  public async login(
-    loginOrEmail: string,
-    password: string
-  ): Promise<{ success: boolean; message: string; user?: User; isCloudAuth?: boolean; isLocalContingency?: boolean }> {
-    const rawInput = loginOrEmail.trim();
-    if (!rawInput || !password.trim()) {
-      return { success: false, isCloudAuth: false, message: 'Por favor, informe seu nome de usuário e senha.' };
     }
 
-    const users = this.getUsers();
-    const term = rawInput.toLowerCase();
-
-    // 1. Identify local employee candidate to resolve username -> email
-    const localCandidate = users.find(
-      (u) => (u.username || '').toLowerCase() === term || (u.email || '').toLowerCase() === term
-    );
-
-    // Resolve target email for Firebase Auth
-    let targetEmail = term;
-    if (!targetEmail.includes('@')) {
-      if (localCandidate && localCandidate.email && localCandidate.email.includes('@')) {
-        targetEmail = localCandidate.email.trim().toLowerCase();
-      } else if (term === 'admin') {
-        targetEmail = this.getInitialAdminEmail();
-      } else {
-        targetEmail = `${term}@staff.amanditasabores.com.br`;
-      }
-    }
-
-    const isBootstrapAdmin = this.isBootstrappedAdminEmail(targetEmail);
-
-    // 2. CLOUD AUTHENTICATION PATH (STRICT when Firebase is configured — NEVER silently falls back to local auth)
-    if (isFirebaseReady() && auth) {
-      const currentFbEmail = (auth.currentUser?.email || '').trim().toLowerCase();
-      if (auth.currentUser && currentFbEmail && currentFbEmail !== targetEmail) {
-        await signOutFirebase().catch(() => {});
-      }
-
-      let fbUser: any = null;
-      let firebaseAuthErr: unknown = null;
-
-      try {
-        fbUser = await signInWithEmail(targetEmail, password);
-      } catch (fbErr: unknown) {
-        firebaseAuthErr = fbErr;
-        // Only allow initial Firebase Auth user creation if a matching local staff account exists with the exact stored initial password
-        const errCode = String((fbErr as any)?.code || '');
-        if (errCode !== 'auth/wrong-password' && errCode !== 'auth/user-disabled' && errCode !== 'auth/too-many-requests') {
-          const passwords = this.getUserPasswords();
-          const storedPass = localCandidate ? (passwords[localCandidate.id] || '123456') : null;
-          if (localCandidate && storedPass && password.trim() === storedPass.trim()) {
-            try {
-              fbUser = await createUserWithEmail(targetEmail, password);
-              firebaseAuthErr = null;
-            } catch (createErr: unknown) {
-              // Keep original sign-in error if email is already registered (meaning wrong password)
-              const createCode = String((createErr as any)?.code || '');
-              if (createCode !== 'auth/email-already-in-use') {
-                firebaseAuthErr = createErr;
-              }
-            }
-          }
-        }
-      }
-
-      if (!fbUser) {
-        this.setCurrentUser(null);
-        this.stopStaffFirestoreSync();
-        const friendlyMsg = formatFirebaseAuthError(firebaseAuthErr);
-        this.logAccess({
-          username: rawInput,
-          action: 'LOGIN_FALHA',
-          details: `Falha no Firebase Auth para ${targetEmail}: ${friendlyMsg}`,
-        });
-        return {
-          success: false,
-          isCloudAuth: false,
-          message: friendlyMsg,
-        };
-      }
-
-      // Firebase Auth succeeded: now resolve and verify active profile in Firestore /users/{uid}
-      const now = new Date().toISOString();
-      let profile: User | null = null;
-      let existsInFirestore = false;
-
-      if (db) {
-        try {
-          const snap = await getDoc(doc(db, 'users', fbUser.uid));
-          if (snap.exists()) {
-            profile = snap.data() as User;
-            existsInFirestore = true;
-          }
-        } catch (err) {
-          console.warn('[Firestore User Fetch]:', err);
-        }
-      }
-
-      if (!profile && typeof window !== 'undefined') {
-        try {
-          const idToken = await fbUser.getIdToken();
-          if (idToken) {
-            const syncRes = await fetch('/api/auth/sync-profile', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${idToken}`,
-              },
-              body: JSON.stringify({
-                name: localCandidate?.name,
-                username: localCandidate?.username,
-                allowedModules: localCandidate?.allowedModules,
-              }),
-            });
-            const syncData = await syncRes.json().catch(() => ({}));
-            if (syncRes.ok && syncData.success && syncData.profile) {
-              profile = syncData.profile as User;
-              existsInFirestore = true;
-            }
-          }
-        } catch {
-          // Non-fatal; proceed to self-create check below
-        }
-      }
-
-      if (!profile) {
-        if (localCandidate) {
-          profile = {
-            ...localCandidate,
-            id: fbUser.uid,
-            email: fbUser.email || targetEmail,
-            isEmailVerified: fbUser.emailVerified ?? true,
-            authProvider: 'firebase_email',
-            firebaseUid: fbUser.uid,
-            lastLoginAt: now,
-            ...(isBootstrapAdmin ? { role: 'ADMINISTRADOR' as UserRole } : {}),
-          };
-        } else if (isBootstrapAdmin) {
-          profile = {
-            id: fbUser.uid,
-            name: fbUser.displayName || 'Amanda Silveira (Admin)',
-            username: fbUser.email?.split('@')[0] || 'admin',
-            email: fbUser.email || targetEmail,
-            isEmailVerified: fbUser.emailVerified ?? true,
-            role: 'ADMINISTRADOR',
-            status: 'ATIVO',
-            allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
-            authProvider: 'firebase_email',
-            firebaseUid: fbUser.uid,
-            createdAt: now,
-            lastLoginAt: now,
-          };
-        } else if (targetEmail === 'gerente@amanditasabores.com.br') {
-          profile = {
-            id: fbUser.uid,
-            name: fbUser.displayName || 'Gerência Amandita',
-            username: 'gerente',
-            email: fbUser.email || targetEmail,
-            isEmailVerified: fbUser.emailVerified ?? true,
-            role: 'GERENTE',
-            status: 'ATIVO',
-            allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'configuracoes', 'qrcodes'],
-            authProvider: 'firebase_email',
-            firebaseUid: fbUser.uid,
-            createdAt: now,
-            lastLoginAt: now,
-          };
-        }
-      }
-
-      if (!profile) {
-        await signOutFirebase().catch(() => {});
-        this.setCurrentUser(null);
-        return {
-          success: false,
-          isCloudAuth: false,
-          message: 'Conta autenticada no Firebase, porém sem perfil de colaborador vinculado em /users/{uid}. Solicite cadastro ao administrador.',
-        };
-      }
-
-      if (profile.status === 'BLOQUEADO') {
-        await signOutFirebase().catch(() => {});
-        this.setCurrentUser(null);
-        return { success: false, isCloudAuth: false, message: 'Esta conta está bloqueada pelo administrador.' };
-      }
-      if (profile.status === 'DESATIVADO') {
-        await signOutFirebase().catch(() => {});
-        this.setCurrentUser(null);
-        return { success: false, isCloudAuth: false, message: 'Esta conta foi desativada.' };
-      }
-
-      profile = {
-        ...profile,
-        id: fbUser.uid,
-        firebaseUid: fbUser.uid,
-        authProvider: 'firebase_email',
-        lastLoginAt: now,
-      };
-
-      // Persist or update /users/{uid} in Firestore cleanly and fail if profile creation is rejected
-      if (db) {
-        try {
-          if (existsInFirestore) {
-            await updateDoc(doc(db, 'users', fbUser.uid), { lastLoginAt: now }).catch(() => {});
-          } else {
-            await setDoc(doc(db, 'users', fbUser.uid), this.cleanForFirestore(profile));
-          }
-        } catch (fsProfileErr: any) {
-          await signOutFirebase().catch(() => {});
-          this.setCurrentUser(null);
-          return {
-            success: false,
-            isCloudAuth: false,
-            message: `Sessão Firebase iniciada, mas o perfil /users/${fbUser.uid} não pôde ser confirmado no Firestore (${fsProfileErr?.code || fsProfileErr?.message || 'permission-denied'}). Solicite ao administrador para vincular seu usuário.`,
-          };
-        }
-      }
-
-      const legacyId = localCandidate && localCandidate.id !== fbUser.uid ? localCandidate.id : undefined;
-      this.upsertLocalUserCleanly(profile, legacyId);
-      this.setCurrentUser(profile);
-      await this.initStaffFirestoreSync(fbUser);
-
-      this.logAccess({
-        userId: profile.id,
-        username: profile.username,
-        role: profile.role,
-        action: 'LOGIN_SUCESSO',
-        details: `Login efetuado com sucesso via Firebase Cloud para @${profile.username} (${profile.role})`,
-      });
-
+    if (!fbUser || fbUser.uid !== expectedUid) {
+      await signOutFirebase().catch(() => {});
+      this.activeStaffRole = null;
+      this.activeStaffUid = null;
+      this.stopStaffFirestoreSync();
+      this.setCurrentUser(null);
       return {
-        success: true,
-        message: 'Login realizado com sucesso e sincronizado com o Firebase!',
-        user: profile,
-        isCloudAuth: true,
+        success: false,
+        isCloudAuth: false,
+        code: 'UID_MISMATCH',
+        message: 'Inconsistência na sessão autenticada. Tente entrar novamente.',
       };
     }
 
-    // 3. LOCAL CONTINGENCY MODE (ONLY executed when Firebase is NOT configured on this device)
-    if (!localCandidate) {
-      this.logAccess({
-        username: rawInput,
-        action: 'LOGIN_FALHA',
-        details: 'Tentativa de login com usuário inexistente (modo contingência local)',
-      });
-      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Usuário não encontrado.' };
+    // Recover authoritative profile corresponding to the authenticated Firebase UID
+    const recovered = await this.recoverAuthenticatedProfile(fbUser, { allowTransientOfflinePreserve: false });
+    if (!recovered.profile || recovered.profile.status !== 'ATIVO') {
+      await signOutFirebase().catch(() => {});
+      this.activeStaffRole = null;
+      this.activeStaffUid = null;
+      this.stopStaffFirestoreSync();
+      this.setCurrentUser(null);
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: recovered.code || 'PROFILE_RECOVERY_FAILED',
+        message:
+          recovered.error ||
+          'Não foi possível recuperar o perfil autorizado deste usuário. Acesso bloqueado por segurança.',
+      };
     }
 
-    if (localCandidate.status === 'BLOQUEADO') {
-      this.logAccess({
-        userId: localCandidate.id,
-        username: localCandidate.username,
-        role: localCandidate.role,
-        action: 'CONTA_BLOQUEADA',
-        details: 'Tentativa de acesso em conta bloqueada',
-      });
-      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Esta conta está bloqueada pelo administrador. Contate a gerência.' };
-    }
-
-    if (localCandidate.status === 'DESATIVADO') {
-      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Esta conta foi desativada no sistema.' };
-    }
-
-    const passwords = this.getUserPasswords();
-    const storedPass = passwords[localCandidate.id] || '123456';
-
-    if (password.trim() !== storedPass.trim()) {
-      this.logAccess({
-        userId: localCandidate.id,
-        username: localCandidate.username,
-        role: localCandidate.role,
-        action: 'LOGIN_FALHA',
-        details: 'Senha incorreta digitada (modo contingência local)',
-      });
-      return { success: false, isCloudAuth: false, isLocalContingency: true, message: 'Senha incorreta.' };
-    }
-
-    const contingencyUser: User = {
-      ...localCandidate,
-      authProvider: 'local_contingency',
-      lastLoginAt: new Date().toISOString(),
+    const finalProfile: User = {
+      ...recovered.profile,
+      id: fbUser.uid,
+      firebaseUid: fbUser.uid,
+      authProvider: 'firebase_custom_token',
+      lastLoginAt: recovered.profile.lastLoginAt || new Date().toISOString(),
     };
-    const updatedUsersList = users.map((u) =>
-      u.id === contingencyUser.id ? contingencyUser : u
-    );
-    localStorage.setItem('gf_users', JSON.stringify(updatedUsersList));
-    this.setCurrentUser(contingencyUser);
+
+    this.activeStaffRole = finalProfile.role;
+    this.activeStaffUid = fbUser.uid;
+    this.upsertLocalUserCleanly(finalProfile);
+    this.setCurrentUser(finalProfile);
+    await this.initStaffFirestoreSync(fbUser);
 
     this.logAccess({
-      userId: contingencyUser.id,
-      username: contingencyUser.username,
-      role: contingencyUser.role,
-      action: 'LOGIN_CONTINGENCIA_LOCAL',
-      details: `Acesso em modo de contingência local (Firebase não configurado) para @${contingencyUser.username} (${contingencyUser.role})`,
+      userId: finalProfile.id,
+      username: finalProfile.username,
+      role: finalProfile.role,
+      action: options.auditAction,
+      details: `Autenticação segura via Custom Token para @${finalProfile.username} (${finalProfile.role})`,
     });
 
     return {
       success: true,
-      message: 'Autenticado em modo de contingência local (sem sincronização com a nuvem).',
-      user: contingencyUser,
-      isCloudAuth: false,
-      isLocalContingency: true,
+      isCloudAuth: true,
+      idempotentReplay: options.idempotentReplay,
+      message: options.successMessage,
+      user: finalProfile,
     };
   }
 
-  public logout(): void {
+  /**
+   * Authenticates strictly by username + password via POST /api/auth/login -> signInWithCustomToken.
+   * Rejects email login, never uses Google OAuth, and NEVER falls back to local plaintext passwords.
+   */
+  public async login(
+    usernameInput: string,
+    password: string
+  ): Promise<AuthActionResult<User>> {
+    const rawInput = String(usernameInput || '').trim();
+    const rawPassword = typeof password === 'string' ? password : '';
+
+    if (!rawInput || !rawPassword.trim()) {
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'MISSING_CREDENTIALS',
+        message: 'Por favor, informe seu nome de login e senha.',
+      };
+    }
+
+    if (rawInput.includes('@')) {
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'EMAIL_NOT_ALLOWED',
+        message: 'Informe seu nome de login (não utilize endereço de e-mail).',
+      };
+    }
+
+    if (!isFirebaseAuthAvailable()) {
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'FIREBASE_NOT_CONFIGURED',
+        message: 'Autenticação segura indisponível: Firebase Authentication não configurado neste dispositivo.',
+      };
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'FETCH_UNAVAILABLE',
+        message: 'Serviço de rede indisponível para autenticação.',
+      };
+    }
+
+    const cleanUsername = rawInput.toLowerCase();
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          username: cleanUsername,
+          password: rawPassword,
+        }),
+      });
+
+      const parsed = await this.readServerJsonResponse(res);
+      if (parsed.isHtml || !parsed.isValidJson || !parsed.data) {
+        this.activeStaffRole = null;
+        this.activeStaffUid = null;
+        this.stopStaffFirestoreSync();
+        this.setCurrentUser(null);
+        return {
+          success: false,
+          isCloudAuth: false,
+          code: 'INVALID_SERVER_RESPONSE',
+          message: `Servidor de autenticação retornou resposta inválida (HTTP ${parsed.status}).`,
+        };
+      }
+
+      if (!parsed.ok || !parsed.data.success) {
+        this.activeStaffRole = null;
+        this.activeStaffUid = null;
+        this.stopStaffFirestoreSync();
+        this.setCurrentUser(null);
+        this.logAccess({
+          username: cleanUsername,
+          action: parsed.data.code === 'ACCOUNT_BLOCKED' ? 'CONTA_BLOQUEADA' : 'LOGIN_FALHA',
+          details: `Falha na autenticação para @${cleanUsername} (${parsed.data.code || `HTTP ${parsed.status}`})`,
+        });
+        return {
+          success: false,
+          isCloudAuth: false,
+          code: typeof parsed.data.code === 'string' ? parsed.data.code : undefined,
+          retryAfterSeconds:
+            typeof parsed.data.retryAfterSeconds === 'number' ? parsed.data.retryAfterSeconds : undefined,
+          message:
+            typeof parsed.data.message === 'string' && parsed.data.message.trim()
+              ? parsed.data.message.trim()
+              : 'Nome de login ou senha inválidos.',
+        };
+      }
+
+      const customToken = typeof parsed.data.customToken === 'string' ? parsed.data.customToken.trim() : '';
+      const serverUser = parsed.data.user as Partial<User> | undefined;
+
+      if (!customToken || !serverUser || !serverUser.id) {
+        this.activeStaffRole = null;
+        this.activeStaffUid = null;
+        this.stopStaffFirestoreSync();
+        this.setCurrentUser(null);
+        return {
+          success: false,
+          isCloudAuth: false,
+          code: 'INCOMPLETE_AUTH_RESPONSE',
+          message: 'Resposta de autenticação incompleta. Tente novamente.',
+        };
+      }
+
+      return this.completeCustomTokenSignIn(customToken, serverUser, {
+        successMessage: parsed.data.message || 'Login realizado com sucesso!',
+        auditAction: 'LOGIN_SUCESSO',
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.activeStaffRole = null;
+      this.activeStaffUid = null;
+      this.stopStaffFirestoreSync();
+      this.setCurrentUser(null);
+      return {
+        success: false,
+        isCloudAuth: false,
+        code: 'NETWORK_ERROR',
+        message: `Não foi possível conectar ao servidor de autenticação: ${msg}`,
+      };
+    }
+  }
+
+  public async logoutAsync(): Promise<void> {
     const current = this.getCurrentUser();
     if (current) {
       this.logAccess({
@@ -10772,70 +11429,57 @@ class StoreService {
         details: 'Logout efetuado da sessão',
       });
     }
+    this.activeStaffRole = null;
+    this.activeStaffUid = null;
     this.stopStaffFirestoreSync();
     if (this.isCloudCashConfirmationRequired()) {
       try {
         localStorage.removeItem('gf_current_cash_shift');
       } catch {}
     }
-    signOutFirebase().catch(() => {});
     this.setCurrentUser(null);
+    await signOutFirebase().catch(() => {});
   }
 
+  public logout(): void {
+    this.logoutAsync().catch(() => {});
+  }
+
+  /**
+   * Re-verifies the authenticated ADMINISTRADOR's password exclusively on the server
+   * via POST /api/auth/verify-password (scrypt). Never uses local plaintext passwords.
+   */
   public async verifyAdminPassword(password: string): Promise<{ success: boolean; message: string }> {
     const current = this.getCurrentUser();
-    if (!current) {
-      return { success: false, message: 'Nenhum usuário logado na sessão.' };
+    if (!current || current.status !== 'ATIVO') {
+      return { success: false, message: 'Nenhum usuário ativo autenticado na sessão.' };
     }
     const role = (current.role || '').toUpperCase();
-    if (role !== 'ADMINISTRADOR' && current.username !== 'admin') {
+    if (role !== 'ADMINISTRADOR') {
       return { success: false, message: 'Permissão insuficiente: somente Administradores podem executar esta ação.' };
     }
-    const trimmedPw = password.trim();
-    if (!trimmedPw) {
+
+    const rawPassword = typeof password === 'string' ? password : '';
+    if (!rawPassword.trim()) {
       return { success: false, message: 'A senha é obrigatória.' };
     }
 
-    if (isFirebaseReady() && auth) {
-      if (current.authProvider === 'firebase_google') {
-        try {
-          const pwMapRaw = localStorage.getItem('gf_user_passwords');
-          if (pwMapRaw) {
-            const pwMap = JSON.parse(pwMapRaw);
-            if (pwMap[current.id] === trimmedPw || pwMap['user-admin'] === trimmedPw) {
-              return { success: true, message: 'PIN/Senha administrativa confirmada.' };
-            }
-          }
-        } catch {}
-        return { success: false, message: 'Senha administrativa incorreta.' };
-      }
+    const res = await this.callAuthenticatedAuthEndpoint('/api/auth/verify-password', {
+      method: 'POST',
+      body: { password: rawPassword },
+    });
 
-      const targetEmail = (auth.currentUser?.email || current.email || '').trim().toLowerCase();
-      if (!targetEmail) {
-        return { success: false, message: 'E-mail administrativo não localizado para revalidação no Firebase.' };
-      }
-      try {
-        await signInWithEmail(targetEmail, trimmedPw);
-        return { success: true, message: 'Senha confirmada no Firebase Authentication.' };
-      } catch (err) {
-        return { success: false, message: formatFirebaseAuthError(err) };
-      }
+    if (!res.ok) {
+      return {
+        success: false,
+        message: res.errorMessage || 'Senha incorreta. Acesso não autorizado.',
+      };
     }
 
-    // Local contingency fallback ONLY when Firebase is not configured
-    try {
-      const pwMapRaw = localStorage.getItem('gf_user_passwords');
-      if (pwMapRaw) {
-        const pwMap = JSON.parse(pwMapRaw);
-        if (pwMap[current.id] === trimmedPw || pwMap['user-admin'] === trimmedPw) {
-          return { success: true, message: 'Senha confirmada em modo contingência local.' };
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    return { success: false, message: 'Senha incorreta. Acesso não autorizado.' };
+    return {
+      success: true,
+      message: res.data?.message || 'Senha administrativa confirmada com sucesso.',
+    };
   }
 
   public resetToSampleData(): void {
@@ -10852,8 +11496,7 @@ class StoreService {
     localStorage.setItem('gf_menu_items', JSON.stringify(INITIAL_MENU));
     localStorage.setItem('gf_orders', JSON.stringify(INITIAL_ORDERS));
     localStorage.setItem('gf_restaurant_config', JSON.stringify(INITIAL_CONFIG));
-    localStorage.setItem('gf_users', JSON.stringify(INITIAL_USERS));
-    localStorage.setItem('gf_current_user', JSON.stringify(INITIAL_USERS[0]));
+    // Etapa 2B: Nunca recriar contas padrão nem senhas padrão ('123456') e preservar dados locais de usuários/senhas existentes.
     this.hasReceivedFirestoreConfig = false;
     this.officialPixState = {
       status: isFirebaseReady() && db ? 'LOADING' : 'MISSING',
@@ -10865,15 +11508,6 @@ class StoreService {
         : 'Chave PIX oficial não configurada.',
       lastSyncedAt: null,
     };
-    
-    const defaultPasswords: Record<string, string> = {
-      'user-admin': '123456',
-      'user-caixa': '123456',
-      'user-cozinha': '123456',
-      'user-entregador': '123456',
-      'user-gerente': '123456',
-    };
-    localStorage.setItem('gf_user_passwords', JSON.stringify(defaultPasswords));
 
     this.notify('FULL_RESET');
   }

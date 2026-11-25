@@ -73,14 +73,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
     { id: 'settings', moduleKey: 'configuracoes', label: 'Configurações Loja', icon: Settings },
   ];
 
-  // Filter tabs by current user's authorized modules and strict cash authority
+  // Filter tabs by current user's authorized modules, strict cash authority, and ADMINISTRADOR-only staff management
   const allowedTabs = useMemo(() => {
     if (!currentUser) return allTabs;
     const canManageCash = store.canUserManageCash();
-    const cashSafeTabs = canManageCash ? allTabs : allTabs.filter((tab) => tab.id !== 'caixa');
-    if (currentUser.username === 'admin' || currentUser.role === 'ADMINISTRADOR') return cashSafeTabs;
+    const canManageUsers = currentUser.role === 'ADMINISTRADOR' && store.canUserManageUsers();
+    const roleSafeTabs = allTabs.filter((tab) => {
+      if (tab.id === 'caixa' && !canManageCash) return false;
+      if (tab.id === 'usuarios' && !canManageUsers) return false;
+      return true;
+    });
+    if (currentUser.role === 'ADMINISTRADOR') return roleSafeTabs;
     const modules = currentUser.allowedModules || ['pdv', 'kanban'];
-    return cashSafeTabs.filter((tab) => modules.includes(tab.moduleKey));
+    return roleSafeTabs.filter((tab) => modules.includes(tab.moduleKey));
   }, [currentUser, allTabs]);
 
   const [activeTab, setActiveTab] = useState<TabKey>(() => {
@@ -146,34 +151,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
   const newOrdersCount = orders.filter((o) => o.status === 'NOVO').length;
 
   return (
-    <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] pb-16">
+    <div className="min-h-screen bg-[#F8FAFC] text-[#0F2342] pb-24 lg:pb-12">
       {/* Top Main Navigation Bar */}
-      <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-md sticky top-0 z-30 border-b border-[#C86D3B]/25">
-        <div className="max-w-7xl mx-auto px-3 sm:px-6 py-2.5 sm:py-3 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
+      <header className="bg-[#0F2342] text-white shadow-sm sticky top-0 z-30 border-b border-white/10">
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 py-2 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-4">
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <div className="shrink-0">
-              <AmanditaLogo variant="icon" size="md" theme="dark" />
+              <AmanditaLogo variant="icon" size="sm" theme="dark" className="sm:w-10 sm:h-10" />
             </div>
             <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="font-black text-sm sm:text-base tracking-tight text-white truncate">{config.name}</h1>
-                <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-[#C86D3B]/25 text-[#E89255] border border-[#C86D3B]/40 uppercase tracking-wider shrink-0">
-                  PAINEL DE GESTÃO
-                </span>
+              <div className="flex items-center gap-2 min-w-0">
+                <h1 className="font-bold text-sm sm:text-base tracking-tight text-white truncate">
+                  {config.name}
+                </h1>
                 {store.getAuthSessionMode() === 'local_contingency' && (
-                  <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/40 uppercase tracking-wider shrink-0" title="Firebase não configurado neste dispositivo">
-                    CONTINGÊNCIA LOCAL
+                  <span
+                    className="text-[11px] font-semibold text-amber-300 shrink-0 whitespace-nowrap"
+                    title="Firebase não configurado neste dispositivo"
+                  >
+                    · Contingência local
                   </span>
                 )}
               </div>
-              <p className="text-xs text-[#D9C7B8] flex items-center gap-2 flex-wrap mt-0.5">
-                <span className="font-mono text-amber-300 font-bold shrink-0">{currentTime}</span>
-                <span>·</span>
-                <span className="shrink-0">{activeOrdersCount} pedidos ativos</span>
+              <p className="text-[11px] sm:text-xs text-slate-300 flex items-center gap-1.5 sm:gap-2 truncate">
+                <span className="font-mono tabular-nums text-[#FB923C] font-semibold shrink-0">{currentTime}</span>
+                <span className="text-slate-500" aria-hidden="true">·</span>
+                <span className="shrink-0 tabular-nums">{activeOrdersCount} ativos</span>
                 {newOrdersCount > 0 && (
                   <>
-                    <span>·</span>
-                    <span className="text-[#E89255] font-black flex items-center gap-1 shrink-0">
+                    <span className="text-slate-500" aria-hidden="true">·</span>
+                    <span className="text-[#FB923C] font-bold flex items-center gap-1 shrink-0 tabular-nums">
                       <Bell className="w-3 h-3 animate-bounce" />
                       {newOrdersCount} novos
                     </span>
@@ -184,13 +191,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
           </div>
 
           {/* Quick shortcuts and Audio toggles */}
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {/* Audio Alert Toggle & Test Button */}
-            <div className="flex items-center gap-1 bg-[#1F100B] p-1 rounded-xl border border-[#4A2E1F]">
+            <div className="flex items-center gap-0.5 bg-[#1B365D] p-1 rounded-xl border border-white/10">
               <button
                 onClick={toggleSound}
-                className={`p-1.5 rounded-lg transition ${
-                  isSoundActive ? 'text-[#E89255] bg-[#C86D3B]/20' : 'text-slate-400 hover:text-white'
+                className={`p-1.5 rounded-lg transition cursor-pointer ${
+                  isSoundActive ? 'text-[#FB923C] bg-[#EA580C]/20' : 'text-slate-400 hover:text-white'
                 }`}
                 title={isSoundActive ? 'Som ativado (clique para silenciar)' : 'Som desativado (clique para ativar)'}
               >
@@ -198,7 +205,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
               </button>
               <button
                 onClick={testAlertSound}
-                className="px-2 py-1 text-[11px] font-semibold text-[#D9C7B8] hover:text-white rounded-lg hover:bg-white/10 transition"
+                className="hidden sm:inline-flex px-2 py-1 text-[11px] font-semibold text-slate-200 hover:text-white rounded-lg hover:bg-white/10 transition whitespace-nowrap cursor-pointer"
                 title="Tocar som de campainha de teste"
               >
                 Testar Som
@@ -209,44 +216,45 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
             {activeTab !== 'pdv' && allowedTabs.some((t) => t.id === 'pdv') && (
               <button
                 onClick={() => setActiveTab('pdv')}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-emerald-700 to-emerald-600 hover:opacity-95 text-white rounded-xl text-xs font-bold transition shadow-2xs cursor-pointer"
+                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-[#EA580C] hover:bg-[#C2410C] text-white rounded-xl text-xs font-bold transition shadow-2xs whitespace-nowrap shrink-0 cursor-pointer"
                 title="Retornar diretamente à tela principal do PDV Balcão"
               >
-                <Store className="w-3.5 h-3.5" />
-                <span>PDV / Painel de Controle</span>
+                <Store className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Voltar ao PDV</span>
+                <span className="sm:hidden">PDV</span>
               </button>
             )}
 
             {/* Quick Link buttons to Client Menu and Driver Portal */}
             <button
               onClick={() => onNavigateToView('cardapio')}
-              className="hidden md:flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-emerald-700 to-emerald-600 hover:opacity-95 text-white rounded-xl text-xs font-bold transition shadow-2xs"
+              className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 bg-[#1B365D] hover:bg-[#25477A] text-slate-100 rounded-xl text-xs font-semibold border border-white/15 transition whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <span>Cardápio WhatsApp</span>
+              <span>Cardápio</span>
               <ExternalLink className="w-3 h-3 opacity-70" />
             </button>
 
             <button
               onClick={() => onNavigateToView('entregador')}
-              className="hidden md:flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-[#C86D3B] to-[#721C24] hover:opacity-95 text-white rounded-xl text-xs font-bold transition shadow-2xs"
+              className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 bg-[#1B365D] hover:bg-[#25477A] text-slate-100 rounded-xl text-xs font-semibold border border-white/15 transition whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <span>Portal Entregador</span>
+              <span>Entregador</span>
               <ExternalLink className="w-3 h-3 opacity-70" />
             </button>
 
             {/* User Profile & Logout */}
-            <div className="flex items-center gap-2 pl-2 border-l border-[#4A2E1F]">
-              <div className="text-right hidden sm:block">
-                <p className="text-xs font-black text-white leading-tight">
+            <div className="flex items-center gap-2 pl-2 border-l border-white/15">
+              <div className="text-right hidden md:block">
+                <p className="text-xs font-bold text-white leading-tight truncate max-w-[140px]">
                   {currentUser?.name || currentUser?.username || 'admin'}
                 </p>
-                <p className="text-[10px] text-[#D9C7B8] uppercase font-bold tracking-wider">
+                <p className="text-[11px] text-slate-300 font-medium leading-tight">
                   {currentUser?.role || 'ADMINISTRADOR'}
                 </p>
               </div>
               <button
                 onClick={onLogout}
-                className="p-2 text-[#D9C7B8] hover:text-rose-400 hover:bg-white/10 rounded-xl transition"
+                className="p-2 text-slate-300 hover:text-rose-300 hover:bg-white/10 rounded-xl transition cursor-pointer"
                 title="Sair da sessão"
               >
                 <LogOut className="w-4 h-4" />
@@ -256,8 +264,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
         </div>
 
         {/* Navigation Tabs */}
-        <div className="max-w-7xl mx-auto px-2 sm:px-6 w-full max-w-full overflow-hidden">
-          <div className="flex items-center gap-1 overflow-x-auto border-t border-[#4A2E1F] pt-1.5 pb-1.5 scrollbar-thin">
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 w-full max-w-full overflow-hidden">
+          <div className="flex items-center gap-1 overflow-x-auto no-scrollbar border-t border-white/10 py-1.5">
             {allowedTabs.map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -266,17 +274,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition whitespace-nowrap cursor-pointer shrink-0 ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap cursor-pointer shrink-0 ${
                     isActive
-                      ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-sm'
-                      : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                      ? 'bg-[#EA580C] text-white shadow-xs'
+                      : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                   }`}
                 >
-                  <Icon className="w-4 h-4" />
+                  <Icon className="w-3.5 h-3.5 shrink-0" />
                   <span>{tab.label}</span>
                   {tab.badgeCount !== undefined && tab.badgeCount > 0 && (
-                    <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-black ${
-                      isActive ? 'bg-white text-[#721C24]' : 'bg-[#C86D3B] text-white'
+                    <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-bold leading-none tabular-nums ${
+                      isActive ? 'bg-white text-[#0F2342]' : 'bg-[#EA580C] text-white'
                     }`}>
                       {tab.badgeCount}
                     </span>
@@ -290,29 +298,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
 
       {/* NEW ORDER SOUND & VISUAL ALERT BANNER */}
       {newOrderNotice && (
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-4 animate-in slide-in-from-top-3">
-          <div className="bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white p-4 rounded-2xl shadow-lg border border-[#C86D3B]/40 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-white/20 text-white flex items-center justify-center font-bold">
-                <Bell className="w-5 h-5 animate-bounce" />
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 pt-3 animate-in slide-in-from-top-3">
+          <div className="bg-[#0F2342] text-white p-3.5 sm:p-4 rounded-2xl shadow-lg border border-[#EA580C]/50 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-9 h-9 rounded-xl bg-[#EA580C] text-white flex items-center justify-center shrink-0">
+                <Bell className="w-4 h-4 animate-bounce" />
               </div>
-              <div>
-                <span className="text-[10px] font-mono font-bold uppercase tracking-wider block text-amber-200">
-                  NOVO PEDIDO CHEGANDO!
+              <div className="min-w-0">
+                <span className="text-[11px] font-semibold text-[#FB923C] block">
+                  Novo pedido recebido
                 </span>
-                <p className="text-sm font-extrabold">
+                <p className="text-sm font-bold truncate">
                   {newOrderNotice.orderNumber} · {newOrderNotice.customer.name} ({newOrderNotice.items.length} itens)
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 shrink-0">
               <button
-                onClick={() => { 
+                onClick={() => {
                   store.silenceAllAlerts();
-                  setActiveTab('kanban'); 
-                  setNewOrderNotice(null); 
+                  setActiveTab('kanban');
+                  setNewOrderNotice(null);
                 }}
-                className="px-3.5 py-1.5 bg-white text-[#721C24] rounded-xl text-xs font-black hover:bg-amber-100 transition shadow-xs cursor-pointer"
+                className="px-3.5 py-1.5 bg-[#EA580C] hover:bg-[#C2410C] text-white rounded-xl text-xs font-bold transition shadow-xs whitespace-nowrap cursor-pointer"
               >
                 Abrir Pedidos
               </button>
@@ -321,7 +329,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
                   store.silenceAllAlerts();
                   setNewOrderNotice(null);
                 }}
-                className="text-white/80 hover:text-white p-1 cursor-pointer"
+                className="text-slate-300 hover:text-white p-1.5 cursor-pointer"
               >
                 ✕
               </button>
@@ -331,7 +339,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
       )}
 
       {/* Main Tab Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 pt-6">
+      <main className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 pt-3 sm:pt-5">
         {activeTab === 'pdv' && (
           <PointOfSale
             currentUser={currentUser}

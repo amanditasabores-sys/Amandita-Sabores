@@ -80,8 +80,8 @@ export default function App() {
     }
 
     const role = user.role?.toUpperCase();
-    if (role === 'ADMINISTRADOR' || role === 'GERENTE' || user.username === 'admin') {
-      return true; // Full access across all modules
+    if (role === 'ADMINISTRADOR' || role === 'GERENTE') {
+      return true; // Full access across operational views (staff management remains strictly ADMINISTRADOR-only)
     }
 
     if (view === 'entregador') {
@@ -206,6 +206,13 @@ export default function App() {
     window.addEventListener('hashchange', handleHashChange);
     window.addEventListener('gestaofood_state_changed', handleStateChanged);
 
+    // Authoritative profile recovery when Firebase Auth session is already active
+    store.refreshSessionProfileFromAuth().then((recovered) => {
+      if (recovered) {
+        setCurrentUser(recovered);
+      }
+    }).catch(() => {});
+
     const deactivationPoll = setInterval(handleStateChanged, 4000);
 
     return () => {
@@ -279,7 +286,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
-    store.logout();
+    void store.logoutAsync();
     setCurrentUser(null);
     navigateTo('admin');
   };
@@ -288,107 +295,106 @@ export default function App() {
   // and NEVER on customer views (cardapio/rastreio) or driver portal (entregador)
   const isGlobalToolbarVisible = Boolean(
     currentUser && 
-    (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE' || currentUser.username === 'admin') &&
+    (currentUser.role === 'ADMINISTRADOR' || currentUser.role === 'GERENTE') &&
     currentView !== 'cardapio' &&
     currentView !== 'rastreio' &&
     currentView !== 'entregador'
   );
 
   return (
-    <div className="min-h-screen w-full max-w-full bg-[#FAF7F2] text-[#2C1810] font-sans">
+    <div className="min-h-screen w-full max-w-full bg-[#F8FAFC] text-[#0F2342] font-sans">
       {/* GLOBAL VIEW SWITCHER / PREVIEW ASSISTANT TOOLBAR (RESTRICTED TO ADMINISTRATOR ONLY) */}
       {isGlobalToolbarVisible && (
-        <aside aria-label="Seletor de Ambiente" className="sticky top-0 z-50 w-full max-w-full bg-[#1F100B] text-white border-b border-[#4A2E1F] shadow-md overflow-hidden">
-          <div className="w-full max-w-7xl mx-auto px-2.5 sm:px-4 py-1.5 flex items-center justify-between gap-1.5 sm:gap-3 text-xs">
-            <div className="flex items-center gap-1.5 shrink-0">
-              <span className="font-black tracking-wider text-[#E89255] font-serif text-[11px] sm:text-[12px] flex items-center gap-1">
-                <span>AMANDITA</span>
-                <span className="hidden xs:inline">SABORES</span>
+        <aside aria-label="Seletor de Ambiente" className="relative z-40 w-full max-w-full bg-[#09172E] text-white border-b border-white/10 overflow-hidden">
+          <div className="w-full max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 py-1.5 flex items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="font-extrabold tracking-tight text-white text-[11px] sm:text-xs whitespace-nowrap">
+                Amandita <span className="text-[#FB923C]">Sabores</span>
               </span>
-              <span className="text-[#6B4B3E] hidden md:inline">|</span>
-              <span className="text-[#D9C7B8] hidden md:inline text-[11px]">Navegação Rápida (Admin):</span>
+              <span className="text-slate-600 hidden md:inline" aria-hidden="true">·</span>
+              <span className="text-slate-400 hidden md:inline text-[11px] whitespace-nowrap">Alternar ambiente</span>
             </div>
 
-            <div className="flex items-center gap-1 sm:gap-2 overflow-x-auto scrollbar-none py-0.5 min-w-0 flex-1 justify-end">
+            <div className="flex items-center gap-1 sm:gap-1.5 overflow-x-auto no-scrollbar py-0.5 min-w-0 flex-1 justify-end">
               {/* 1. Botão de retorno ao PDV / Painel de Controle */}
               <button
                 onClick={() => {
                   navigateTo('admin');
                   window.dispatchEvent(new CustomEvent('switch_to_pdv'));
                 }}
-                className={`px-2.5 sm:px-3 py-1 rounded-lg font-bold flex items-center gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                className={`px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 transition text-[11px] shrink-0 whitespace-nowrap cursor-pointer ${
                   currentView === 'admin'
-                    ? 'bg-gradient-to-r from-[#C86D3B] to-[#721C24] text-white shadow-xs'
-                    : 'bg-emerald-600/30 text-emerald-200 hover:text-white hover:bg-emerald-600/50 border border-emerald-500/40'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
                 title="Retornar diretamente à tela principal do PDV / Painel de Controle"
               >
-                <Store className="w-3.5 h-3.5 text-[#E89255]" />
-                <span>PDV / Painel de Controle</span>
+                <Store className="w-3.5 h-3.5 shrink-0" />
+                <span>PDV / Painel</span>
               </button>
 
               {/* 2. Customer Menu */}
               <button
                 onClick={() => navigateTo('cardapio')}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 transition text-[11px] shrink-0 whitespace-nowrap cursor-pointer ${
                   currentView === 'cardapio'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
               >
-                <UtensilsCrossed className="w-3.5 h-3.5" />
+                <UtensilsCrossed className="w-3.5 h-3.5 shrink-0" />
                 <span>Cardápio</span>
               </button>
 
               {/* 3. Atendente */}
               <button
                 onClick={() => navigateTo('atendente')}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 transition text-[11px] shrink-0 whitespace-nowrap cursor-pointer ${
                   currentView === 'atendente'
-                    ? 'bg-amber-600 text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
               >
-                <Store className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Atendente</span>
+                <Store className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Atendente</span>
               </button>
 
               {/* 4. Cozinha */}
               <button
                 onClick={() => navigateTo('producao')}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 transition text-[11px] shrink-0 whitespace-nowrap cursor-pointer ${
                   currentView === 'producao'
-                    ? 'bg-rose-700 text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
               >
-                <ChefHat className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Cozinha</span>
+                <ChefHat className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Cozinha</span>
               </button>
 
               {/* 5. Caixa */}
               <button
                 onClick={() => navigateTo('caixa')}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 transition text-[11px] shrink-0 whitespace-nowrap cursor-pointer ${
                   currentView === 'caixa'
-                    ? 'bg-emerald-700 text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
               >
-                <Vault className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Caixa</span>
+                <Vault className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Caixa</span>
               </button>
 
               {/* 6. Entregador */}
               <button
                 onClick={() => navigateTo('entregador')}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 sm:gap-1.5 transition text-[11px] shrink-0 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1.5 transition text-[11px] shrink-0 whitespace-nowrap cursor-pointer ${
                   currentView === 'entregador'
-                    ? 'bg-[#C86D3B] text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
               >
-                <Bike className="w-3.5 h-3.5" />
+                <Bike className="w-3.5 h-3.5 shrink-0" />
                 <span>Entregas</span>
               </button>
             </div>
@@ -476,12 +482,12 @@ export default function App() {
 
       {/* SECURITY ACCESS NOTICE TOAST */}
       {securityNotice && (
-        <div className="fixed bottom-6 right-6 z-50 bg-[#2C1810] text-[#FAF7F2] p-4 rounded-2xl shadow-2xl border border-amber-500/40 flex items-center gap-3 text-xs max-w-md animate-in slide-in-from-bottom">
-          <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0" />
+        <div className="fixed bottom-6 right-6 z-50 bg-[#0F2342] text-white p-4 rounded-2xl shadow-2xl border border-[#EA580C]/40 flex items-center gap-3 text-xs max-w-md animate-in slide-in-from-bottom">
+          <ShieldAlert className="w-5 h-5 text-[#FB923C] shrink-0" />
           <span className="font-medium flex-1">{securityNotice}</span>
           <button
             onClick={() => setSecurityNotice(null)}
-            className="text-[#D9C7B8] hover:text-white p-1"
+            className="text-slate-300 hover:text-white p-1 cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>

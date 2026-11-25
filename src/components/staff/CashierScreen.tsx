@@ -54,53 +54,54 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
   }, []);
 
   return (
-    <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] pb-16">
+    <div className="min-h-screen bg-[#F8FAFC] text-[#0F2342] pb-24 lg:pb-12">
       {/* Top Header - Dedicated Caixa UI */}
-      <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-md sticky top-0 z-30 border-b border-[#C86D3B]/25">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+      <header className="bg-[#0F2342] text-white shadow-sm sticky top-0 z-30 border-b border-white/10">
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 py-2 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-4">
           {/* Brand & Caixa Status */}
-          <div className="flex items-center gap-3">
-            <AmanditaLogo variant="icon" size="md" theme="dark" />
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-black text-base tracking-tight text-white flex items-center gap-1.5">
-                  <Vault className="w-5 h-5 text-emerald-400" />
-                  <span>Controle de Caixa</span>
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+            <div className="shrink-0">
+              <AmanditaLogo variant="icon" size="sm" theme="dark" className="sm:w-10 sm:h-10" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <h1 className="font-bold text-sm sm:text-base tracking-tight text-white truncate">
+                  Controle de Caixa
                 </h1>
-                <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 uppercase tracking-wider">
-                  OPERADOR DE CAIXA
-                </span>
                 {store.getAuthSessionMode() === 'local_contingency' && (
-                  <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/40 uppercase tracking-wider" title="Firebase não configurado neste dispositivo">
-                    CONTINGÊNCIA LOCAL
+                  <span
+                    className="text-[11px] font-semibold text-amber-300 shrink-0 whitespace-nowrap"
+                    title="Firebase não configurado neste dispositivo"
+                  >
+                    · Contingência local
                   </span>
                 )}
               </div>
-              <p className="text-xs text-[#D9C7B8] flex items-center gap-2">
-                <span className="font-mono text-amber-300 font-bold flex items-center gap-1">
-                  <Clock className="w-3 h-3 text-amber-400" />
+              <p className="text-[11px] sm:text-xs text-slate-300 flex items-center gap-1.5 sm:gap-2 truncate">
+                <span className="font-mono tabular-nums text-[#FB923C] font-semibold flex items-center gap-1 shrink-0">
+                  <Clock className="w-3 h-3" />
                   {currentTime}
                 </span>
-                <span>·</span>
+                <span className="text-slate-500" aria-hidden="true">·</span>
                 {cashSyncState.status === 'SYNCING' || cashSyncState.status === 'IDLE' ? (
-                  <span className="text-amber-300 font-semibold flex items-center gap-1">
-                    <Clock className="w-3 h-3 animate-pulse" />
+                  <span className="text-amber-300 font-semibold flex items-center gap-1 truncate">
+                    <Clock className="w-3 h-3 animate-pulse shrink-0" />
                     Sincronizando caixa...
                   </span>
                 ) : cashSyncState.status === 'ERROR' ? (
-                  <span className="text-rose-400 font-semibold flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" />
+                  <span className="text-rose-300 font-semibold flex items-center gap-1 truncate">
+                    <AlertCircle className="w-3 h-3 shrink-0" />
                     Falha ao sincronizar caixa
                   </span>
                 ) : currentShift && currentShift.status === 'ABERTO' ? (
-                  <span className="text-emerald-400 font-bold flex items-center gap-1">
-                    <CheckCircle2 className="w-3 h-3" />
-                    Turno Aberto (R$ {currentShift.initialBalance.toFixed(2)})
+                  <span className="text-emerald-300 font-semibold flex items-center gap-1 truncate tabular-nums">
+                    <CheckCircle2 className="w-3 h-3 shrink-0" />
+                    Turno aberto (R$ {currentShift.initialBalance.toFixed(2)})
                   </span>
                 ) : (
-                  <span className="text-amber-400 font-semibold flex items-center gap-1">
-                    <AlertCircle className="w-3 h-3" />
-                    Caixa Fechado
+                  <span className="text-amber-300 font-semibold flex items-center gap-1 truncate">
+                    <AlertCircle className="w-3 h-3 shrink-0" />
+                    Caixa fechado
                   </span>
                 )}
               </p>
@@ -108,7 +109,7 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
           </div>
 
           {/* User Profile & Logout */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 shrink-0">
             {hasPdvPermission && (
               <button
                 onClick={() => {
@@ -118,58 +119,60 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
                   window.dispatchEvent(new PopStateEvent('popstate'));
                   window.dispatchEvent(new CustomEvent('switch_to_pdv'));
                 }}
-                className="px-2.5 py-1.5 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-emerald-500/40 cursor-pointer"
+                className="px-2.5 sm:px-3 py-1.5 bg-[#1B365D] hover:bg-[#25477A] text-slate-100 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 border border-white/15 whitespace-nowrap shrink-0 cursor-pointer"
                 title="Retornar à tela principal do PDV / Painel de Controle"
               >
-                <Store className="w-3.5 h-3.5 text-[#E89255]" />
+                <Store className="w-3.5 h-3.5 text-[#FB923C] shrink-0" />
                 <span className="hidden sm:inline">PDV / Painel</span>
               </button>
             )}
-            <div className="text-right hidden sm:block">
-              <p className="text-xs font-black text-white leading-tight">
-                {currentUser?.name || currentUser?.username || 'Operador de Caixa'}
-              </p>
-              <p className="text-[10px] text-[#D9C7B8] uppercase font-bold tracking-wider">
-                Frente de Caixa
-              </p>
+            <div className="flex items-center gap-2 pl-2 border-l border-white/15">
+              <div className="text-right hidden md:block">
+                <p className="text-xs font-bold text-white leading-tight truncate max-w-[140px]">
+                  {currentUser?.name || currentUser?.username || 'Operador de Caixa'}
+                </p>
+                <p className="text-[11px] text-slate-300 font-medium leading-tight">
+                  Frente de Caixa
+                </p>
+              </div>
+              <button
+                onClick={onLogout}
+                className="px-2.5 sm:px-3 py-1.5 bg-white/10 hover:bg-rose-500/20 text-slate-200 hover:text-rose-200 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 border border-white/10 whitespace-nowrap cursor-pointer"
+                title="Sair do Caixa"
+              >
+                <LogOut className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Sair</span>
+              </button>
             </div>
-            <button
-              onClick={onLogout}
-              className="px-3 py-1.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-rose-500/30 cursor-pointer"
-              title="Sair do Caixa"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>Sair</span>
-            </button>
           </div>
         </div>
 
         {/* Navigation Tabs (only shown if operator has extra permitted modules) */}
         {(hasReportsPermission || hasPdvPermission) && (
-          <div className="max-w-7xl mx-auto px-4 sm:px-6">
-            <div className="flex items-center gap-1 overflow-x-auto border-t border-[#4A2E1F] pt-1.5 pb-1.5">
+          <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6">
+            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar border-t border-white/10 py-1.5">
               <button
                 onClick={() => setActiveTab('caixa')}
-                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer ${
                   activeTab === 'caixa'
-                    ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-xs'
-                    : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                    ? 'bg-[#EA580C] text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                 }`}
               >
-                <Vault className="w-4 h-4" />
+                <Vault className="w-3.5 h-3.5 shrink-0" />
                 <span>Fluxo de Caixa</span>
               </button>
 
               {hasPdvPermission && (
                 <button
                   onClick={() => setActiveTab('pdv')}
-                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer ${
                     activeTab === 'pdv'
-                      ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-xs'
-                      : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                      ? 'bg-[#EA580C] text-white shadow-xs'
+                      : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                   }`}
                 >
-                  <Store className="w-4 h-4" />
+                  <Store className="w-3.5 h-3.5 shrink-0" />
                   <span>PDV Balcão</span>
                 </button>
               )}
@@ -177,13 +180,13 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
               {hasReportsPermission && (
                 <button
                   onClick={() => setActiveTab('relatorios')}
-                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer ${
                     activeTab === 'relatorios'
-                      ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-xs'
-                      : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                      ? 'bg-[#EA580C] text-white shadow-xs'
+                      : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
                   }`}
                 >
-                  <BarChart3 className="w-4 h-4" />
+                  <BarChart3 className="w-3.5 h-3.5 shrink-0" />
                   <span>Relatórios Financeiros</span>
                 </button>
               )}
@@ -193,7 +196,7 @@ export const CashierScreen: React.FC<CashierScreenProps> = ({ currentUser, onLog
       </header>
 
       {/* Main Cashier Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 pt-6">
+      <main className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 pt-3 sm:pt-5">
         {activeTab === 'caixa' && <CashRegisterManager onStateChanged={refreshData} />}
         {activeTab === 'pdv' && hasPdvPermission && (
           <PointOfSale currentUser={currentUser} onOrderCreated={refreshData} />

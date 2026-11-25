@@ -247,11 +247,29 @@ async function run() {
     verifyIdToken: async (token: string) => {
       const u = simUsersByToken[token];
       if (!u) throw new Error('INVALID_ID_TOKEN');
-      return { uid: u.uid, email: u.email };
+      return { uid: u.uid, role: u.role, status: u.status };
     },
   };
 
   const { store } = await import('../src/services/store');
+  const setTestStaffSession = (role: 'CAIXA' | 'ATENDENTE') => {
+    const tokenKey = role === 'CAIXA' ? 'tok-caixa' : 'tok-atendente';
+    const meta = simUsersByToken[tokenKey];
+    activeTestToken = tokenKey;
+    store.setCurrentUser({
+      id: meta.uid,
+      name: role === 'CAIXA' ? 'Caixa Teste' : 'Atendente Teste',
+      username: role === 'CAIXA' ? 'caixa_teste' : 'atendente_teste',
+      email: '',
+      isEmailVerified: false,
+      role,
+      status: 'ATIVO',
+      allowedModules: role === 'CAIXA' ? ['pdv', 'kanban', 'caixa'] : ['pdv', 'kanban'],
+      createdAt: new Date().toISOString(),
+      authProvider: 'firebase_custom_token',
+      provisioningState: 'ACTIVE',
+    });
+  };
   const { default: app, __setTestFirebaseAdminServices } = await import('../server');
 
   __setTestFirebaseAdminServices({
@@ -286,7 +304,7 @@ async function run() {
       simDb.clearCollection('orders');
       store.setServerAtomicPaymentMode(true);
       store.setExplicitCashConfirmationModeForTest(true);
-      await store.login('caixa', '123456');
+      setTestStaffSession('CAIXA');
 
       assert.strictEqual(store.getCashShiftSyncState().status, 'IDLE');
       assert.strictEqual(store.getCurrentCashShift(), null, 'Não deve criar nem retornar turno sintético antes da confirmação');
@@ -317,8 +335,7 @@ async function run() {
       simDb.clearCollection('orders');
       store.setServerAtomicPaymentMode(true);
       store.setExplicitCashConfirmationModeForTest(true);
-      await store.login('atendente', '123456');
-      activeTestToken = 'tok-atendente';
+      setTestStaffSession('ATENDENTE');
       store.beginCashShiftSyncForTest();
 
       const realShift = {
@@ -367,8 +384,7 @@ async function run() {
       simDb.clearCollection('orders');
       store.setServerAtomicPaymentMode(true);
       store.setExplicitCashConfirmationModeForTest(true);
-      await store.login('caixa', '123456');
-      activeTestToken = 'tok-caixa';
+      setTestStaffSession('CAIXA');
       store.beginCashShiftSyncForTest();
 
       const closedShift = {
@@ -417,8 +433,7 @@ async function run() {
       simDb.clearCollection('orders');
       store.setServerAtomicPaymentMode(true);
       store.setExplicitCashConfirmationModeForTest(true);
-      await store.login('atendente', '123456');
-      activeTestToken = 'tok-atendente';
+      setTestStaffSession('ATENDENTE');
 
       // Mesmo que existisse lixo antigo no localStorage, antes de confirmar NÃO pode ser usado
       localStorage.setItem(
@@ -464,8 +479,7 @@ async function run() {
       simDb.clearCollection('orders');
       store.setServerAtomicPaymentMode(true);
       store.setExplicitCashConfirmationModeForTest(true);
-      await store.login('caixa', '123456');
-      activeTestToken = 'tok-caixa';
+      setTestStaffSession('CAIXA');
 
       const openRes = await store.openCashRegisterAsync(150, 'Caixa Teste', { shiftId: 'shift-open-close-e' });
       assert.strictEqual(openRes.success, true);
@@ -488,7 +502,7 @@ async function run() {
       storageMap.clear();
       store.setExplicitCashConfirmationModeForTest(false);
       store.setServerAtomicPaymentMode(false);
-      await store.login('caixa', '123456');
+      setTestStaffSession('CAIXA');
 
       assert.strictEqual(store.getCashShiftSyncState().status, 'CONFIRMED');
       assert.strictEqual(store.getCashShiftSyncState().source, 'local_contingency');

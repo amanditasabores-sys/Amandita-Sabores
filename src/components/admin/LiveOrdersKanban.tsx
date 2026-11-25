@@ -310,13 +310,28 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
     },
   ];
 
-  const handleAdvanceStatus = async (order: Order, nextStatus: OrderStatus) => {
+  const handleAdvanceStatus = async (order: Order, nextStatus: OrderStatus, customNotes?: string) => {
     if (updatingOrderIds[order.id]) return;
+
+    if (nextStatus === 'EM_ROTA' && order.fulfillmentType === 'RETIRADA') {
+      setSyncActionNotice({
+        type: 'error',
+        message: `O pedido ${order.orderNumber} é de Retirada no Balcão e não utiliza motoboy. Utilize "Confirmar Retirada".`,
+      });
+      setTimeout(() => setSyncActionNotice(null), 8000);
+      return;
+    }
+
     setUpdatingOrderIds((prev) => ({ ...prev, [order.id]: true }));
     setSyncActionNotice(null);
     try {
       const authorName = currentUser?.name || currentUser?.username || 'Painel Administrativo';
-      const res = await store.updateOrderStatusAsync(order.id, nextStatus, authorName, `Avançado para ${nextStatus}`);
+      const statusNotes =
+        customNotes ||
+        (order.fulfillmentType === 'RETIRADA' && nextStatus === 'ENTREGUE'
+          ? 'Retirada confirmada no balcão'
+          : `Avançado para ${nextStatus}`);
+      const res = await store.updateOrderStatusAsync(order.id, nextStatus, authorName, statusNotes);
       if (!res.synced) {
         if (res.rejected) {
           setSyncActionNotice({
@@ -911,11 +926,31 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                               className="flex-1 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-wait text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                             >
                               <PackageCheck className="w-3 h-3" />
-                              <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Pronto p/ Entrega'}</span>
+                              <span>
+                                {updatingOrderIds[order.id]
+                                  ? 'Salvando...'
+                                  : order.fulfillmentType === 'RETIRADA'
+                                  ? 'Pronto p/ Retirada'
+                                  : 'Pronto p/ Entrega'}
+                              </span>
                             </button>
                           )}
 
-                          {order.status === 'PRONTO' && (
+                          {order.status === 'PRONTO' && order.fulfillmentType === 'RETIRADA' && (
+                            <button
+                              disabled={Boolean(updatingOrderIds[order.id])}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleAdvanceStatus(order, 'ENTREGUE', 'Retirada confirmada no balcão');
+                              }}
+                              className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-wait text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
+                            >
+                              <CheckCircle className="w-3 h-3" />
+                              <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Confirmar Retirada'}</span>
+                            </button>
+                          )}
+
+                          {order.status === 'PRONTO' && order.fulfillmentType !== 'RETIRADA' && (
                             <button
                               disabled={Boolean(updatingOrderIds[order.id])}
                               onClick={(e) => { e.stopPropagation(); handleAdvanceStatus(order, 'EM_ROTA'); }}
@@ -933,7 +968,13 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                               className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-wait text-white rounded-lg text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                             >
                               <CheckCircle className="w-3 h-3" />
-                              <span>{updatingOrderIds[order.id] ? 'Salvando...' : 'Concluir Entrega'}</span>
+                              <span>
+                                {updatingOrderIds[order.id]
+                                  ? 'Salvando...'
+                                  : order.fulfillmentType === 'RETIRADA'
+                                  ? 'Confirmar Retirada'
+                                  : 'Concluir Entrega'}
+                              </span>
                             </button>
                           )}
 
@@ -1343,7 +1384,7 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
               <span className="text-xs font-bold text-slate-700 block">
                 Alterar Status:{updatingOrderIds[selectedOrderForModal.id] ? ' (Sincronizando...)' : ''}
               </span>
-              <div className="grid grid-cols-3 gap-2">
+              <div className={`grid gap-2 ${selectedOrderForModal.fulfillmentType === 'RETIRADA' ? 'grid-cols-2' : 'grid-cols-3'}`}>
                 <button
                   disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
                   onClick={() => handleAdvanceStatus(selectedOrderForModal, 'EM_PREPARO')}
@@ -1356,21 +1397,35 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
                   onClick={() => handleAdvanceStatus(selectedOrderForModal, 'PRONTO')}
                   className="py-2 bg-purple-50 hover:bg-purple-100 disabled:opacity-50 text-purple-800 border border-purple-200 rounded-xl text-xs font-bold transition cursor-pointer"
                 >
-                  Pronto
+                  {selectedOrderForModal.fulfillmentType === 'RETIRADA' ? 'Pronto p/ Retirada' : 'Pronto'}
                 </button>
+                {selectedOrderForModal.fulfillmentType === 'DELIVERY' && (
+                  <button
+                    disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
+                    onClick={() => handleAdvanceStatus(selectedOrderForModal, 'EM_ROTA')}
+                    className="py-2 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-50 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold transition cursor-pointer"
+                  >
+                    Em Rota (Motoboy)
+                  </button>
+                )}
                 <button
                   disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
-                  onClick={() => handleAdvanceStatus(selectedOrderForModal, 'EM_ROTA')}
-                  className="py-2 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-50 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold transition cursor-pointer"
+                  onClick={() =>
+                    handleAdvanceStatus(
+                      selectedOrderForModal,
+                      'ENTREGUE',
+                      selectedOrderForModal.fulfillmentType === 'RETIRADA'
+                        ? 'Retirada confirmada no balcão'
+                        : undefined
+                    )
+                  }
+                  className={`py-2 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold transition cursor-pointer ${
+                    selectedOrderForModal.fulfillmentType === 'RETIRADA' ? '' : 'col-span-2'
+                  }`}
                 >
-                  Em Rota (Motoboy)
-                </button>
-                <button
-                  disabled={Boolean(updatingOrderIds[selectedOrderForModal.id])}
-                  onClick={() => handleAdvanceStatus(selectedOrderForModal, 'ENTREGUE')}
-                  className="py-2 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-50 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold transition col-span-2 cursor-pointer"
-                >
-                  Finalizar (Entregue)
+                  {selectedOrderForModal.fulfillmentType === 'RETIRADA'
+                    ? 'Confirmar Retirada'
+                    : 'Finalizar (Entregue)'}
                 </button>
                 {selectedOrderForModal.status === 'CANCELADO' ? (
                   <button

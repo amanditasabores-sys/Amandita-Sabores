@@ -238,9 +238,9 @@ async function run() {
   const realFetch = globalThis.fetch.bind(globalThis);
   const simDb = new TransactionalFirestoreSimulator();
 
-  const staffTokens: Record<string, { uid: string; email: string; role: string; status: string }> = {
-    'tok-admin': { uid: 'uid-admin', email: 'dvrmercadinho@gmail.com', role: 'ADMINISTRADOR', status: 'ATIVO' },
-    'tok-caixa': { uid: 'uid-caixa', email: 'caixa@staff.amanditasabores.com.br', role: 'CAIXA', status: 'ATIVO' },
+  const staffTokens: Record<string, { uid: string; role: string; status: string }> = {
+    'tok-admin': { uid: 'uid-admin', role: 'ADMINISTRADOR', status: 'ATIVO' },
+    'tok-caixa': { uid: 'uid-caixa', role: 'CAIXA', status: 'ATIVO' },
   };
 
   let activeTestToken = 'tok-caixa';
@@ -249,7 +249,7 @@ async function run() {
     async verifyIdToken(token: string) {
       const hit = staffTokens[token];
       if (!hit) throw new Error('INVALID_TOKEN');
-      return { uid: hit.uid, email: hit.email };
+      return { uid: hit.uid, role: hit.role, status: hit.status };
     },
   };
 
@@ -297,8 +297,8 @@ async function run() {
 
   const seedDefaultUsers = () => {
     const users = [
-      { id: 'uid-admin', name: 'Admin', username: 'admin', email: 'dvrmercadinho@gmail.com', role: 'ADMINISTRADOR', status: 'ATIVO', allowedModules: ['pdv', 'caixa', 'pedidos', 'cardapio', 'config', 'relatorios'], createdAt: new Date().toISOString() },
-      { id: 'uid-caixa', name: 'Caixa', username: 'caixa', email: 'caixa@staff.amanditasabores.com.br', role: 'CAIXA', status: 'ATIVO', allowedModules: ['pdv', 'caixa', 'pedidos'], createdAt: new Date().toISOString() },
+      { id: 'uid-admin', name: 'Gestor Principal', username: 'gestor_admin', email: '', role: 'ADMINISTRADOR', status: 'ATIVO', allowedModules: ['pdv', 'caixa', 'kanban', 'menu', 'configuracoes', 'relatorios', 'usuarios'], createdAt: new Date().toISOString() },
+      { id: 'uid-caixa', name: 'Caixa', username: 'caixa_op', email: '', role: 'CAIXA', status: 'ATIVO', allowedModules: ['pdv', 'caixa', 'kanban'], createdAt: new Date().toISOString() },
     ];
     localStorage.setItem('gf_users', JSON.stringify(users));
     for (const u of users) simDb.seedDoc('users', u.id, u);

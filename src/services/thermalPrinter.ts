@@ -91,6 +91,8 @@ class ThermalPrinterService {
   private lastError: string | null = null;
   private lastPrintedAt: string | null = null;
   private activeReconnectPromise: Promise<{ success: boolean; message: string }> | null = null;
+  private activeConnectPromise: Promise<{ success: boolean; message: string; deviceName?: string }> | null = null;
+  private manuallyDisconnected = false;
   private registeredDisconnectDevices: WeakSet<object> = new WeakSet();
   private lastAutoReconnectAttemptAt = 0;
   private readonly AUTO_RECONNECT_COOLDOWN_MS = 4000;
@@ -180,88 +182,222 @@ class ThermalPrinterService {
   // ==========================================
   public async connectBluetoothBLE(): Promise<{ success: boolean; message: string; deviceName?: string }> {
     if (!this.isBluetoothSupported()) {
-      const err = 'O seu navegador não possui suporte ao Web Bluetooth. No Android, use o Google Chrome ou alterne para o modo "Android RawBT".';
+      const err = 'O seu navegador não possui suporte ao Web Bluetooth. No Android ou computador, use o Google Chrome ou alterne para o modo "Android RawBT" / "Spooler do Sistema".';
       this.lastError = err;
       this.notifyStatus();
       return { success: false, message: err };
     }
 
-    const nav = navigator as any;
-
-    // 1. Verifica se o hardware Bluetooth está ligado no dispositivo
-    try {
-      if (typeof nav.bluetooth.getAvailability === 'function') {
-        const isAvailable = await nav.bluetooth.getAvailability();
-        if (!isAvailable) {
-          const msg = 'O Bluetooth do seu aparelho está desligado. Por favor, ative o Bluetooth nas configurações do celular/computador e certifique-se de que a impressora está ligada.';
-          this.lastError = msg;
-          this.notifyStatus();
-          return { success: false, message: msg };
-        }
-      }
-    } catch {
-      // Ignora erro de checagem prévia caso não suportado
+    // Evita concorrência entre o botão de Configurações e o botão rápido do PDV
+    if (this.activeConnectPromise) {
+      return this.activeConnectPromise;
     }
 
-    try {
-      this.lastError = null;
-      this.notifyStatus();
+    const nav = navigator as any;
+    this.manuallyDisconnected = false;
+    this.lastError = null;
+    this.notifyStatus();
 
-      // Solicita seleção nativa no Google Chrome
-      const device = await nav.bluetooth.requestDevice({
+    // IMPORTANTE: requestDevice() DEVE ser chamado diretamente no gesto do usuário,
+    // sem nenhum await assíncrono anterior (ex: getAvailability), para não perder a ativação no Chrome.
+    let devicePromise: Promise<any>;
+    try {
+      devicePromise = nav.bluetooth.requestDevice({
         acceptAllDevices: true,
         optionalServices: COMMON_BLE_PRINT_SERVICES,
       });
-
-      if (!device) {
-        return { success: false, message: 'Nenhuma impressora Bluetooth foi selecionada.' };
-      }
-
-      this.bleDevice = device;
-      this.setupDeviceDisconnectionListener(device);
-
-      // Conecta ao GATT Server
-      const server = await device.gatt.connect();
-      this.gattServer = server;
-
-      // Descobre serviço e característica de escrita ESC/POS
-      const foundCharacteristic = await this.discoverWriteCharacteristic(server);
-
-      if (!foundCharacteristic) {
-        await this.disconnectBluetooth();
-        const err = `Impressora pareada (${device.name || 'Dispositivo'}), mas não foi encontrada a característica de escrita BLE ESC/POS. A maioria das impressoras portáteis de 58mm utiliza Bluetooth clássico (SPP). Selecione o modo "Android RawBT" para imprimir via RawBT.`;
-        this.lastError = err;
-        this.notifyStatus();
-        return { success: false, message: err };
-      }
-
-      this.writeCharacteristic = foundCharacteristic;
-
-      this.saveConfig({
-        lastDeviceName: device.name || 'Impressora Térmica 58mm',
-        lastDeviceId: device.id,
-        connectionMode: 'bluetooth_ble',
-      });
-
-      this.notifyStatus();
-      return {
-        success: true,
-        message: `Impressora "${device.name || 'Térmica 58mm'}" conectada com sucesso via Bluetooth BLE!`,
-        deviceName: device.name,
-      };
-    } catch (err: any) {
-      let msg = err?.message || String(err);
-      if (err?.name === 'NotFoundError') {
-        msg = 'Nenhuma impressora foi selecionada ou a busca foi cancelada. Se sua impressora não apareceu na lista: 1) Verifique se a impressora está ligada com luz indicadora piscando; 2) No Android, certifique-se de que a Localização/GPS e "Dispositivos Próximos" estão autorizados para o Chrome; 3) Se sua impressora for Bluetooth 2.0/3.0 Clássico (SPP), ela não opera por BLE — utilize o modo "Android RawBT" nas opções.';
-      } else if (err?.name === 'SecurityError') {
-        msg = 'Permissão de Bluetooth negada pelo navegador. Conceda a permissão de Bluetooth nas configurações do site no Chrome.';
-      } else if (err?.name === 'NotSupportedError') {
-        msg = 'Web Bluetooth não é suportado nesta plataforma. Utilize o modo "Android RawBT" ou "Spooler do Sistema".';
-      }
+    } catch (syncErr: any) {
+      const msg = this.classifyBluetoothConnectError(syncErr, null);
       this.lastError = msg;
       this.notifyStatus();
       return { success: false, message: msg };
     }
+
+    const run = (async (): Promise<{ success: boolean; message: string; deviceName?: string }> => {
+      let selectedServer: any = null;
+      try {
+        const device = await devicePromise;
+
+        if (!device) {
+          return { success: false, message: 'Nenhuma impressora Bluetooth foi selecionada.' };
+        }
+
+        // Se havia outro dispositivo conectado anteriormente, encerra o GATT anterior com segurança
+        if (this.bleDevice && this.bleDevice !== device && this.gattServer?.connected) {
+          try {
+            this.gattServer.disconnect();
+          } catch {
+            // ignora erro ao encerrar conexão anterior
+          }
+        }
+
+        this.setupDeviceDisconnectionListener(device);
+
+        // Conecta ao GATT Server com timeout controlado
+        const server = await this.connectGattWithTimeout(device, 10000);
+        selectedServer = server;
+
+        // Descobre serviço e característica de escrita ESC/POS (com uma tentativa extra após breve estabilização)
+        let foundCharacteristic = await this.discoverWriteCharacteristic(server);
+        if (!foundCharacteristic) {
+          await new Promise((r) => setTimeout(r, 250));
+          if (server?.connected) {
+            foundCharacteristic = await this.discoverWriteCharacteristic(server);
+          }
+        }
+
+        if (!foundCharacteristic) {
+          try {
+            if (server?.connected) {
+              server.disconnect();
+            }
+          } catch {
+            // ignore
+          }
+          const err = `Impressora pareada (${device.name || 'Dispositivo'}), mas não foi encontrada a característica de escrita BLE ESC/POS. A maioria das impressoras portáteis de 58mm utiliza Bluetooth clássico (SPP). Selecione o modo "Android RawBT" para imprimir via RawBT.`;
+          this.lastError = err;
+          this.notifyStatus();
+          return { success: false, message: err };
+        }
+
+        this.bleDevice = device;
+        this.gattServer = server;
+        this.writeCharacteristic = foundCharacteristic;
+        this.manuallyDisconnected = false;
+        this.lastError = null;
+
+        this.saveConfig({
+          lastDeviceName: device.name || 'Impressora Térmica 58mm',
+          lastDeviceId: device.id,
+          connectionMode: 'bluetooth_ble',
+          bleServiceUuid: foundCharacteristic?.service?.uuid || this.config.bleServiceUuid,
+          bleCharUuid: foundCharacteristic?.uuid || this.config.bleCharUuid,
+        });
+
+        this.notifyStatus();
+        return {
+          success: true,
+          message: `Impressora "${device.name || 'Térmica 58mm'}" conectada com sucesso via Bluetooth BLE!`,
+          deviceName: device.name,
+        };
+      } catch (err: any) {
+        if (selectedServer?.connected && selectedServer !== this.gattServer) {
+          try {
+            selectedServer.disconnect();
+          } catch {
+            // ignore
+          }
+        }
+
+        // Diagnóstico complementar pós-erro (nunca antes do requestDevice e nunca sobrescrevendo o erro original)
+        let availability: boolean | null = null;
+        if (typeof nav?.bluetooth?.getAvailability === 'function') {
+          try {
+            availability = Boolean(await nav.bluetooth.getAvailability());
+          } catch {
+            availability = null;
+          }
+        }
+
+        const msg = this.classifyBluetoothConnectError(err, availability);
+        this.lastError = msg;
+        this.notifyStatus();
+        return { success: false, message: msg };
+      } finally {
+        this.activeConnectPromise = null;
+      }
+    })();
+
+    this.activeConnectPromise = run;
+    return run;
+  }
+
+  private classifyBluetoothConnectError(err: any, availability: boolean | null): string {
+    const errName = typeof err?.name === 'string' ? err.name.trim() : '';
+    const rawMsg =
+      typeof err?.message === 'string'
+        ? err.message.trim()
+        : typeof err === 'string'
+          ? err.trim()
+          : '';
+    const lowerMsg = rawMsg.toLowerCase();
+
+    let inIframe = false;
+    try {
+      inIframe = typeof window !== 'undefined' && window.self !== window.top;
+    } catch {
+      inIframe = true;
+    }
+
+    const isPolicyBlocked =
+      lowerMsg.includes('permissions policy') ||
+      lowerMsg.includes('feature policy') ||
+      lowerMsg.includes('disallowed by permissions');
+    const isUserCancelled =
+      lowerMsg.includes('user cancel') ||
+      lowerMsg.includes('cancelled') ||
+      lowerMsg.includes('canceled') ||
+      lowerMsg.includes('chooser');
+    const isPermissionDenied =
+      lowerMsg.includes('permission') ||
+      lowerMsg.includes('denied') ||
+      lowerMsg.includes('not allowed') ||
+      lowerMsg.includes('globally disabled') ||
+      lowerMsg.includes('nearby');
+    const isAdapterUnavailableMsg =
+      lowerMsg.includes('adapter not available') ||
+      lowerMsg.includes('bluetooth is turned off') ||
+      lowerMsg.includes('bluetooth adapter');
+
+    // 1. SecurityError ou bloqueio explícito por Permissions-Policy / iframe (prioridade máxima)
+    if (errName === 'SecurityError' || isPolicyBlocked) {
+      if (inIframe || isPolicyBlocked) {
+        return 'Acesso ao Bluetooth bloqueado pela política de permissões do navegador (Permissions-Policy) ou por estar em um iframe/visualização embutida. Abra o sistema em uma aba direta do Google Chrome (HTTPS ou localhost) e tente novamente.';
+      }
+      return 'Permissão de Bluetooth bloqueada por política de segurança do navegador (SecurityError). Abra o sistema em uma aba direta do Google Chrome via HTTPS (ou localhost) e conceda permissão de Bluetooth ao site.';
+    }
+
+    // 2. NotAllowedError: distingue cancelamento do seletor vs permissão negada
+    if (errName === 'NotAllowedError') {
+      if (isUserCancelled && !isPermissionDenied) {
+        return 'A seleção da impressora Bluetooth foi cancelada antes da conexão. Toque novamente em "Localizar e Parear Impressora" e escolha o dispositivo na lista.';
+      }
+      const complementaryHint =
+        availability === false
+          ? ' O navegador também reportou o adaptador Bluetooth indisponível para o Chrome.'
+          : '';
+      return `Permissão de Bluetooth negada pelo navegador ou pelo sistema (NotAllowedError). No Android, verifique em Configurações > Apps > Chrome > Permissões se "Dispositivos próximos" (e Localização) estão autorizados, e libere Bluetooth nas configurações do site no Chrome.${complementaryHint}`;
+    }
+
+    // 3. NotSupportedError: ausência de suporte Web Bluetooth na plataforma
+    if (errName === 'NotSupportedError') {
+      return 'Web Bluetooth não é suportado nesta plataforma ou navegador (NotSupportedError). Utilize o modo "Android RawBT" ou "Spooler do Sistema".';
+    }
+
+    // 4. NotFoundError: nenhum dispositivo encontrado, cancelamento ou adaptador inacessível no Chrome
+    if (errName === 'NotFoundError') {
+      if (isUserCancelled) {
+        return 'Nenhuma impressora foi selecionada ou a busca foi cancelada. Se sua impressora não apareceu na lista: 1) Verifique se a impressora está ligada com luz indicadora piscando; 2) No Android, certifique-se de que "Dispositivos próximos" e Localização/GPS estão autorizados para o Chrome; 3) Se sua impressora for Bluetooth 2.0/3.0 Clássico (SPP), ela não opera por BLE — utilize o modo "Android RawBT" nas opções.';
+      }
+      if (isAdapterUnavailableMsg || availability === false) {
+        return 'Nenhuma impressora Bluetooth pôde ser encontrada (NotFoundError) porque o adaptador está indisponível para o Google Chrome. Isso pode ocorrer se o Bluetooth estiver desligado ou se a permissão "Dispositivos próximos" (e Localização) do Chrome não estiver concedida no Android (Configurações > Apps > Chrome > Permissões). Se a impressora for Bluetooth Clássico (SPP), utilize o modo "Android RawBT".';
+      }
+      return 'Nenhuma impressora foi selecionada ou a busca foi cancelada. Se sua impressora não apareceu na lista: 1) Verifique se a impressora está ligada com luz indicadora piscando; 2) No Android, certifique-se de que "Dispositivos próximos" e Localização/GPS estão autorizados para o Chrome; 3) Se sua impressora for Bluetooth 2.0/3.0 Clássico (SPP), ela não opera por BLE — utilize o modo "Android RawBT" nas opções.';
+    }
+
+    // 5. Diagnóstico complementar quando getAvailability() retorna false sem erro mais específico
+    if (availability === false) {
+      return 'O adaptador Bluetooth está indisponível para o Google Chrome. Isso pode ocorrer se o Bluetooth do aparelho estiver desligado ou se a permissão "Dispositivos próximos" do Chrome não estiver concedida no Android (Configurações > Apps > Chrome > Permissões). Verifique também se a impressora está ligada.';
+    }
+
+    // 6. Erro genérico seguro (sem expor detalhes sensíveis)
+    const safeMsg = rawMsg.slice(0, 180);
+    if (safeMsg) {
+      return errName && !safeMsg.includes(errName)
+        ? `Falha ao conectar impressora Bluetooth (${errName}): ${safeMsg}`
+        : safeMsg;
+    }
+    return 'Não foi possível localizar ou conectar a impressora Bluetooth. Verifique se a impressora está ligada e tente novamente.';
   }
 
   private isBleConnectionHealthy(): boolean {
@@ -273,11 +409,12 @@ class ThermalPrinterService {
 
     const triggerPassiveResumeReconnect = () => {
       if (document.visibilityState === 'hidden') return;
+      if (this.manuallyDisconnected) return;
       if (this.config.connectionMode !== 'bluetooth_ble') return;
       if (!this.bleDevice && !this.config.lastDeviceId && !this.config.lastDeviceName) return;
       if (this.isPrinting) return;
       if (this.isBleConnectionHealthy()) return;
-      if (this.activeReconnectPromise) return;
+      if (this.activeReconnectPromise || this.activeConnectPromise) return;
 
       const now = Date.now();
       if (now - this.lastAutoReconnectAttemptAt < this.AUTO_RECONNECT_COOLDOWN_MS) return;
@@ -315,6 +452,21 @@ class ThermalPrinterService {
 
   private async discoverWriteCharacteristic(server: any): Promise<any> {
     let foundCharacteristic: any = null;
+
+    // Prioridade 0: Reutiliza UUID de serviço e característica previamente validados nesta impressora
+    if (this.config.bleServiceUuid && this.config.bleCharUuid) {
+      try {
+        const savedService = await server.getPrimaryService(this.config.bleServiceUuid);
+        if (savedService) {
+          const savedChar = await savedService.getCharacteristic(this.config.bleCharUuid);
+          if (savedChar?.properties && (savedChar.properties.write || savedChar.properties.writeWithoutResponse)) {
+            return savedChar;
+          }
+        }
+      } catch {
+        // Segue para descoberta completa caso UUID tenha mudado
+      }
+    }
 
     // Prioridade 1: Inspeciona todos os serviços primários expostos
     try {
@@ -623,6 +775,7 @@ class ThermalPrinterService {
    * recupera dispositivo via getDevices() se perdido após reload e redescobre a característica ESC/POS.
    */
   public async reconnectSavedBLE(): Promise<{ success: boolean; message: string }> {
+    this.manuallyDisconnected = false;
     return this.performSerializedBleReconnect({
       silent: false,
       timeoutMs: 6000,
@@ -631,6 +784,7 @@ class ThermalPrinterService {
   }
 
   public async disconnectBluetooth(): Promise<void> {
+    this.manuallyDisconnected = true;
     try {
       if (this.gattServer && this.gattServer.connected) {
         this.gattServer.disconnect();
@@ -640,7 +794,6 @@ class ThermalPrinterService {
     } finally {
       this.writeCharacteristic = null;
       this.gattServer = null;
-      this.bleDevice = null;
       this.notifyStatus();
     }
   }

@@ -154,34 +154,33 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
   return (
     <aside
       aria-label="Notificação de Pedido Pronto para Entrega"
-      className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50 max-w-sm sm:max-w-md w-[calc(100vw-2rem)] animate-in slide-in-from-bottom-5 duration-300 pointer-events-auto"
+      className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50 max-w-sm sm:max-w-md w-[calc(100vw-2rem)] animate-in slide-in-from-bottom-5 duration-300 pointer-events-auto font-sans"
     >
-      <div className="bg-slate-900 border-2 border-amber-500/80 rounded-2xl sm:rounded-3xl shadow-2xl overflow-hidden backdrop-blur-xl ring-1 ring-amber-500/30">
-        {/* Pulsing Alarm Header Bar */}
-        <div className="bg-gradient-to-r from-amber-600 via-amber-700 to-amber-900 text-white px-4 py-2.5 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-3.5 w-3.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-300 opacity-90"></span>
-              <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-amber-200"></span>
-            </span>
-            <div className="flex items-center gap-1.5 font-black text-xs tracking-wide uppercase text-white">
-              <Bike className="w-4 h-4 text-amber-200 animate-bounce" />
-              <span>Pedido pronto para entrega!</span>
+      <div className="bg-white border-2 border-[#EA580C] rounded-2xl shadow-2xl overflow-hidden">
+        {/* Alert Header Bar */}
+        <div className="bg-[#0F2342] text-white px-4 py-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-7 h-7 rounded-lg bg-[#EA580C] text-white flex items-center justify-center shrink-0">
+              <Bike className="w-4 h-4" />
             </div>
+            <span className="font-bold text-xs sm:text-sm tracking-tight text-white truncate">
+              Pedido pronto para entrega!
+            </span>
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 shrink-0">
             {isPlayingAudio && !isSoundMutedManually && (
-              <span className="flex items-center gap-1 text-[10px] font-bold text-amber-200 bg-black/30 px-2 py-0.5 rounded-full">
-                <Volume2 className="w-3 h-3 animate-pulse text-amber-300" />
+              <span className="flex items-center gap-1 text-[11px] font-semibold text-[#FED7AA] bg-white/10 px-2 py-0.5 rounded-lg">
+                <Volume2 className="w-3.5 h-3.5 text-[#FB923C]" />
                 <span className="hidden sm:inline">Tocando</span>
               </span>
             )}
             <button
               type="button"
               onClick={() => handleAcknowledge(current.id)}
-              className="text-white/80 hover:text-white p-1 rounded-lg hover:bg-white/10 transition cursor-pointer"
+              className="text-slate-300 hover:text-white p-1.5 rounded-lg hover:bg-white/10 transition cursor-pointer"
               title="Dispensar aviso"
+              aria-label="Dispensar aviso"
             >
               <X className="w-4 h-4" />
             </button>
@@ -189,28 +188,28 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
         </div>
 
         {/* Content Body */}
-        <div className="p-4 space-y-3 bg-slate-900/95 text-slate-100">
+        <div className="p-4 space-y-3 bg-white text-[#0F2342]">
           {/* Order Header & Time */}
           <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xl font-black text-amber-400 font-mono tracking-tight">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xl font-extrabold text-[#EA580C] font-mono tabular-nums tracking-tight">
                   {current.orderNumber}
                 </span>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-1">
-                  <PackageCheck className="w-3 h-3" />
-                  Pronto para Retirada
+                <span className="text-xs font-semibold text-[#1B365D] flex items-center gap-1">
+                  <PackageCheck className="w-3.5 h-3.5 text-[#EA580C] shrink-0" />
+                  <span>Pronto para retirada</span>
                 </span>
               </div>
-              <p className="text-sm font-bold text-white mt-0.5">
+              <p className="text-sm font-bold text-[#0F2342] mt-0.5 truncate">
                 {current.customer.name}
               </p>
             </div>
 
             <div className="text-right shrink-0">
-              <span className="text-[10px] text-slate-400 uppercase font-semibold block">Pronto às</span>
-              <span className="text-xs font-bold text-slate-200 font-mono flex items-center justify-end gap-1">
-                <Clock className="w-3 h-3 text-amber-400" />
+              <span className="text-[11px] text-slate-500 font-medium block">Pronto às</span>
+              <span className="text-xs font-bold text-[#0F2342] font-mono tabular-nums flex items-center justify-end gap-1">
+                <Clock className="w-3.5 h-3.5 text-[#EA580C]" />
                 {readyTimeStr}
               </span>
             </div>
@@ -218,33 +217,33 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
 
           {/* Delivery Address Details */}
           {addressText ? (
-            <div className="text-xs text-slate-200 bg-slate-950/80 p-2.5 rounded-xl border border-slate-800 flex items-start gap-2">
-              <MapPin className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="text-xs text-[#0F2342] bg-[#F8FAFC] p-3 rounded-xl border border-[#E2E8F0] flex items-start gap-2.5">
+              <MapPin className="w-4 h-4 text-[#EA580C] shrink-0 mt-0.5" />
               <div className="flex-1 min-w-0">
-                <p className="font-semibold text-slate-100 leading-snug">
+                <p className="font-semibold text-[#0F2342] leading-snug">
                   {addressText}
                 </p>
                 {address?.reference && (
-                  <p className="text-[11px] text-slate-400 mt-0.5 italic">
+                  <p className="text-[11px] text-slate-600 mt-0.5">
                     Ref: {address.reference}
                   </p>
                 )}
               </div>
             </div>
           ) : (
-            <div className="text-xs text-slate-300 bg-slate-950/80 p-2 rounded-xl border border-slate-800 flex items-center gap-2">
-              <MapPin className="w-4 h-4 text-amber-400 shrink-0" />
+            <div className="text-xs text-slate-600 bg-[#F8FAFC] p-2.5 rounded-xl border border-[#E2E8F0] flex items-center gap-2">
+              <MapPin className="w-4 h-4 text-[#EA580C] shrink-0" />
               <span>Endereço de entrega informado no cadastro do pedido.</span>
             </div>
           )}
 
           {/* Clear message */}
-          <p className="text-xs font-medium text-amber-200/90 bg-amber-950/40 border border-amber-900/50 p-2 rounded-xl">
-            📦 <strong>Mensagem:</strong> O pedido está pronto para ser retirado e entregue.
+          <p className="text-xs font-medium text-[#9A3412] bg-[#FFF7ED] border border-[#FED7AA] px-3 py-2 rounded-xl">
+            O pedido está pronto no balcão para retirada e entrega.
           </p>
 
           {additionalCount > 0 && (
-            <p className="text-[11px] font-bold text-amber-400 text-center bg-amber-500/10 py-1 rounded-lg border border-amber-500/20">
+            <p className="text-xs font-semibold text-[#1B365D] text-center bg-[#F8FAFC] py-1.5 rounded-xl border border-[#E2E8F0]">
               + {additionalCount} outro(s) pedido(s) pronto(s) para entrega
             </p>
           )}
@@ -256,34 +255,25 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
               type="button"
               onClick={handleStopSound}
               disabled={!isPlayingAudio || isSoundMutedManually}
-              className={`py-2 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer active:scale-95 ${
+              className={`min-h-[44px] py-2.5 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer active:scale-[0.98] ${
                 isPlayingAudio && !isSoundMutedManually
-                  ? 'bg-amber-500 hover:bg-amber-600 text-slate-950 shadow-md ring-2 ring-amber-400/50'
-                  : 'bg-slate-800/80 text-slate-400 border border-slate-700/50 cursor-default opacity-70'
+                  ? 'bg-[#EA580C] hover:bg-[#C2410C] text-white shadow-xs'
+                  : 'bg-[#F1F5F9] text-slate-400 border border-[#E2E8F0] cursor-default'
               }`}
               title="Interrompe o alarme sonoro imediatamente"
             >
-              {isPlayingAudio && !isSoundMutedManually ? (
-                <>
-                  <VolumeX className="w-4 h-4 text-slate-950" />
-                  <span>Parar som</span>
-                </>
-              ) : (
-                <>
-                  <VolumeX className="w-4 h-4" />
-                  <span>Som parado</span>
-                </>
-              )}
+              <VolumeX className="w-4 h-4 shrink-0" />
+              <span>{isPlayingAudio && !isSoundMutedManually ? 'Parar som' : 'Som parado'}</span>
             </button>
 
             {/* 2. ENTENDIDO BUTTON (Confirms awareness & closes alert; preserves order status) */}
             <button
               type="button"
               onClick={() => handleAcknowledge(current.id)}
-              className="py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs rounded-xl shadow-md transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 ring-1 ring-emerald-400/30"
+              className="min-h-[44px] py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-[0.98]"
               title="Confirma recebimento do aviso sem alterar o status do pedido"
             >
-              <Check className="w-4 h-4 text-emerald-200" />
+              <Check className="w-4 h-4 shrink-0" />
               <span>Entendido</span>
             </button>
           </div>
@@ -293,10 +283,10 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
             <button
               type="button"
               onClick={() => handleViewOrder(current)}
-              className="w-full py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
+              className="w-full min-h-[44px] py-2.5 px-3 bg-[#0F2342] hover:bg-[#1B365D] text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
             >
-              <Eye className="w-3.5 h-3.5 text-amber-400" />
-              <span>Ver Detalhes do Pedido no Portal</span>
+              <Eye className="w-4 h-4 text-[#FB923C] shrink-0" />
+              <span>Ver detalhes do pedido</span>
             </button>
           )}
 
@@ -304,7 +294,7 @@ export const DriverReadyOrderAlert: React.FC<DriverReadyOrderAlertProps> = ({
             <button
               type="button"
               onClick={handleAcknowledgeAll}
-              className="w-full text-center text-[11px] text-slate-400 hover:text-slate-200 underline pt-1 cursor-pointer transition-colors"
+              className="w-full text-center text-xs text-slate-500 hover:text-[#0F2342] underline pt-1 cursor-pointer transition-colors"
             >
               Confirmar e dispensar todos os {readyAlerts.length} avisos
             </button>

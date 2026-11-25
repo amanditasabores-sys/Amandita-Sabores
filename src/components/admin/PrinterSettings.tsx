@@ -32,6 +32,7 @@ export const PrinterSettings: React.FC = () => {
   useEffect(() => {
     const unsub = thermalPrinterService.subscribe((newStatus) => {
       setStatus(newStatus);
+      setConfig(thermalPrinterService.getConfig());
     });
     return unsub;
   }, []);
@@ -204,8 +205,8 @@ export const PrinterSettings: React.FC = () => {
           <div className="flex flex-wrap gap-2 pt-1">
             {config.connectionMode === 'bluetooth_ble' ? (
               !status.connected ? (
-                config.lastDeviceId ? (
-                  <>
+                <>
+                  {(status.hasSavedDevice || config.lastDeviceId) && (
                     <button
                       type="button"
                       onClick={handleReconnectSaved}
@@ -215,23 +216,13 @@ export const PrinterSettings: React.FC = () => {
                       <RefreshCw className={`w-3.5 h-3.5 ${isReconnecting ? 'animate-spin' : ''}`} />
                       <span>{isReconnecting ? 'Reconectando...' : 'Reconectar Impressora'}</span>
                     </button>
-                    <button
-                      type="button"
-                      onClick={handleConnectBle}
-                      disabled={isConnecting || isReconnecting}
-                      className="px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
-                      title="Parear outro modelo de impressora"
-                    >
-                      <Bluetooth className="w-3.5 h-3.5" />
-                      <span>Parear Nova</span>
-                    </button>
-                  </>
-                ) : (
+                  )}
                   <button
                     type="button"
                     onClick={handleConnectBle}
-                    disabled={isConnecting}
+                    disabled={isConnecting || isReconnecting}
                     className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition cursor-pointer"
+                    title="Abrir seletor Bluetooth do navegador para parear impressora"
                   >
                     {isConnecting ? (
                       <>
@@ -245,18 +236,50 @@ export const PrinterSettings: React.FC = () => {
                       </>
                     )}
                   </button>
-                )
+                </>
               ) : (
-                <button
-                  type="button"
-                  onClick={handleDisconnect}
-                  className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer"
-                >
-                  <Unplug className="w-3.5 h-3.5 text-slate-600" />
-                  <span>Desconectar</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={handleDisconnect}
+                    className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer"
+                  >
+                    <Unplug className="w-3.5 h-3.5 text-slate-600" />
+                    <span>Desconectar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConnectBle}
+                    disabled={isConnecting || isReconnecting}
+                    className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                    title="Selecionar e parear outra impressora Bluetooth"
+                  >
+                    <Bluetooth className="w-3.5 h-3.5" />
+                    <span>{isConnecting ? 'Buscando...' : 'Parear Outra'}</span>
+                  </button>
+                </>
               )
-            ) : null}
+            ) : (
+              <button
+                type="button"
+                onClick={handleConnectBle}
+                disabled={isConnecting || isReconnecting}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition cursor-pointer"
+                title="Localizar e parear impressora via Web Bluetooth (BLE)"
+              >
+                {isConnecting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Buscando impressora...</span>
+                  </>
+                ) : (
+                  <>
+                    <Bluetooth className="w-3.5 h-3.5" />
+                    <span>Localizar e Parear Impressora (BLE)</span>
+                  </>
+                )}
+              </button>
+            )}
 
             <button
               type="button"

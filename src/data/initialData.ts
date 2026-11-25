@@ -435,74 +435,10 @@ export const INITIAL_CONFIG: RestaurantConfig = {
   closedSecondaryMessage: DEFAULT_CLOSED_SECONDARY_MESSAGE,
 };
 
-export const INITIAL_USERS: User[] = [
-  {
-    id: 'user-admin',
-    name: 'Amanda Silveira (Administradora)',
-    username: 'admin',
-    email: 'admin@amanditasabores.com.br',
-    isEmailVerified: true,
-    role: 'ADMINISTRADOR',
-    status: 'ATIVO',
-    allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'entregas', 'relatorios', 'menu', 'usuarios', 'configuracoes', 'qrcodes', 'auditoria'],
-    createdAt: new Date(Date.now() - 30 * 86400000).toISOString(),
-  },
-  {
-    id: 'user-caixa',
-    name: 'Carlos Mendes (Operador de Caixa)',
-    username: 'caixa',
-    email: 'caixa@amanditasabores.com.br',
-    isEmailVerified: true,
-    role: 'CAIXA',
-    status: 'ATIVO',
-    allowedModules: ['pdv', 'kanban', 'caixa'],
-    createdAt: new Date(Date.now() - 20 * 86400000).toISOString(),
-  },
-  {
-    id: 'user-cozinha',
-    name: 'Maria Cícera (Cozinha & Preparo)',
-    username: 'cozinha',
-    email: 'cozinha@amanditasabores.com.br',
-    isEmailVerified: true,
-    role: 'COZINHA',
-    status: 'ATIVO',
-    allowedModules: ['kds'],
-    createdAt: new Date(Date.now() - 15 * 86400000).toISOString(),
-  },
-  {
-    id: 'user-entregador',
-    name: 'Rodrigo Motoboy (Entregas)',
-    username: 'entregador',
-    email: 'entregador@amanditasabores.com.br',
-    isEmailVerified: true,
-    role: 'ENTREGADOR',
-    status: 'ATIVO',
-    allowedModules: ['entregas'],
-    createdAt: new Date(Date.now() - 10 * 86400000).toISOString(),
-  },
-  {
-    id: 'user-gerente',
-    name: 'Juliana Castro (Supervisora)',
-    username: 'gerente',
-    email: 'gerente@amanditasabores.com.br',
-    isEmailVerified: true,
-    role: 'GERENTE',
-    status: 'ATIVO',
-    allowedModules: ['pdv', 'kanban', 'kds', 'caixa', 'relatorios', 'menu', 'qrcodes'],
-    createdAt: new Date(Date.now() - 12 * 86400000).toISOString(),
-  },
-  {
-    id: 'user-atendente',
-    name: 'Fernanda Lima (Atendimento & Balcão)',
-    username: 'atendente',
-    email: 'atendente@amanditasabores.com.br',
-    isEmailVerified: true,
-    role: 'ATENDENTE',
-    status: 'ATIVO',
-    allowedModules: ['pdv', 'kanban'],
-    createdAt: new Date(Date.now() - 8 * 86400000).toISOString(),
-  },
-];
+// Etapa 2B: Contas padrão com credenciais fixas foram removidas.
+// O primeiro administrador é criado exclusivamente no fluxo de primeiro acesso (/api/auth/bootstrap-admin)
+// e os funcionários são cadastrados exclusivamente pelo administrador (/api/auth/register-staff).
+export const INITIAL_USERS: User[] = [];
 
 export const INITIAL_ORDERS: Order[] = [
   {

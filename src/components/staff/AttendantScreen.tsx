@@ -74,39 +74,40 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
   const newOrdersCount = orders.filter((o) => o.status === 'NOVO').length;
 
   return (
-    <div className="min-h-screen bg-[#FAF7F2] text-[#2C1810] pb-16">
+    <div className="min-h-screen bg-[#F8FAFC] text-[#0F2342] pb-24 lg:pb-12">
       {/* Top Header - Dedicated Atendente UI */}
-      <header className="bg-gradient-to-r from-[#2C1810] via-[#3D2314] to-[#2C1810] text-white shadow-md sticky top-0 z-30 border-b border-[#C86D3B]/25">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+      <header className="bg-[#0F2342] text-white shadow-sm sticky top-0 z-30 border-b border-white/10">
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 py-2 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-4">
           {/* Brand & Atendente Tag */}
-          <div className="flex items-center gap-3">
-            <AmanditaLogo variant="icon" size="md" theme="dark" />
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="font-black text-base tracking-tight text-white flex items-center gap-1.5">
-                  <Store className="w-5 h-5 text-[#E89255]" />
-                  <span>Atendimento & Balcão</span>
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+            <div className="shrink-0">
+              <AmanditaLogo variant="icon" size="sm" theme="dark" className="sm:w-10 sm:h-10" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <h1 className="font-bold text-sm sm:text-base tracking-tight text-white truncate">
+                  Atendimento & Balcão
                 </h1>
-                <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-[#C86D3B]/25 text-[#E89255] border border-[#C86D3B]/40 uppercase tracking-wider">
-                  ATENDENTE
-                </span>
                 {store.getAuthSessionMode() === 'local_contingency' && (
-                  <span className="px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-400/40 uppercase tracking-wider" title="Firebase não configurado neste dispositivo">
-                    CONTINGÊNCIA LOCAL
+                  <span
+                    className="text-[11px] font-semibold text-amber-300 shrink-0 whitespace-nowrap"
+                    title="Firebase não configurado neste dispositivo"
+                  >
+                    · Contingência local
                   </span>
                 )}
               </div>
-              <p className="text-xs text-[#D9C7B8] flex items-center gap-2">
-                <span className="font-mono text-amber-300 font-bold flex items-center gap-1">
-                  <Clock className="w-3 h-3 text-amber-400" />
+              <p className="text-[11px] sm:text-xs text-slate-300 flex items-center gap-1.5 sm:gap-2 truncate">
+                <span className="font-mono tabular-nums text-[#FB923C] font-semibold flex items-center gap-1 shrink-0">
+                  <Clock className="w-3 h-3" />
                   {currentTime}
                 </span>
-                <span>·</span>
-                <span>{activeOrdersCount} pedidos ativos</span>
+                <span className="text-slate-500" aria-hidden="true">·</span>
+                <span className="shrink-0 tabular-nums">{activeOrdersCount} ativos</span>
                 {newOrdersCount > 0 && (
                   <>
-                    <span>·</span>
-                    <span className="text-[#E89255] font-black flex items-center gap-1">
+                    <span className="text-slate-500" aria-hidden="true">·</span>
+                    <span className="text-[#FB923C] font-bold flex items-center gap-1 shrink-0 tabular-nums">
                       <Bell className="w-3 h-3 animate-bounce" />
                       {newOrdersCount} novos
                     </span>
@@ -117,13 +118,13 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
           </div>
 
           {/* Quick shortcuts and Audio toggles */}
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {/* Audio Alert Toggle & Test Button */}
-            <div className="flex items-center gap-1 bg-[#1F100B] p-1 rounded-xl border border-[#4A2E1F]">
+            <div className="flex items-center gap-0.5 bg-[#1B365D] p-1 rounded-xl border border-white/10">
               <button
                 onClick={toggleSound}
                 className={`p-1.5 rounded-lg transition cursor-pointer ${
-                  isSoundActive ? 'text-[#E89255] bg-[#C86D3B]/20' : 'text-slate-400 hover:text-white'
+                  isSoundActive ? 'text-[#FB923C] bg-[#EA580C]/20' : 'text-slate-400 hover:text-white'
                 }`}
                 title={isSoundActive ? 'Som ativado' : 'Som desativado'}
               >
@@ -131,7 +132,7 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
               </button>
               <button
                 onClick={testAlertSound}
-                className="px-2 py-1 text-[11px] font-semibold text-[#D9C7B8] hover:text-white rounded-lg hover:bg-white/10 transition cursor-pointer"
+                className="hidden sm:inline-flex px-2 py-1 text-[11px] font-semibold text-slate-200 hover:text-white rounded-lg hover:bg-white/10 transition whitespace-nowrap cursor-pointer"
                 title="Tocar som de campainha de teste"
               >
                 Testar Som
@@ -142,63 +143,66 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
             {activeTab !== 'pdv' && (
               <button
                 onClick={() => setActiveTab('pdv')}
-                className="px-2.5 py-1.5 bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-200 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-emerald-500/40 cursor-pointer"
+                className="px-2.5 sm:px-3 py-1.5 bg-[#EA580C] hover:bg-[#C2410C] text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 title="Retornar à tela principal do PDV"
               >
-                <Store className="w-3.5 h-3.5 text-[#E89255]" />
-                <span className="hidden sm:inline">PDV / Painel</span>
+                <Store className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Voltar ao PDV</span>
+                <span className="sm:hidden">PDV</span>
               </button>
             )}
 
             {/* User Profile & Logout */}
-            <div className="flex items-center gap-2 pl-2 border-l border-[#4A2E1F]">
-              <div className="text-right hidden sm:block">
-                <p className="text-xs font-black text-white leading-tight">
+            <div className="flex items-center gap-2 pl-2 border-l border-white/15">
+              <div className="text-right hidden md:block">
+                <p className="text-xs font-bold text-white leading-tight truncate max-w-[140px]">
                   {currentUser?.name || currentUser?.username || 'Atendente'}
                 </p>
-                <p className="text-[10px] text-[#D9C7B8] uppercase font-bold tracking-wider">
-                  Atendimento & PDV
+                <p className="text-[11px] text-slate-300 font-medium leading-tight">
+                  Atendente
                 </p>
               </div>
               <button
                 onClick={onLogout}
-                className="px-3 py-1.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-rose-500/30 cursor-pointer"
+                className="px-2.5 sm:px-3 py-1.5 bg-white/10 hover:bg-rose-500/20 text-slate-200 hover:text-rose-200 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 border border-white/10 whitespace-nowrap cursor-pointer"
                 title="Sair do Atendimento"
               >
-                <LogOut className="w-3.5 h-3.5" />
-                <span>Sair</span>
+                <LogOut className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Sair</span>
               </button>
             </div>
           </div>
         </div>
 
         {/* Navigation Tabs - Strictly limited to authorized modules (PDV and Kanban) */}
-        <div className="max-w-7xl mx-auto px-4 sm:px-6">
-          <div className="flex items-center gap-1 overflow-x-auto border-t border-[#4A2E1F] pt-1.5 pb-1.5">
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6">
+          <div className="flex items-center gap-1 overflow-x-auto no-scrollbar border-t border-white/10 py-1.5">
             <button
               onClick={() => setActiveTab('pdv')}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'pdv'
-                  ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-sm'
-                  : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                  ? 'bg-[#EA580C] text-white shadow-xs'
+                  : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
               }`}
             >
-              <Store className="w-4 h-4" />
+              <Store className="w-3.5 h-3.5 shrink-0" />
               <span>PDV Balcão</span>
             </button>
 
             <button
               onClick={() => setActiveTab('kanban')}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'kanban'
-                  ? 'bg-gradient-to-r from-[#C86D3B] via-[#B85D2A] to-[#721C24] text-white shadow-sm'
-                  : 'text-[#D9C7B8] hover:text-white hover:bg-white/10'
+                  ? 'bg-[#EA580C] text-white shadow-xs'
+                  : 'text-slate-300 hover:text-white hover:bg-[#1B365D]'
               }`}
             >
-              <Layers className="w-4 h-4" />
+              <Layers className="w-3.5 h-3.5 shrink-0" />
               <span>Gestão de Pedidos</span>
               {newOrdersCount > 0 && (
-                <span className="w-4 h-4 bg-amber-400 text-slate-950 rounded-full text-[9px] font-black flex items-center justify-center">
+                <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-bold leading-none tabular-nums ${
+                  activeTab === 'kanban' ? 'bg-white text-[#0F2342]' : 'bg-[#EA580C] text-white'
+                }`}>
                   {newOrdersCount}
                 </span>
               )}
@@ -208,7 +212,7 @@ export const AttendantScreen: React.FC<AttendantScreenProps> = ({ currentUser, o
       </header>
 
       {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 pt-6">
+      <main className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 pt-3 sm:pt-5">
         {activeTab === 'pdv' && (
           <PointOfSale currentUser={currentUser} onOrderCreated={refreshOrders} />
         )}

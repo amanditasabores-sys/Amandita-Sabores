@@ -21,10 +21,10 @@ export function getVapidConfig(): VapidConfigResult {
   const cleanedPriv = rawPriv.trim().replace(/\s+/g, '');
 
   const rawSubject = (process.env.VAPID_SUBJECT || process.env.ASSUNTO_VAPID || '').trim();
-  const defaultAdmin = (process.env.VITE_INITIAL_ADMIN_EMAIL || 'dvrmercadinho@gmail.com').trim().toLowerCase();
+  const defaultVapidSubject = 'mailto:notificacoes@amanditasabores.com.br';
   const vapidSubject = rawSubject
     ? (rawSubject.startsWith('mailto:') || rawSubject.startsWith('https:') ? rawSubject : `mailto:${rawSubject}`)
-    : `mailto:${defaultAdmin}`;
+    : defaultVapidSubject;
 
   let activePublicKey = DEV_FALLBACK_PUBLIC_KEY;
   let activePrivateKey = DEV_FALLBACK_PRIVATE_KEY;

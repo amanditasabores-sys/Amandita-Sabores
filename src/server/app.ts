@@ -7,6 +7,8 @@ import { getFirebaseAdminInstances, getFirebaseClientConfigStatus } from './fire
 import type { Auth as AdminAuth } from 'firebase-admin/auth';
 import { INITIAL_MENU, OFFICIAL_ADDONS } from '../data/initialData.js';
 import { getVapidConfig } from './pushConfig.js';
+import { registerAuthRoutes, __resetAuthRateLimitersForTests } from './authRoutes.js';
+export { __resetAuthRateLimitersForTests };
 import {
   DEFAULT_CLOSED_PRIMARY_MESSAGE,
   DEFAULT_CLOSED_SECONDARY_MESSAGE,
@@ -33,7 +35,6 @@ const AUTH_DOMAIN = firebaseClientConfig.authDomain;
 const STORAGE_BUCKET = firebaseClientConfig.storageBucket;
 const SENDER_ID = firebaseClientConfig.messagingSenderId;
 const APP_ID = firebaseClientConfig.appId;
-const INITIAL_ADMIN_EMAIL = (process.env.VITE_INITIAL_ADMIN_EMAIL || 'dvrmercadinho@gmail.com').trim().toLowerCase();
 
 // Official Catalog Reference Map (For strict O(1) price, product existence & addon verification)
 const catalogMap = new Map<string, { id: string; name: string; price: number; available: boolean }>();
@@ -70,7 +71,7 @@ let vapidConfigMessage = '';
 const rawSubject = (process.env.VAPID_SUBJECT || process.env.ASSUNTO_VAPID || '').trim();
 const VAPID_SUBJECT = rawSubject
   ? (rawSubject.startsWith('mailto:') || rawSubject.startsWith('https:') ? rawSubject : `mailto:${rawSubject}`)
-  : `mailto:${INITIAL_ADMIN_EMAIL}`;
+  : 'mailto:notificacoes@amanditasabores.com.br';
 
 // Check if production environment keys were provided and are mathematically valid
 if (cleanedPub && cleanedPriv) {
@@ -780,19 +781,8 @@ const AUTHORIZED_STAFF_ROLES = new Set([
   'ATENDENTE',
 ]);
 
-function isBootstrappedAdminEmailServer(email: string): boolean {
-  return (
-    email === INITIAL_ADMIN_EMAIL ||
-    email === 'admin@amanditasabores.com.br' ||
-    email === 'amanditasabore@gmail.com' ||
-    email === 'amanditasabores@gmail.com' ||
-    email === 'dvrmercadinho@gmail.com'
-  );
-}
-
 async function fetchUserProfileServer(
   uid: string,
-  email: string,
   token: string
 ): Promise<Record<string, any> | null> {
   if (adminDb) {
@@ -800,12 +790,6 @@ async function fetchUserProfileServer(
       const snap = await adminDb.collection('users').doc(uid).get();
       if (snap.exists) {
         return snap.data() || null;
-      }
-      if (email) {
-        const byEmail = await adminDb.collection('users').where('email', '==', email).limit(1).get();
-        if (!byEmail.empty) {
-          return byEmail.docs[0].data() || null;
-        }
       }
     } catch {}
   }
@@ -840,8 +824,20 @@ async function verifyStaffAuth(req: Request): Promise<AuthVerificationResult> {
   try {
     let uid = '';
     let email = '';
+    let verifiedClaimRole = '';
+    let verifiedClaimStatus = '';
 
-    if (API_KEY) {
+    if (adminAuth) {
+      const decoded = await adminAuth.verifyIdToken(token);
+      uid = decoded.uid || '';
+      email = (decoded.email || '').trim().toLowerCase();
+      verifiedClaimRole = typeof (decoded as Record<string, unknown>).role === 'string'
+        ? String((decoded as Record<string, unknown>).role).trim().toUpperCase()
+        : '';
+      verifiedClaimStatus = typeof (decoded as Record<string, unknown>).status === 'string'
+        ? String((decoded as Record<string, unknown>).status).trim().toUpperCase()
+        : '';
+    } else if (API_KEY) {
       // Verify bearer token with Google Identity Toolkit REST API
       const verifyRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${API_KEY}`, {
         method: 'POST',
@@ -861,10 +857,6 @@ async function verifyStaffAuth(req: Request): Promise<AuthVerificationResult> {
       const fbUser = verifyData.users[0];
       email = (fbUser.email || '').trim().toLowerCase();
       uid = fbUser.localId || '';
-    } else if (adminAuth) {
-      const decoded = await adminAuth.verifyIdToken(token);
-      uid = decoded.uid || '';
-      email = (decoded.email || '').trim().toLowerCase();
     } else {
       return { isStaff: false, role: 'ANONYMOUS', uid: null, email: null, token: null };
     }
@@ -873,9 +865,14 @@ async function verifyStaffAuth(req: Request): Promise<AuthVerificationResult> {
       return { isStaff: false, role: 'ANONYMOUS', uid: null, email: null, token: null };
     }
 
-    // 1. Check authoritative Firestore /users profile first (enforces real role & ATIVO status)
-    const userProfile = await fetchUserProfileServer(uid, email, token);
+    // 1. Check authoritative Firestore /users/{uid} profile (enforces real role, ATIVO status & completed provisioning)
+    const userProfile = await fetchUserProfileServer(uid, token);
     if (userProfile) {
+      const provState = userProfile.provisioningState;
+      if (provState !== undefined && provState !== 'ACTIVE') {
+        return { isStaff: false, role: 'PROVISIONING_INCOMPLETE', uid, email, token };
+      }
+
       const profileStatus = String(userProfile.status || 'ATIVO').trim().toUpperCase();
       const profileRole = String(userProfile.role || '').trim().toUpperCase();
 
@@ -891,24 +888,24 @@ async function verifyStaffAuth(req: Request): Promise<AuthVerificationResult> {
       return { isStaff: false, role: 'CUSTOMER', uid, email, token };
     }
 
-    // 2. Designated Bootstrap Administrators (first login before /users/{uid} is created)
-    if (email && isBootstrappedAdminEmailServer(email)) {
-      return { isStaff: true, role: 'ADMINISTRADOR', uid, email, token };
-    }
-
-    // 3. Seeded Gerente bootstrap account
-    if (email === 'gerente@amanditasabores.com.br') {
-      return { isStaff: true, role: 'GERENTE', uid, email, token };
-    }
-
-    // 4. Staff Domain Check (only maps built-in operational fallback roles; never elevates arbitrary accounts to Admin)
-    if (email.endsWith('@staff.amanditasabores.com.br') || email.endsWith('@amanditasabores.com.br')) {
-      const username = email.split('@')[0];
-      let role = 'ATENDENTE';
-      if (username === 'cozinha' || username.startsWith('cozinha')) role = 'COZINHA';
-      else if (username === 'entregador' || username.startsWith('entregador')) role = 'ENTREGADOR';
-      else if (username === 'caixa' || username.startsWith('caixa')) role = 'CAIXA';
-      return { isStaff: true, role, uid, email, token };
+    // 2. When Admin Firestore is unavailable (e.g. degraded mode / fail-closed 503 routes),
+    // accept ONLY cryptographically signed Firebase Auth custom claims (NEVER hardcoded emails or domains).
+    if (!adminDb && verifiedClaimRole) {
+      if (verifiedClaimStatus && verifiedClaimStatus !== 'ATIVO') {
+        return {
+          isStaff: false,
+          role: verifiedClaimStatus === 'BLOQUEADO' ? 'BLOCKED' : 'INACTIVE',
+          uid,
+          email,
+          token,
+        };
+      }
+      if (AUTHORIZED_STAFF_ROLES.has(verifiedClaimRole)) {
+        return { isStaff: true, role: verifiedClaimRole, uid, email, token };
+      }
+      if (verifiedClaimRole === 'ADMIN') {
+        return { isStaff: true, role: 'ADMINISTRADOR', uid, email, token };
+      }
     }
 
     return { isStaff: false, role: 'CUSTOMER', uid, email, token };
@@ -1266,174 +1263,10 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     }
   });
 
-  // Secure Backend API: Staff Registration and Credential Administration
-  // Enforces RBAC on server side: only authenticated ADMINISTRADOR or GERENTE
-  app.post(['/api/auth/register-staff', '/auth/register-staff'], async (req: Request, res: Response) => {
-    try {
-      const auth = await verifyStaffAuth(req);
-      const isAuthorizedManager = auth.isStaff && ['ADMINISTRADOR', 'GERENTE'].includes(auth.role.toUpperCase());
-
-      if (!isAuthorizedManager) {
-        res.status(403).json({
-          success: false,
-          message: 'Acesso negado: requer perfil autenticado de Administrador ou Gerente.',
-        });
-        return;
-      }
-
-      const { username, name, role, allowedModules } = req.body;
-
-      if (!username || !role) {
-        res.status(400).json({
-          success: false,
-          message: 'Dados incompletos: nome de usuário e cargo são obrigatórios.',
-        });
-        return;
-      }
-
-      // Enforce RBAC: Gerente cannot create an Administrador
-      if (auth.role.toUpperCase() === 'GERENTE' && String(role).toUpperCase() === 'ADMINISTRADOR') {
-        res.status(403).json({
-          success: false,
-          message: 'Permissão insuficiente: Gerente não possui autorização para criar contas de Administrador Geral.',
-        });
-        return;
-      }
-
-      const cleanUsername = String(username).trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '');
-      const syntheticEmail = `${cleanUsername}@staff.amanditasabores.com.br`;
-
-      res.json({
-        success: true,
-        message: 'Credencial de funcionário validada com sucesso pelo backend seguro.',
-        user: {
-          username: cleanUsername,
-          name: name ? String(name).trim() : cleanUsername,
-          email: syntheticEmail,
-          role,
-          allowedModules: allowedModules || ['pdv'],
-          status: 'ATIVO',
-          createdAt: new Date().toISOString(),
-        },
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ success: false, message: `Erro interno no backend: ${msg}` });
-    }
-  });
-
-  // Secure Backend API: Password Reset Authorization
-  app.post(['/api/auth/reset-password', '/auth/reset-password'], async (req: Request, res: Response) => {
-    try {
-      const auth = await verifyStaffAuth(req);
-      const isAuthorizedManager = auth.isStaff && ['ADMINISTRADOR', 'GERENTE'].includes(auth.role.toUpperCase());
-
-      if (!isAuthorizedManager) {
-        res.status(403).json({
-          success: false,
-          message: 'Acesso negado: apenas Administrador ou Gerente autenticados podem autorizar redefinições de senha.',
-        });
-        return;
-      }
-
-      const { targetUserRole, newPassword } = req.body;
-
-      if (auth.role.toUpperCase() === 'GERENTE' && String(targetUserRole).toUpperCase() === 'ADMINISTRADOR') {
-        res.status(403).json({
-          success: false,
-          message: 'Permissão insuficiente: Gerente não pode redefinir a senha do Administrador Geral.',
-        });
-        return;
-      }
-
-      if (!newPassword || String(newPassword).trim().length < 4) {
-        res.status(400).json({
-          success: false,
-          message: 'A nova senha deve possuir no mínimo 4 caracteres.',
-        });
-        return;
-      }
-
-      res.json({
-        success: true,
-        message: 'Redefinição de senha autorizada com sucesso pelo backend seguro.',
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ success: false, message: `Erro interno no backend: ${msg}` });
-    }
-  });
-
-  // Sync / Link Staff Firestore Profile to Firebase Auth UID (resolves usr-... vs uid mismatch)
-  app.post(['/api/auth/sync-profile', '/auth/sync-profile'], async (req: Request, res: Response) => {
-    try {
-      const auth = await verifyStaffAuth(req);
-      if (!auth.uid || !auth.token) {
-        res.status(401).json({ success: false, message: 'Token Firebase inválido ou ausente.' });
-        return;
-      }
-      if (!auth.isStaff) {
-        res.status(403).json({ success: false, message: 'Conta autenticada não pertence à equipe autorizada ou está inativa.' });
-        return;
-      }
-
-      if (adminDb) {
-        const uidRef = adminDb.collection('users').doc(auth.uid);
-        const uidSnap = await uidRef.get();
-        if (uidSnap.exists) {
-          const existingProfile = uidSnap.data() || {};
-          res.json({ success: true, profile: existingProfile });
-          return;
-        }
-
-        let sourceProfile: Record<string, any> | null = null;
-        if (auth.email) {
-          const emailSnap = await adminDb.collection('users').where('email', '==', auth.email).limit(1).get();
-          if (!emailSnap.empty) {
-            sourceProfile = emailSnap.docs[0].data() || null;
-          }
-        }
-
-        const now = new Date().toISOString();
-        const normalizedRole = auth.role;
-        const linkedProfile: Record<string, any> = {
-          ...(sourceProfile || {}),
-          id: auth.uid,
-          firebaseUid: auth.uid,
-          email: auth.email || sourceProfile?.email || '',
-          name: sourceProfile?.name || req.body?.name || (auth.email ? auth.email.split('@')[0] : 'Colaborador'),
-          username: sourceProfile?.username || req.body?.username || (auth.email ? auth.email.split('@')[0] : 'colaborador'),
-          role: sourceProfile?.role || normalizedRole,
-          status: sourceProfile?.status || 'ATIVO',
-          allowedModules: Array.isArray(sourceProfile?.allowedModules)
-            ? sourceProfile.allowedModules
-            : (Array.isArray(req.body?.allowedModules) ? req.body.allowedModules : ['pdv', 'kanban']),
-          isEmailVerified: true,
-          createdAt: sourceProfile?.createdAt || now,
-          lastLoginAt: now,
-        };
-
-        await uidRef.set(linkedProfile, { merge: true });
-        res.json({ success: true, profile: linkedProfile, linked: true });
-        return;
-      }
-
-      const existing = await fetchUserProfileServer(auth.uid, auth.email || '', auth.token);
-      if (existing) {
-        res.json({ success: true, profile: existing });
-        return;
-      }
-
-      res.json({
-        success: false,
-        needsClientBootstrap: true,
-        role: auth.role,
-        message: 'Perfil ainda não provisionado no Firestore (Admin SDK indisponível para vinculação cruzada).',
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ success: false, message: `Erro ao sincronizar perfil: ${msg}` });
-    }
+  // Stage 2A: Secure Authentication, One-Time Admin Bootstrap, Staged Staff Provisioning & Recovery
+  registerAuthRoutes(app, {
+    getAdminServices: () => ({ adminDb, adminAuth }),
+    verifyStaffAuth,
   });
 
   // ---------------------------------------------------------------------------
@@ -2928,6 +2761,15 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
           return;
         }
 
+        if (prev.fulfillmentType === 'RETIRADA' && targetStatus === 'EM_ROTA') {
+          res.status(400).json({
+            success: false,
+            code: 'INVALID_PICKUP_STATUS',
+            message: 'Pedidos de Retirada no Balcão não utilizam motoboy e não podem receber status EM_ROTA.',
+          });
+          return;
+        }
+
         // Payment status transitions are strictly forbidden on /status; must execute via /confirm-payment atomic transaction
         if (req.body?.paymentStatus !== undefined && req.body.paymentStatus !== prev.paymentStatus) {
           res.status(403).json({
@@ -2954,13 +2796,18 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
             fromStatus: prev.status,
             toStatus: targetStatus,
             author: String(req.body?.author || auth.email || auth.role),
-            notes: String(req.body?.notes || `Status alterado de ${prev.status} para ${targetStatus}`),
+            notes: String(
+              req.body?.notes ||
+                (prev.fulfillmentType === 'RETIRADA' && targetStatus === 'ENTREGUE'
+                  ? 'Retirada confirmada no balcão'
+                  : `Status alterado de ${prev.status} para ${targetStatus}`)
+            ),
           });
           updatedOrder.movements = prevMoves;
         }
 
-        // Delivery metadata (forbidden for COZINHA, allowed for ENTREGADOR/CAIXA/ATENDENTE/GERENTE/ADMIN)
-        if (upperRole !== 'COZINHA') {
+        // Delivery metadata (exclusively for DELIVERY orders and forbidden for COZINHA)
+        if (upperRole !== 'COZINHA' && prev.fulfillmentType !== 'RETIRADA') {
           if (req.body?.deliveryPerson !== undefined) updatedOrder.deliveryPerson = req.body.deliveryPerson;
           if (req.body?.deliveryPersonId !== undefined) updatedOrder.deliveryPersonId = req.body.deliveryPersonId;
           if (req.body?.deliveryPersonName !== undefined) updatedOrder.deliveryPersonName = req.body.deliveryPersonName;
@@ -2973,6 +2820,15 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
         const fallbackOrder = req.body?.order;
         if (!fallbackOrder || typeof fallbackOrder !== 'object' || fallbackOrder.id !== orderId) {
           res.status(404).json({ success: false, message: 'Pedido não encontrado no Cloud Firestore para atualização de status.' });
+          return;
+        }
+
+        if (fallbackOrder.fulfillmentType === 'RETIRADA' && targetStatus === 'EM_ROTA') {
+          res.status(400).json({
+            success: false,
+            code: 'INVALID_PICKUP_STATUS',
+            message: 'Pedidos de Retirada no Balcão não utilizam motoboy e não podem receber status EM_ROTA.',
+          });
           return;
         }
 
@@ -3154,13 +3010,22 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       }
 
       const prev = existingLookup.data;
+      const dp = req.body?.deliveryPerson;
+      if (prev.fulfillmentType === 'RETIRADA' && dp) {
+        res.status(400).json({
+          success: false,
+          code: 'INVALID_PICKUP_DRIVER',
+          message: 'Pedidos de Retirada no Balcão não podem ser atribuídos a um entregador.',
+        });
+        return;
+      }
+
       const now = new Date().toISOString();
       const updatedOrder: Record<string, any> = {
         ...prev,
         updatedAt: String(req.body?.updatedAt || now),
       };
 
-      const dp = req.body?.deliveryPerson;
       if (!dp) {
         delete updatedOrder.deliveryPerson;
         delete updatedOrder.deliveryPersonId;

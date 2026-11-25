@@ -63,8 +63,65 @@ export interface User {
   createdAt: string;
   updatedAt?: string;
   lastLoginAt?: string;
-  authProvider?: 'firebase_email' | 'firebase_google' | 'local_contingency';
+  authProvider?: 'firebase_custom_token' | 'firebase_email' | 'firebase_google' | 'local_contingency';
+  provisioningState?: 'PENDING' | 'FINALIZING' | 'ACTIVE';
   firebaseUid?: string;
+}
+
+export interface AuthBootstrapStatus {
+  initialized: boolean;
+  mode: 'setup_required' | 'login' | 'unavailable';
+  message?: string;
+  checkedAt?: string;
+}
+
+export interface BootstrapAdminPayload {
+  name: string;
+  username: string;
+  phone: string;
+  password: string;
+  idempotencyKey?: string;
+}
+
+export interface CreateStaffPayload {
+  name: string;
+  username: string;
+  phone: string;
+  password: string;
+  role: UserRole;
+  allowedModules: AppModule[];
+  deliveryPermissions?: Partial<DeliveryPermissions>;
+  idempotencyKey?: string;
+}
+
+export interface UpdateStaffPayload {
+  name?: string;
+  username?: string;
+  phone?: string;
+  role?: UserRole;
+  status?: UserStatus;
+  allowedModules?: AppModule[];
+  deliveryPermissions?: Partial<DeliveryPermissions>;
+}
+
+export interface UpdateOwnCredentialsPayload {
+  currentPassword: string;
+  newUsername?: string;
+  newPassword?: string;
+  name?: string;
+  phone?: string;
+}
+
+export interface AuthActionResult<T = User> {
+  success: boolean;
+  message: string;
+  code?: string;
+  user?: T;
+  users?: User[];
+  retryAfterSeconds?: number;
+  idempotentReplay?: boolean;
+  isCloudAuth?: boolean;
+  isLocalContingency?: boolean;
 }
 
 export interface UserAccessLog {
@@ -72,7 +129,23 @@ export interface UserAccessLog {
   userId?: string;
   username: string;
   timestamp: string;
-  action: 'LOGIN_SUCESSO' | 'LOGIN_FALHA' | 'LOGOUT' | 'SENHA_ALTERADA' | 'CONTA_BLOQUEADA' | 'LOGIN_CONTINGENCIA_LOCAL' | 'VINCULO_FIREBASE' | 'RESTAURACAO_DADOS';
+  action:
+    | 'LOGIN_SUCESSO'
+    | 'LOGIN_FALHA'
+    | 'LOGOUT'
+    | 'SENHA_ALTERADA'
+    | 'CONTA_BLOQUEADA'
+    | 'CONTA_ATIVADA'
+    | 'LOGIN_CONTINGENCIA_LOCAL'
+    | 'VINCULO_FIREBASE'
+    | 'RESTAURACAO_DADOS'
+    | 'PRIMEIRO_ACESSO_ADMIN'
+    | 'FUNCIONARIO_CADASTRADO'
+    | 'FUNCIONARIO_ATUALIZADO'
+    | 'FUNCIONARIO_REMOVIDO'
+    | 'CREDENCIAIS_ALTERADAS'
+    | 'RECUPERACAO_ADMIN'
+    | 'RECUPERACAO_ADMIN_FALHA';
   details?: string;
   role?: string;
 }
