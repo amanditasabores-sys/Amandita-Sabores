@@ -920,8 +920,15 @@ class ThermalPrinterService {
   }
 
   /**
+   * Formata valor monetário compacto (sem espaço entre R$ e número) para caber em 58 mm sem quebras extras.
+   */
+  private formatCompactCurrency(value: number): string {
+    return this.sanitizeText(formatReportCurrency(value).replace(/\u00A0/g, ' ')).replace(/^R\$\s+/, 'R$').trim();
+  }
+
+  /**
    * Formata título do item com preço à direita na 1ª linha e continuação
-   * aproveitando a largura útil completa (evitando quebras excessivas em 22 colunas).
+   * aproveitando a largura útil completa (evitando quebras excessivas em 58 mm).
    */
   private formatOrderItemTitleLines(itemTitle: string, itemPrice: string, cols: number): string[] {
     const cleanTitle = this.sanitizeText(itemTitle.replace(/\u00A0/g, ' ')).replace(/\s+/g, ' ').trim();
@@ -952,18 +959,18 @@ class ThermalPrinterService {
       firstLine = firstWord.slice(0, firstLineMax);
       const remainderWord = firstWord.slice(firstLineMax);
       const remainingText = [remainderWord, ...words.slice(1)].filter(Boolean).join(' ');
-      const restLines = remainingText ? this.wrapText(remainingText, cols, '  ') : [];
+      const restLines = remainingText ? this.wrapText(remainingText, cols, ' ') : [];
       return [this.formatLine(firstLine, cleanPrice, cols), ...restLines];
     }
 
     const remainingText = words.slice(idx).join(' ');
-    const restLines = remainingText ? this.wrapText(remainingText, cols, '  ') : [];
+    const restLines = remainingText ? this.wrapText(remainingText, cols, ' ') : [];
     return [this.formatLine(firstLine, cleanPrice, cols), ...restLines];
   }
 
   /**
-   * Monta o endereço de entrega deduplicando campos para garantir que
-   * condomínio, bloco, apartamento, número e complemento não apareçam repetidos.
+   * Monta o endereço de entrega de forma compacta e deduplicada, aproveitando
+   * toda a largura útil e agrupando campos compatíveis sem perder nenhuma informação.
    */
   public formatReceiptAddressLines(addr?: CustomerAddress): string[] {
     if (!addr) return [];
@@ -1002,50 +1009,58 @@ class ThermalPrinterService {
       if (match) effectiveBlock = match[1];
     }
 
-    // 1. Condomínio (se informado)
-    if (condRaw) {
-      const cleanCond = condRaw.replace(/^condom[íi]nio\s*/i, '').trim();
-      lines.push(...this.wrapText(`Cond: ${cleanCond}`, cols, '  '));
-      printedCond = true;
-    }
-
-    // 2. Rua / Logradouro / Identificação Principal
-    if (streetRaw) {
-      const isSameAsCondo = condRaw && (
-        streetRaw.toLowerCase().includes(condRaw.toLowerCase()) || 
-        condRaw.toLowerCase().includes(streetRaw.toLowerCase())
-      );
-      if (!isSameAsCondo || !printedCond) {
-        lines.push(...this.wrapText(streetRaw, cols, '  '));
-        if (/condom[íi]nio/i.test(streetRaw)) {
-          printedCond = true;
-        }
-      }
-    }
-
-    // 3. Número predial / residencial (se não for apenas 'Ap ...' ou 'Bloco ...' que já isolamos)
+    // Número predial / residencial válido (se não for apenas 'Ap ...' ou 'Bloco ...')
+    let effectiveNum = '';
     if (numRaw) {
-      const isOnlyApOrBloco = /^(?:ap(?:to|\.)?\s*[:\-]?\s*[0-9a-zA-Z]+|bloco\s*[:\-]?\s*[0-9a-zA-Z]+|s\/?n)$/i.test(numRaw.trim());
+      const isOnlyApOrBloco = /^(?:ap(?:to|\.)?\s*[:\-]?\s*[0-9a-zA-Z]+|bloco\s*[:\-]?\s*[0-9a-zA-Z]+|s\/?n)$/i.test(numRaw);
       if (!isOnlyApOrBloco) {
-        lines.push(...this.wrapText(`Numero: ${numRaw}`, cols, '  '));
-      } else if (/^s\/?n$/i.test(numRaw.trim()) && !effectiveApt && !effectiveBlock) {
-        lines.push(`  Numero: S/N`);
+        effectiveNum = numRaw;
+      } else if (/^s\/?n$/i.test(numRaw) && !effectiveApt && !effectiveBlock) {
+        effectiveNum = 'S/N';
       }
     }
 
-    // 4. Bloco e Apartamento (exibido exatamente uma vez)
-    const blockAptParts: string[] = [];
+    // 1. Condomínio (se informado)
+    const cleanCond = condRaw ? condRaw.replace(/^condom[íi]nio\s*/i, '').trim() : '';
+    const streetIsSameAsCondo = Boolean(
+      condRaw &&
+      streetRaw &&
+      (streetRaw.toLowerCase().includes(condRaw.toLowerCase()) ||
+        condRaw.toLowerCase().includes(streetRaw.toLowerCase()))
+    );
+
+    if (condRaw) {
+      const condLine =
+        (!streetRaw || streetIsSameAsCondo) && effectiveNum
+          ? `Cond: ${cleanCond}, ${effectiveNum}`
+          : `Cond: ${cleanCond}`;
+      lines.push(...this.wrapText(condLine, cols, ''));
+      printedCond = true;
+      if (!streetRaw || streetIsSameAsCondo) {
+        effectiveNum = '';
+      }
+    }
+
+    // 2. Rua / Logradouro + Número agrupados na mesma linha
+    if (streetRaw && (!streetIsSameAsCondo || !printedCond)) {
+      const streetWithNum = effectiveNum ? `${streetRaw}, ${effectiveNum}` : streetRaw;
+      lines.push(...this.wrapText(streetWithNum, cols, ''));
+      effectiveNum = '';
+      if (/condom[íi]nio/i.test(streetRaw)) {
+        printedCond = true;
+      }
+    } else if (effectiveNum) {
+      lines.push(...this.wrapText(`Numero: ${effectiveNum}`, cols, ''));
+    }
+
+    // 3. Bloco, Apartamento e Complemento deduplicados e agrupados
+    const unitParts: string[] = [];
     if (effectiveBlock) {
-      blockAptParts.push(`Bloco: ${effectiveBlock.replace(/^bloco\s*/i, '').trim()}`);
+      unitParts.push(`Bloco ${effectiveBlock.replace(/^bloco\s*/i, '').trim()}`);
     }
     if (effectiveApt) {
-      blockAptParts.push(`Apto: ${effectiveApt.replace(/^ap(?:to|\.)?\s*/i, '').trim()}`);
+      unitParts.push(`Ap ${effectiveApt.replace(/^ap(?:to|\.)?\s*/i, '').trim()}`);
     }
-    if (blockAptParts.length > 0) {
-      lines.push(...this.wrapText(blockAptParts.join(' - '), cols, '  '));
-    }
-
-    // 5. Complemento (remove redundâncias de Bloco e Ap já impressos)
     if (compRaw) {
       let cleanComp = compRaw;
       if (effectiveBlock) {
@@ -1056,26 +1071,31 @@ class ThermalPrinterService {
       }
       cleanComp = cleanComp.replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '').trim();
       if (cleanComp) {
-        lines.push(...this.wrapText(`Compl: ${cleanComp}`, cols, '  '));
+        unitParts.push(unitParts.length > 0 ? cleanComp : `Compl: ${cleanComp}`);
       }
     }
-
-    // 6. Bairro (se não for redundante com condomínio ou placeholder 'Bairro')
-    if (neighRaw && neighRaw !== 'Bairro') {
-      const isSameAsCondo = condRaw && neighRaw.toLowerCase().includes(condRaw.toLowerCase());
-      if (!isSameAsCondo) {
-        lines.push(...this.wrapText(`Bairro: ${neighRaw}`, cols, '  '));
-      }
+    if (unitParts.length > 0) {
+      lines.push(...this.wrapText(unitParts.join(' - '), cols, ''));
     }
 
-    // 7. Cidade
-    if (cityRaw) {
-      lines.push(...this.wrapText(`Cidade: ${cityRaw}`, cols, '  '));
+    // 4. Bairro e Cidade agrupados na mesma linha
+    const validNeigh =
+      neighRaw &&
+      neighRaw !== 'Bairro' &&
+      !(condRaw && neighRaw.toLowerCase().includes(condRaw.toLowerCase()))
+        ? neighRaw
+        : '';
+    if (validNeigh && cityRaw) {
+      lines.push(...this.wrapText(`Bairro: ${validNeigh} - ${cityRaw}`, cols, ''));
+    } else if (validNeigh) {
+      lines.push(...this.wrapText(`Bairro: ${validNeigh}`, cols, ''));
+    } else if (cityRaw) {
+      lines.push(...this.wrapText(`Cidade: ${cityRaw}`, cols, ''));
     }
 
-    // 8. Ponto de Referência
+    // 5. Ponto de Referência
     if (refRaw) {
-      lines.push(...this.wrapText(`Ref: ${refRaw}`, cols, '  '));
+      lines.push(...this.wrapText(`Ref: ${refRaw}`, cols, ''));
     }
 
     return lines;
@@ -1104,97 +1124,124 @@ class ThermalPrinterService {
   }
 
   /**
-   * Gera o texto plano do comprovante formatado exatamente em 32 colunas (58 mm)
+   * Formata a linha de identificação do pedido + data/hora em 1 única linha quando couber.
+   */
+  private formatOrderHeaderMetaLines(orderNumber: string, createdAt: string, cols: number): string[] {
+    const cleanDate = this.sanitizeText(formatDateTime(createdAt).replace(',', '')).replace(/\s+/g, ' ').trim();
+    const cleanNum = this.sanitizeText(orderNumber).trim();
+    const fullLabel = `PEDIDO ${cleanNum}`;
+    if (fullLabel.length + cleanDate.length + 1 <= cols) {
+      return [this.formatLine(fullLabel, cleanDate, cols)];
+    }
+    const shortLabel = `PED ${cleanNum}`;
+    if (shortLabel.length + cleanDate.length + 1 <= cols) {
+      return [this.formatLine(shortLabel, cleanDate, cols)];
+    }
+    return [`PEDIDO: ${cleanNum}`, `DATA: ${cleanDate}`];
+  }
+
+  /**
+   * Formata dados do cliente (nome e telefone) compactando na mesma linha quando couber.
+   */
+  private formatCustomerLines(order: Order, isDelivery: boolean, cols: number): string[] {
+    const name = this.sanitizeText(order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao')).trim();
+    const phone = order.customer.phone ? this.sanitizeText(order.customer.phone).trim() : '';
+
+    if (phone) {
+      const combined = `CLIENTE: ${name} | ${phone}`;
+      if (combined.length <= cols) {
+        return [combined];
+      }
+      return [...this.wrapText(`CLIENTE: ${name}`, cols), ...this.wrapText(`TEL: ${phone}`, cols)];
+    }
+    return this.wrapText(`CLIENTE: ${name}`, cols);
+  }
+
+  /**
+   * Formata linha compacta de Recebido + Troco (1 linha quando couber, 2 linhas se exceder largura).
+   */
+  private formatCashReceivedChangeLines(received: number, change: number, cols: number, indent = ''): string[] {
+    const left = `${indent}REC: ${this.formatCompactCurrency(received)}`;
+    const right = `TROCO: ${this.formatCompactCurrency(change)}`;
+    if (left.length + right.length + 1 <= cols) {
+      return [this.formatLine(left, right, cols)];
+    }
+    return [
+      this.formatLine(`${indent}RECEBIDO:`, formatReportCurrency(received), cols),
+      this.formatLine(`${indent}TROCO:`, formatReportCurrency(change), cols),
+    ];
+  }
+
+  /**
+   * Gera o texto plano compacto do comprovante (58 mm / 80 mm), preservando 100% das informações.
    */
   public generateReceiptPlainText(order: Order, options?: { isReprint?: boolean; footerText?: string }): string {
     const isReprint = Boolean(options?.isReprint);
-    const dateFormatted = formatDateTime(order.createdAt);
     const cols = this.getSafeOrderColumns();
     const separator = '-'.repeat(cols);
     const lines: string[] = [];
+    const isDelivery = order.fulfillmentType === 'DELIVERY';
 
-    // CABEÇALHO
-    lines.push(this.centerText('AMANDITA SABORES', cols));
-    lines.push(this.centerText('Cardapio & Cozinha', cols));
-
+    // 1. CABEÇALHO E MODALIDADE (compacto, sem separadores redundantes)
+    if (cols >= 42) {
+      lines.push(this.centerText('AMANDITA SABORES - Cardapio & Cozinha', cols));
+    } else {
+      lines.push(this.centerText('AMANDITA SABORES', cols));
+      lines.push(this.centerText('Cardapio & Cozinha', cols));
+    }
     if (isReprint) {
       lines.push(this.centerText('*** REIMPRESSAO ***', cols));
     }
-
-    const isDelivery = order.fulfillmentType === 'DELIVERY';
-
-    // MODALIDADE
-    lines.push(separator);
-    if (isDelivery) {
-      lines.push(this.centerText('*** ENTREGA ***', cols));
-    } else {
-      lines.push(this.centerText('*** RETIRADA NO BALCAO ***', cols));
-    }
+    lines.push(this.centerText(isDelivery ? '*** ENTREGA ***' : '*** RETIRADA NO BALCAO ***', cols));
     lines.push(separator);
 
-    // PEDIDO E DATA
-    lines.push(this.formatLine(`PEDIDO: ${order.orderNumber}`, dateFormatted.split(' ')[1] || '', cols));
-    lines.push(`DATA: ${dateFormatted}`);
+    // 2. PEDIDO, DATA E CLIENTE
+    lines.push(...this.formatOrderHeaderMetaLines(order.orderNumber, order.createdAt, cols));
+    lines.push(...this.formatCustomerLines(order, isDelivery, cols));
 
-    // DADOS DO CLIENTE
-    lines.push(...this.wrapText(`CLIENTE: ${order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao')}`, cols));
-    if (order.customer.phone) {
-      lines.push(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
-    }
-
-    // ENDEREÇO DE ENTREGA (Exclusivo para modalidade DELIVERY - nunca inventar dados)
+    // 3. ENDEREÇO DE ENTREGA (Exclusivo para modalidade DELIVERY - nunca inventar dados)
     if (isDelivery && order.customer.address) {
-      lines.push(separator);
       lines.push('ENDERECO DE ENTREGA:');
-      const addressLines = this.formatReceiptAddressLines(order.customer.address);
-      lines.push(...addressLines);
+      lines.push(...this.formatReceiptAddressLines(order.customer.address));
     }
 
-    // ITENS DO PEDIDO
+    // 4. ITENS DO PEDIDO
     lines.push(separator);
     lines.push(this.formatLine('QTD DESCRICAO', 'VALOR', cols));
-    lines.push(separator);
 
     for (const it of order.items) {
       const itemTitle = `${it.quantity}x ${it.name}`;
-      const itemPrice = formatReportCurrency(it.subtotal);
+      const itemPrice = this.formatCompactCurrency(it.subtotal);
       lines.push(...this.formatOrderItemTitleLines(itemTitle, itemPrice, cols));
 
-      // Adicionais
+      // Adicionais agrupados com nome e valor preservados
       if (it.addons && it.addons.length > 0) {
-        for (const ad of it.addons) {
-          const adText = `+ ${ad.name} (R$ ${ad.price.toFixed(2)})`;
-          const wrapped = this.wrapText(adText, cols, '  ');
-          lines.push(...wrapped);
-        }
+        const addonsSummary = '+ ' + it.addons
+          .map((ad) => `${ad.name}(${this.formatCompactCurrency(ad.price)})`)
+          .join(', ');
+        lines.push(...this.wrapText(addonsSummary, cols, ' '));
       }
 
-      // Componentes de combo
+      // Componentes de combo agrupados
       if (it.isCombo && it.comboComponents && it.comboComponents.length > 0) {
-        for (const comp of it.comboComponents) {
-          const compText = `> ${comp.quantity * it.quantity}x ${comp.name}`;
-          const wrapped = this.wrapText(compText, cols, '  ');
-          lines.push(...wrapped);
-        }
+        const comboSummary = '> ' + it.comboComponents
+          .map((comp) => `${comp.quantity * it.quantity}x ${comp.name}`)
+          .join(', ');
+        lines.push(...this.wrapText(comboSummary, cols, ' '));
       }
 
       // Observações do item
       if (it.notes && it.notes.trim()) {
-        const noteText = `Obs: ${it.notes.trim()}`;
-        const wrapped = this.wrapText(noteText, cols, '  * ');
-        lines.push(...wrapped);
+        lines.push(...this.wrapText(`Obs: ${it.notes.trim()}`, cols, ' '));
       }
     }
 
-    // OBSERVAÇÃO GERAL DO PEDIDO
+    // 5. OBSERVAÇÃO GERAL DO PEDIDO
     if (order.customer.notes && order.customer.notes.trim()) {
-      lines.push(separator);
-      lines.push('OBSERVACOES GERAIS:');
-      const obsLines = this.wrapText(order.customer.notes.trim(), cols, '  ');
-      lines.push(...obsLines);
+      lines.push(...this.wrapText(`OBS GERAL: ${order.customer.notes.trim()}`, cols, ''));
     }
 
-    // TOTAIS E PAGAMENTO
+    // 6. TOTAIS E PAGAMENTO
     lines.push(separator);
     lines.push(this.formatLine('SUBTOTAL:', formatReportCurrency(order.subtotal), cols));
     if (isDelivery && typeof order.deliveryFee === 'number' && order.deliveryFee > 0) {
@@ -1204,51 +1251,62 @@ class ThermalPrinterService {
       lines.push(this.formatLine('DESCONTO:', `- ${formatReportCurrency(order.discount)}`, cols));
     }
     lines.push(this.formatLine('TOTAL:', formatReportCurrency(order.totalAmount), cols));
-    lines.push(separator);
 
-    // FORMA DE PAGAMENTO E DETALHAMENTO FINANCEIRO
-    lines.push(`FORMA: ${this.sanitizeText(getPaymentMethodLabel(order.paymentMethod))}`);
+    // FORMA DE PAGAMENTO, DETALHAMENTO E SITUAÇÃO
+    const methodLabel = this.sanitizeText(getPaymentMethodLabel(order.paymentMethod));
+    const statusShort = order.paymentStatus === 'PAGO' ? 'PAGO (CONFIRMADO)' : 'PENDENTE NO BALCAO';
 
     if (order.paymentMethod === 'DINHEIRO') {
-      const received = order.cashReceived !== undefined 
-        ? order.cashReceived 
+      const received = order.cashReceived !== undefined
+        ? order.cashReceived
         : (order.paymentChangeFor !== undefined ? order.paymentChangeFor : order.totalAmount);
       const change = order.changeAmount !== undefined
         ? order.changeAmount
         : (received > order.totalAmount ? received - order.totalAmount : 0);
 
-      lines.push(this.formatLine('RECEBIDO:', formatReportCurrency(received), cols));
-      lines.push(this.formatLine('TROCO:', formatReportCurrency(change), cols));
+      const inlinePayStatus = `PAG: ${methodLabel} | ${statusShort}`;
+      if (inlinePayStatus.length <= cols) {
+        lines.push(inlinePayStatus);
+        lines.push(...this.formatCashReceivedChangeLines(received, change, cols));
+      } else {
+        lines.push(`FORMA: ${methodLabel}`);
+        lines.push(...this.formatCashReceivedChangeLines(received, change, cols));
+        lines.push(`SITUACAO: ${statusShort}`);
+      }
     } else if (order.paymentMethod === 'MISTO' && order.paymentSplits && order.paymentSplits.length > 0) {
-      lines.push('DETALHAMENTO DO PAGAMENTO:');
+      lines.push(`FORMA: ${methodLabel} (Detalhamento):`);
       for (const split of order.paymentSplits) {
         lines.push(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatReportCurrency(split.amount), cols));
         if (split.method === 'DINHEIRO' && split.cashReceived !== undefined) {
-          lines.push(this.formatLine('  RECEBIDO:', formatReportCurrency(split.cashReceived), cols));
-          lines.push(this.formatLine('  TROCO:', formatReportCurrency(split.change || 0), cols));
+          lines.push(...this.formatCashReceivedChangeLines(split.cashReceived, split.change || 0, cols, ' '));
         }
+      }
+      lines.push(`SITUACAO: ${statusShort}`);
+    } else {
+      const inlinePayStatus = `PAG: ${methodLabel} | ${statusShort}`;
+      if (inlinePayStatus.length <= cols) {
+        lines.push(inlinePayStatus);
+      } else {
+        lines.push(`FORMA: ${methodLabel}`);
+        lines.push(`SITUACAO: ${statusShort}`);
       }
     }
 
-    const situacao = order.paymentStatus === 'PAGO'
-      ? 'SITUACAO: PAGO (CONFIRMADO)'
-      : 'SITUACAO: PENDENTE NO BALCAO';
-    lines.push(situacao);
-
-    lines.push(separator);
+    // 7. RODAPÉ (sem separador extra e sem linha em branco no final)
     lines.push(this.centerText('Obrigado pela preferencia!', cols));
     const footerText = this.getEffectiveFooterText(options?.footerText);
     if (footerText) {
-      lines.push(this.centerText(footerText, cols));
+      for (const fl of this.wrapText(footerText, cols, '')) {
+        lines.push(this.centerText(fl, cols));
+      }
     }
-    lines.push('');
 
     return lines.join('\n');
   }
 
   /**
-   * Gera comandos binários ESC/POS para impressoras térmicas (58 mm / 80 mm)
-   * com espaçamento moderado, sem linhas vazias fantasmas e preservando todo o conteúdo.
+   * Gera comandos binários ESC/POS compactos para impressoras térmicas (58 mm / 80 mm)
+   * reduzindo drasticamente o consumo vertical de papel com 100% das informações preservadas.
    */
   public generateReceiptEscPos(order: Order, options?: { isReprint?: boolean; footerText?: string }): Uint8Array {
     const ESC = 0x1b;
@@ -1275,72 +1333,65 @@ class ThermalPrinterService {
       append(LF);
     };
 
-    // 1. Inicializar impressora + tabela CP860 + entrelinhamento moderado (ESC 3 24)
+    // 1. Inicializar impressora + tabela CP860 + entrelinhamento compacto (ESC 3 22 = ~2,75 mm/linha)
     append(ESC, 0x40); // ESC @ (Initialize)
     append(ESC, 0x74, 0x02); // ESC t 2 (CP860 Português)
-    append(ESC, 0x33, 0x18); // ESC 3 24 (entrelinhamento confortável e econômico)
-
-    // 2. Cabeçalho Centralizado em Negrito / Altura Dupla
-    append(ESC, 0x61, 0x01); // Center align
-    append(GS, 0x21, 0x11); // Double width & height
-    appendLine('AMANDITA SABORES');
-    append(GS, 0x21, 0x00); // Normal text
-    appendLine('Cardapio & Cozinha');
-
-    if (options?.isReprint) {
-      append(ESC, 0x45, 0x01); // Bold ON
-      appendLine('*** REIMPRESSAO ***');
-      append(ESC, 0x45, 0x00); // Bold OFF
-    }
+    append(ESC, 0x33, 0x16); // ESC 3 22 (compacto e nítido para Fonte A ASCII sem sobreposição)
 
     const isDelivery = order.fulfillmentType === 'DELIVERY';
 
-    // 3. Modalidade Destaque
-    appendLine(separator);
-    append(GS, 0x21, 0x01); // Double height
+    // 2. Cabeçalho e Modalidade Compactos (Negrito em altura simples evita desperdício de 2 linhas duplas)
+    append(ESC, 0x61, 0x01); // Center align
     append(ESC, 0x45, 0x01); // Bold ON
-    if (isDelivery) {
-      appendLine('ENTREGA');
+    if (cols >= 42) {
+      appendLine('AMANDITA SABORES - Cardapio & Cozinha');
     } else {
-      appendLine('RETIRADA NO BALCAO');
+      appendLine('AMANDITA SABORES');
+      append(ESC, 0x45, 0x00); // Bold OFF
+      appendLine('Cardapio & Cozinha');
+      append(ESC, 0x45, 0x01); // Bold ON
     }
-    append(GS, 0x21, 0x00); // Normal
+
+    if (options?.isReprint) {
+      appendLine('*** REIMPRESSAO ***');
+    }
+
+    appendLine(isDelivery ? '*** ENTREGA ***' : '*** RETIRADA NO BALCAO ***');
     append(ESC, 0x45, 0x00); // Bold OFF
     appendLine(separator);
 
-    // 4. Pedido em Fonte Normal com Alinhamento à Esquerda
+    // 3. Pedido, Data/Hora e Cliente
     append(ESC, 0x61, 0x00); // Left align
+    const metaLines = this.formatOrderHeaderMetaLines(order.orderNumber, order.createdAt, cols);
     append(ESC, 0x45, 0x01); // Bold ON
-    appendLine(`PEDIDO: ${order.orderNumber}`);
+    appendLine(metaLines[0]);
     append(ESC, 0x45, 0x00); // Bold OFF
-    appendLine(`DATA: ${formatDateTime(order.createdAt)}`);
-    for (const cl of this.wrapText(`CLIENTE: ${order.customer.name || (isDelivery ? 'Cliente' : 'Cliente Balcao')}`, cols)) {
+    for (let i = 1; i < metaLines.length; i++) {
+      appendLine(metaLines[i]);
+    }
+    for (const cl of this.formatCustomerLines(order, isDelivery, cols)) {
       appendLine(cl);
     }
-    if (order.customer.phone) {
-      appendLine(`CONTATO: ${this.sanitizeText(order.customer.phone)}`);
-    }
 
-    // Endereço de Entrega (Exclusivo para modalidade DELIVERY - nunca inventar dados)
+    // 4. Endereço de Entrega (Exclusivo para modalidade DELIVERY - nunca inventar dados)
     if (isDelivery && order.customer.address) {
-      appendLine(separator);
       append(ESC, 0x45, 0x01); // Bold ON
       appendLine('ENDERECO DE ENTREGA:');
       append(ESC, 0x45, 0x00); // Bold OFF
-      const addressLines = this.formatReceiptAddressLines(order.customer.address);
-      for (const al of addressLines) {
+      for (const al of this.formatReceiptAddressLines(order.customer.address)) {
         appendLine(al);
       }
     }
 
-    // 5. Itens (largura segura de 31/47 colunas evita auto-wrap + LF com linha vazia)
+    // 5. Itens (1 separador + cabeçalho em negrito + subitens agrupados)
     appendLine(separator);
+    append(ESC, 0x45, 0x01); // Bold ON
     appendLine(this.formatLine('QTD DESCRICAO', 'VALOR', cols));
-    appendLine(separator);
+    append(ESC, 0x45, 0x00); // Bold OFF
 
     for (const it of order.items) {
       const itemTitle = `${it.quantity}x ${it.name}`;
-      const itemPrice = formatReportCurrency(it.subtotal);
+      const itemPrice = this.formatCompactCurrency(it.subtotal);
 
       append(ESC, 0x45, 0x01); // Bold ON
       for (const tl of this.formatOrderItemTitleLines(itemTitle, itemPrice, cols)) {
@@ -1349,37 +1400,34 @@ class ThermalPrinterService {
       append(ESC, 0x45, 0x00); // Bold OFF
 
       if (it.addons && it.addons.length > 0) {
-        for (const ad of it.addons) {
-          const adText = `+ ${ad.name} (R$ ${ad.price.toFixed(2)})`;
-          const wrapped = this.wrapText(adText, cols, '  ');
-          for (const wl of wrapped) appendLine(wl);
-        }
+        const addonsSummary = '+ ' + it.addons
+          .map((ad) => `${ad.name}(${this.formatCompactCurrency(ad.price)})`)
+          .join(', ');
+        for (const wl of this.wrapText(addonsSummary, cols, ' ')) appendLine(wl);
       }
 
       if (it.isCombo && it.comboComponents && it.comboComponents.length > 0) {
-        for (const comp of it.comboComponents) {
-          const compText = `> ${comp.quantity * it.quantity}x ${comp.name}`;
-          const wrapped = this.wrapText(compText, cols, '  ');
-          for (const wl of wrapped) appendLine(wl);
-        }
+        const comboSummary = '> ' + it.comboComponents
+          .map((comp) => `${comp.quantity * it.quantity}x ${comp.name}`)
+          .join(', ');
+        for (const wl of this.wrapText(comboSummary, cols, ' ')) appendLine(wl);
       }
 
       if (it.notes && it.notes.trim()) {
-        const noteText = `Obs: ${it.notes.trim()}`;
-        const wrapped = this.wrapText(noteText, cols, '  * ');
-        for (const wl of wrapped) appendLine(wl);
+        for (const wl of this.wrapText(`Obs: ${it.notes.trim()}`, cols, ' ')) appendLine(wl);
       }
     }
 
-    // 6. Observações do Pedido
+    // 6. Observação Geral do Pedido (inline em negrito, sem separador extra)
     if (order.customer.notes && order.customer.notes.trim()) {
-      appendLine(separator);
-      appendLine('OBSERVACOES GERAIS:');
-      const obsLines = this.wrapText(order.customer.notes.trim(), cols, '  ');
-      for (const ol of obsLines) appendLine(ol);
+      append(ESC, 0x45, 0x01); // Bold ON
+      for (const ol of this.wrapText(`OBS GERAL: ${order.customer.notes.trim()}`, cols, '')) {
+        appendLine(ol);
+      }
+      append(ESC, 0x45, 0x00); // Bold OFF
     }
 
-    // 7. Totais e Pagamento
+    // 7. Totais e Pagamento (TOTAL mantém destaque em negrito + altura dupla)
     appendLine(separator);
     appendLine(this.formatLine('SUBTOTAL:', formatReportCurrency(order.subtotal), cols));
     if (isDelivery && typeof order.deliveryFee === 'number' && order.deliveryFee > 0) {
@@ -1390,57 +1438,81 @@ class ThermalPrinterService {
     }
 
     append(ESC, 0x45, 0x01); // Bold ON
-    append(GS, 0x21, 0x01); // Double height
+    append(GS, 0x21, 0x01); // Double height exclusivamente no TOTAL para leitura imediata
     appendLine(this.formatLine('TOTAL:', formatReportCurrency(order.totalAmount), cols));
     append(GS, 0x21, 0x00); // Normal
     append(ESC, 0x45, 0x00); // Bold OFF
 
-    appendLine(separator);
-    appendLine(`FORMA: ${this.sanitizeText(getPaymentMethodLabel(order.paymentMethod))}`);
+    const methodLabel = this.sanitizeText(getPaymentMethodLabel(order.paymentMethod));
+    const statusShort = order.paymentStatus === 'PAGO' ? 'PAGO (CONFIRMADO)' : 'PENDENTE NO BALCAO';
 
     if (order.paymentMethod === 'DINHEIRO') {
-      const received = order.cashReceived !== undefined 
-        ? order.cashReceived 
+      const received = order.cashReceived !== undefined
+        ? order.cashReceived
         : (order.paymentChangeFor !== undefined ? order.paymentChangeFor : order.totalAmount);
       const change = order.changeAmount !== undefined
         ? order.changeAmount
         : (received > order.totalAmount ? received - order.totalAmount : 0);
 
-      appendLine(this.formatLine('RECEBIDO:', formatReportCurrency(received), cols));
-      appendLine(this.formatLine('TROCO:', formatReportCurrency(change), cols));
+      const inlinePayStatus = `PAG: ${methodLabel} | ${statusShort}`;
+      if (inlinePayStatus.length <= cols) {
+        append(ESC, 0x45, 0x01);
+        appendLine(inlinePayStatus);
+        append(ESC, 0x45, 0x00);
+        for (const cl of this.formatCashReceivedChangeLines(received, change, cols)) {
+          appendLine(cl);
+        }
+      } else {
+        appendLine(`FORMA: ${methodLabel}`);
+        for (const cl of this.formatCashReceivedChangeLines(received, change, cols)) {
+          appendLine(cl);
+        }
+        append(ESC, 0x45, 0x01);
+        appendLine(`SITUACAO: ${statusShort}`);
+        append(ESC, 0x45, 0x00);
+      }
     } else if (order.paymentMethod === 'MISTO' && order.paymentSplits && order.paymentSplits.length > 0) {
-      appendLine('DETALHAMENTO DO PAGAMENTO:');
+      appendLine(`FORMA: ${methodLabel} (Detalhamento):`);
       for (const split of order.paymentSplits) {
         appendLine(this.formatLine(`- ${this.sanitizeText(getPaymentMethodLabel(split.method))}:`, formatReportCurrency(split.amount), cols));
         if (split.method === 'DINHEIRO' && split.cashReceived !== undefined) {
-          appendLine(this.formatLine('  RECEBIDO:', formatReportCurrency(split.cashReceived), cols));
-          appendLine(this.formatLine('  TROCO:', formatReportCurrency(split.change || 0), cols));
+          for (const cl of this.formatCashReceivedChangeLines(split.cashReceived, split.change || 0, cols, ' ')) {
+            appendLine(cl);
+          }
         }
+      }
+      append(ESC, 0x45, 0x01);
+      appendLine(`SITUACAO: ${statusShort}`);
+      append(ESC, 0x45, 0x00);
+    } else {
+      const inlinePayStatus = `PAG: ${methodLabel} | ${statusShort}`;
+      if (inlinePayStatus.length <= cols) {
+        append(ESC, 0x45, 0x01);
+        appendLine(inlinePayStatus);
+        append(ESC, 0x45, 0x00);
+      } else {
+        appendLine(`FORMA: ${methodLabel}`);
+        append(ESC, 0x45, 0x01);
+        appendLine(`SITUACAO: ${statusShort}`);
+        append(ESC, 0x45, 0x00);
       }
     }
 
-    append(ESC, 0x45, 0x01); // Bold ON
-    const situacao = order.paymentStatus === 'PAGO'
-      ? 'SITUACAO: PAGO (CONFIRMADO)'
-      : 'SITUACAO: PENDENTE NO BALCAO';
-    appendLine(situacao);
-    append(ESC, 0x45, 0x00); // Bold OFF
-
-    // 8. Rodapé
-    appendLine(separator);
+    // 8. Rodapé compacto (centralizado, sem separador redundante)
     append(ESC, 0x61, 0x01); // Center
     appendLine('Obrigado pela preferencia!');
     const footerText = this.getEffectiveFooterText(options?.footerText);
     if (footerText) {
-      appendLine(footerText);
+      for (const fl of this.wrapText(footerText, cols, '')) {
+        appendLine(fl);
+      }
     }
 
-    // 9. Avanço de Papel moderado (evita feed duplicado quando corte automático está ativo)
+    // 9. Avanço mínimo de papel após a última linha
     if (this.config.cutPaper) {
-      append(ESC, 0x64, 0x01); // 1 linha antes do corte (GS V A 0 já avança até a lâmina/serrilha)
-      append(GS, 0x56, 0x41, 0x00); // Cut paper (GS V A 0)
+      append(GS, 0x56, 0x41, 0x00); // Cut paper (GS V A 0 já avança até a lâmina)
     } else {
-      append(ESC, 0x64, 0x02); // 2 linhas para destaque confortável sem corte automático
+      append(ESC, 0x64, 0x01); // 1 linha mínima para destaque limpo na serrilha
     }
 
     return new Uint8Array(buffer);
@@ -1616,7 +1688,7 @@ class ThermalPrinterService {
     if (typeof window === 'undefined') return;
 
     const widthCss = this.config.paperWidth === '80mm' ? '80mm' : '58mm';
-    const fontSizeCss = this.config.paperWidth === '80mm' ? '12px' : '11px';
+    const fontSizeCss = this.config.paperWidth === '80mm' ? '11.5px' : '10.5px';
     const receiptText = this.generateReceiptPlainText(order, { isReprint });
     const printWindow = window.open('', '_blank', 'width=380,height=600');
     if (!printWindow) {
@@ -1639,11 +1711,11 @@ class ThermalPrinterService {
             body {
               font-family: 'Courier New', Courier, monospace;
               font-size: ${fontSizeCss};
-              line-height: 1.15;
+              line-height: 1.05;
               color: #000;
               background: #fff;
               margin: 0;
-              padding: 1.5mm 2.5mm;
+              padding: 0.5mm 1.5mm;
               width: ${widthCss};
               max-width: ${widthCss};
               box-sizing: border-box;
@@ -1652,8 +1724,10 @@ class ThermalPrinterService {
               white-space: pre-wrap;
               word-wrap: break-word;
               margin: 0;
+              padding: 0;
               font-family: inherit;
               font-size: inherit;
+              line-height: inherit;
             }
           </style>
         </head>
@@ -2119,6 +2193,52 @@ class ThermalPrinterService {
     const obsText = report.closingNotes ? report.closingNotes : 'Nenhuma observacao registrada.';
     lines.push(...this.wrapMultilineText(obsText, maxLen, '  '));
     lines.push(separator);
+
+    if (report.pendingDeliveredSummary && report.pendingDeliveredSummary.count > 0) {
+      lines.push('PENDENTES DE CONFERENCIA (NAO RECEBIDOS):');
+      lines.push(
+        ...this.formatCashClosingPair(
+          `Pendentes (${report.pendingDeliveredSummary.count}):`,
+          formatReportCurrency(report.pendingDeliveredSummary.totalAmount),
+          maxLen
+        )
+      );
+      report.pendingDeliveredSummary.orders.forEach((item) => {
+        lines.push(
+          ...this.wrapMultilineText(
+            `${item.orderNumber} [${item.paymentMethod}] ${formatReportCurrency(item.totalAmount)}`,
+            maxLen,
+            '  '
+          )
+        );
+      });
+      lines.push(separator);
+    }
+
+    if (report.exceptionalPendingJustifications && report.exceptionalPendingJustifications.length > 0) {
+      const excTotal = report.exceptionalPendingJustifications.reduce((acc, r) => acc + (Number(r.amount) || 0), 0);
+      lines.push('FECH. EXCEPCIONAL - PENDENCIAS (NAO RECEBIDAS):');
+      lines.push(
+        ...this.formatCashClosingPair(
+          `Pendencias (${report.exceptionalPendingJustifications.length}):`,
+          formatReportCurrency(excTotal),
+          maxLen
+        )
+      );
+      report.exceptionalPendingJustifications.forEach((rec) => {
+        lines.push(
+          ...this.wrapMultilineText(
+            `${rec.orderNumber} [${rec.paymentMethod}] ${formatReportCurrency(rec.amount)}`,
+            maxLen,
+            '  '
+          )
+        );
+        const motif = rec.reasonDetail ? `${rec.reasonLabel} - ${rec.reasonDetail}` : rec.reasonLabel;
+        lines.push(...this.wrapMultilineText(`Motivo: ${motif}`, maxLen, '  '));
+        lines.push(...this.wrapMultilineText(`Resp.: ${rec.responsibleName}`, maxLen, '  '));
+      });
+      lines.push(separator);
+    }
 
     lines.push(this.centerText('Amandita Sabores', maxLen));
     return lines.join('\n');

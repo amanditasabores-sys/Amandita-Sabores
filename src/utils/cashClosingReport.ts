@@ -1,4 +1,4 @@
-import { CashRegisterShift } from '../types';
+import { CashPendingDeliveredOrder, CashRegisterShift, ExceptionalClosingPendingRecord } from '../types';
 import { formatCurrency } from './formatters';
 
 export interface CashShiftFinancialMetrics {
@@ -79,6 +79,20 @@ export interface CashClosingReportData {
   differenceLabel: string;
   closingNotes: string;
   movementsCount: number;
+  /** Pedidos entregues com pagamento PENDENTE no turno aberto (NÃO somados às vendas nem à gaveta) */
+  pendingDeliveredSummary?: {
+    count: number;
+    totalAmount: number;
+    orders: Array<{
+      orderId: string;
+      orderNumber: string;
+      totalAmount: number;
+      paymentMethod: string;
+      customerName: string;
+    }>;
+  };
+  /** Pendências encerradas excepcionalmente com justificativa no fechamento oficial (NÃO recebidas) */
+  exceptionalPendingJustifications?: ExceptionalClosingPendingRecord[];
 }
 
 export interface CountedCashValidationResult {
@@ -300,11 +314,16 @@ export function buildOpenShiftClosingReport(
     closingNotes: string;
     operatorName?: string;
     generatedAt?: string;
+    pendingDeliveredOrders?: CashPendingDeliveredOrder[];
   }
 ): CashClosingReportData {
   const m = calculateCashShiftMetrics(shift);
   const difference = options.countedCash - m.expectedCashInDrawer;
   const diffInfo = classifyCashDifference(difference);
+  const pendingList = Array.isArray(options.pendingDeliveredOrders) ? options.pendingDeliveredOrders : [];
+  const pendingTotal = Math.round(
+    (pendingList.reduce((acc, item) => acc + (Number(item.totalAmount) || 0), 0) + Number.EPSILON) * 100
+  ) / 100;
 
   return {
     mode: 'OPEN_PREVIEW',
@@ -346,6 +365,21 @@ export function buildOpenShiftClosingReport(
     differenceLabel: diffInfo.label,
     closingNotes: (options.closingNotes || '').trim(),
     movementsCount: Array.isArray(shift.movements) ? shift.movements.length : 0,
+    ...(pendingList.length > 0
+      ? {
+          pendingDeliveredSummary: {
+            count: pendingList.length,
+            totalAmount: pendingTotal,
+            orders: pendingList.map((p) => ({
+              orderId: p.orderId,
+              orderNumber: p.orderNumber,
+              totalAmount: p.totalAmount,
+              paymentMethod: String(p.paymentMethod || ''),
+              customerName: p.customerName,
+            })),
+          },
+        }
+      : {}),
   };
 }
 
@@ -419,5 +453,10 @@ export function buildClosedShiftClosingReport(
     differenceLabel: diffInfo.label,
     closingNotes: (shift.notes || '').trim(),
     movementsCount: Array.isArray(shift.movements) ? shift.movements.length : 0,
+    ...(Array.isArray(shift.exceptionalPendingJustifications) && shift.exceptionalPendingJustifications.length > 0
+      ? {
+          exceptionalPendingJustifications: shift.exceptionalPendingJustifications,
+        }
+      : {}),
   };
 }

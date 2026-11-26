@@ -30,8 +30,12 @@ import {
   CreateStaffPayload,
   UpdateStaffPayload,
   UpdateOwnCredentialsPayload,
-  AuthActionResult
+  AuthActionResult,
+  CashPendingDeliveredOrder,
+  CashShiftPendingSummary,
+  ExceptionalClosingJustificationInput,
 } from '../types';
+import { classifyShiftPendingDeliveredOrders } from '../utils/cashPendingOrders';
 import { formatCurrency, getFortalezaDateKey } from '../utils/formatters';
 import { soundService } from './audio';
 import { thermalPrinterService } from './thermalPrinter';
@@ -6268,7 +6272,12 @@ class StoreService {
     newPaymentStatus: 'PAGO' | 'PENDENTE',
     author = 'Caixa',
     notes?: string,
-    options?: { timeoutMs?: number; shiftId?: string }
+    options?: {
+      timeoutMs?: number;
+      shiftId?: string;
+      requireOrderInShiftPeriod?: boolean;
+      allowServerFetchIfMissing?: boolean;
+    }
   ): Promise<{
     order: Order | null;
     shift?: CashRegisterShift | null;
@@ -6289,11 +6298,11 @@ class StoreService {
       };
     }
 
-    const previousOrder = this.getOrderById(orderId);
-    if (!previousOrder) {
+    const previousOrder = this.getOrderById(orderId) || null;
+    if (!previousOrder && !(this.shouldUseServerAtomicPayment() && options?.allowServerFetchIfMissing)) {
       return { order: null, synced: false, rejected: true, error: 'Pedido não encontrado' };
     }
-    if (previousOrder.status === 'CANCELADO') {
+    if (previousOrder?.status === 'CANCELADO') {
       return {
         order: previousOrder,
         synced: false,
@@ -6301,7 +6310,7 @@ class StoreService {
         error: 'Não é possível confirmar pagamento de um pedido cancelado.',
       };
     }
-    if (previousOrder.paymentStatus === 'PAGO' && newPaymentStatus === 'PENDENTE') {
+    if (previousOrder?.paymentStatus === 'PAGO' && newPaymentStatus === 'PENDENTE') {
       return {
         order: previousOrder,
         synced: false,
@@ -6309,7 +6318,7 @@ class StoreService {
         error: 'Não é permitido reverter um pagamento já confirmado para PENDENTE. Utilize o fluxo de cancelamento com estorno.',
       };
     }
-    if (previousOrder.paymentStatus === newPaymentStatus && !this.shouldUseServerAtomicPayment()) {
+    if (previousOrder && previousOrder.paymentStatus === newPaymentStatus && !this.shouldUseServerAtomicPayment()) {
       return { order: previousOrder, synced: false };
     }
 
@@ -6471,6 +6480,7 @@ class StoreService {
           author,
           notes,
           shiftId: shiftCheck.shiftId,
+          ...(options?.requireOrderInShiftPeriod ? { requireOrderInShiftPeriod: true } : {}),
         }),
         ...(controller ? { signal: controller.signal } : {}),
       });
@@ -7473,11 +7483,108 @@ class StoreService {
     return cleanClosed;
   }
 
+  public async fetchCashShiftPendingOrdersAsync(
+    shiftId: string
+  ): Promise<{
+    success: boolean;
+    summary: CashShiftPendingSummary | null;
+    error?: string;
+  }> {
+    if (!this.canUserManageCash()) {
+      return {
+        success: false,
+        summary: null,
+        error: 'Permissão insuficiente: apenas Caixa, Gerente ou Administrador podem consultar pendências financeiras do caixa.',
+      };
+    }
+
+    if (!this.shouldUseServerAtomicPayment()) {
+      const current = this.getCurrentCashShift();
+      const history = this.getCashShiftHistory();
+      const targetShift =
+        (current && current.id === shiftId ? current : null) ||
+        history.find((s) => s.id === shiftId) ||
+        null;
+      if (!targetShift) {
+        return { success: false, summary: null, error: 'Turno de caixa não encontrado.' };
+      }
+      const summary = classifyShiftPendingDeliveredOrders({
+        orders: this.getOrders(),
+        shift: targetShift,
+        allShifts: [...(current ? [current] : []), ...history],
+      });
+      return { success: true, summary };
+    }
+
+    if (isFirebaseReady()) {
+      await this.waitForFirebaseAuthReady();
+      if (!auth?.currentUser) {
+        return {
+          success: false,
+          summary: null,
+          error: 'Sessão Firebase não autenticada. Faça login novamente para consultar pendências do caixa.',
+        };
+      }
+    }
+
+    if (typeof fetch !== 'function') {
+      return {
+        success: false,
+        summary: null,
+        error: 'Cliente HTTP indisponível para consultar pendências financeiras.',
+      };
+    }
+
+    try {
+      const authHeaders = await this.getFirebaseAuthHeaders();
+      const res = await fetch(`/api/cash-shifts/${encodeURIComponent(shiftId)}/pending-orders`, {
+        method: 'GET',
+        headers: authHeaders,
+      });
+      const parsed = await this.readServerJsonResponse(res);
+      const data = parsed.data;
+      if (parsed.ok && !parsed.isHtml && parsed.isValidJson && data?.success === true) {
+        const summary: CashShiftPendingSummary = {
+          shiftId: String(data.shiftId || shiftId),
+          shiftStatus: data.shiftStatus === 'FECHADO' ? 'FECHADO' : 'ABERTO',
+          shiftOpenedAt: String(data.shiftOpenedAt || ''),
+          ...(data.shiftClosedAt ? { shiftClosedAt: String(data.shiftClosedAt) } : {}),
+          checkedAt: String(data.checkedAt || new Date().toISOString()),
+          currentShiftPending: Array.isArray(data.currentShiftPending) ? data.currentShiftPending : [],
+          currentShiftPendingCount: Number(data.currentShiftPendingCount) || 0,
+          currentShiftPendingTotal: Number(data.currentShiftPendingTotal) || 0,
+          previousShiftsPending: Array.isArray(data.previousShiftsPending) ? data.previousShiftsPending : [],
+          previousShiftsPendingCount: Number(data.previousShiftsPendingCount) || 0,
+          previousShiftsPendingTotal: Number(data.previousShiftsPendingTotal) || 0,
+        };
+        return { success: true, summary };
+      }
+      return {
+        success: false,
+        summary: null,
+        error:
+          (typeof data?.message === 'string' && data.message) ||
+          `Não foi possível consultar pendências financeiras do turno (HTTP ${parsed.status}).`,
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        summary: null,
+        error: `Falha de comunicação ao consultar pendências financeiras: ${msg}`,
+      };
+    }
+  }
+
   public async closeCashRegisterAsync(
     countedCash: number,
     closedBy: string,
     notes?: string,
-    options?: { shiftId?: string; timeoutMs?: number }
+    options?: {
+      shiftId?: string;
+      timeoutMs?: number;
+      exceptionalJustifications?: ExceptionalClosingJustificationInput[];
+    }
   ): Promise<{
     success: boolean;
     synced: boolean;
@@ -7485,6 +7592,10 @@ class StoreService {
     uncertain?: boolean;
     recoveredFromTimeout?: boolean;
     shift: CashRegisterShift | null;
+    code?: string;
+    pendingOrders?: CashPendingDeliveredOrder[];
+    pendingCount?: number;
+    pendingTotalAmount?: number;
     error?: string;
   }> {
     if (!this.canUserManageCash()) {
@@ -7623,6 +7734,9 @@ class StoreService {
           countedCash: Math.max(0, roundCurrency(countedCash)),
           closedBy: closedBy.trim() || 'Operador',
           notes: notes?.trim() || undefined,
+          ...(options?.exceptionalJustifications && options.exceptionalJustifications.length > 0
+            ? { exceptionalJustifications: options.exceptionalJustifications }
+            : {}),
         }),
         ...(controller ? { signal: controller.signal } : {}),
       });
@@ -7644,6 +7758,27 @@ class StoreService {
         return { success: true, synced: true, shift: committed };
       }
 
+      if (
+        !parsed.isHtml &&
+        parsed.isValidJson &&
+        (data?.code === 'PENDING_DELIVERED_ORDERS_EXIST' || data?.code === 'INVALID_EXCEPTIONAL_JUSTIFICATIONS')
+      ) {
+        this.uncertainServerOps.delete(opKey);
+        return {
+          success: false,
+          synced: false,
+          rejected: true,
+          shift: null,
+          code: String(data.code),
+          pendingOrders: Array.isArray(data.pendingOrders) ? (data.pendingOrders as CashPendingDeliveredOrder[]) : [],
+          pendingCount: Number(data.pendingCount) || 0,
+          pendingTotalAmount: Number(data.pendingTotalAmount) || 0,
+          error:
+            (typeof data.message === 'string' && data.message) ||
+            'Existem pedidos entregues com pagamento pendente neste turno.',
+        };
+      }
+
       const resolution = await this.resolveFinancialHttpFailure(parsed, 'o fechamento do caixa');
       if (resolution.kind === 'rejected') {
         this.uncertainServerOps.delete(opKey);
@@ -7652,6 +7787,7 @@ class StoreService {
           synced: false,
           rejected: true,
           shift: null,
+          code: typeof data?.code === 'string' ? data.code : undefined,
           error: resolution.error,
         };
       }

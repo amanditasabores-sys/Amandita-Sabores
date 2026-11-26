@@ -25,6 +25,11 @@ import {
   validatePixPayload,
   validatePixReceiver,
 } from '../utils/pix.js';
+import {
+  classifyShiftPendingDeliveredOrders,
+  isOrderWithinShiftPeriod,
+  validateExceptionalClosingJustifications,
+} from '../utils/cashPendingOrders.js';
 
 // Shared Firebase Admin & Client Env Config (Client SDK is never loaded in serverless backend)
 const firebaseAdmin = getFirebaseAdminInstances();
@@ -3563,13 +3568,106 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     }
   });
 
-  // Atomic Close Cash Shift (preserves all movements, forbids closing already FECHADO shift, computes totals server-side)
-  app.post(['/api/cash-shifts/:id/close', '/cash-shifts/:id/close'], async (req: Request, res: Response) => {
+  // Read-only: Pending delivered orders for a cash shift (separating current shift vs previous shifts)
+  app.get(['/api/cash-shifts/:id/pending-orders', '/cash-shifts/:id/pending-orders'], async (req: Request, res: Response) => {
     try {
       const auth = await verifyStaffAuth(req);
+      if (!auth.uid) {
+        res.status(401).json({
+          success: false,
+          code: 'UNAUTHORIZED',
+          message: 'Autenticação obrigatória para consultar pendências financeiras do caixa.',
+        });
+        return;
+      }
       if (!auth.isStaff || !['ADMINISTRADOR', 'GERENTE', 'CAIXA'].includes(auth.role.toUpperCase())) {
         res.status(403).json({
           success: false,
+          code: 'FORBIDDEN',
+          message: 'Permissão insuficiente: apenas Caixa, Gerente ou Administrador podem consultar pendências financeiras do caixa.',
+        });
+        return;
+      }
+
+      if (!adminDb) {
+        res.status(503).json({
+          success: false,
+          code: 'ADMIN_SDK_UNAVAILABLE',
+          message: 'Consulta de pendências indisponível: Firebase Admin SDK não configurado no servidor.',
+        });
+        return;
+      }
+
+      const shiftId = String(req.params.id || '').trim();
+      if (!shiftId || !/^[a-zA-Z0-9_\-]+$/.test(shiftId) || shiftId.length > 128) {
+        res.status(400).json({ success: false, message: 'Identificador do turno de caixa inválido.' });
+        return;
+      }
+
+      const [shiftSnap, pendingOrdersSnap, allShiftsSnap] = await Promise.all([
+        adminDb.collection('cash_shifts').doc(shiftId).get(),
+        adminDb.collection('orders').where('paymentStatus', '==', 'PENDENTE').get(),
+        adminDb.collection('cash_shifts').get(),
+      ]);
+
+      if (!shiftSnap.exists) {
+        res.status(404).json({
+          success: false,
+          code: 'SHIFT_NOT_FOUND',
+          message: `Turno de caixa '${shiftId}' não encontrado no servidor.`,
+        });
+        return;
+      }
+
+      const shiftData = (shiftSnap.data() || {}) as Record<string, any>;
+      const pendingOrders = pendingOrdersSnap.docs.map((doc) => ({
+        id: doc.id,
+        ...(doc.data() as Record<string, any>),
+      }));
+      const allShifts = allShiftsSnap.docs.map((doc) => ({
+        id: doc.id,
+        ...(doc.data() as Record<string, any>),
+      }));
+
+      const summary = classifyShiftPendingDeliveredOrders({
+        orders: pendingOrders,
+        shift: {
+          id: shiftId,
+          status: shiftData.status === 'FECHADO' ? 'FECHADO' : 'ABERTO',
+          openedAt: String(shiftData.openedAt || ''),
+          closedAt: typeof shiftData.closedAt === 'string' ? shiftData.closedAt : undefined,
+          movements: Array.isArray(shiftData.movements) ? shiftData.movements : [],
+        },
+        allShifts,
+      });
+
+      res.status(200).json({
+        success: true,
+        ...summary,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, message: `Erro ao consultar pendências financeiras do turno: ${msg}` });
+    }
+  });
+
+  // Atomic Close Cash Shift (preserves all movements, forbids closing already FECHADO shift,
+  // enforces pending delivered orders check + exceptional closing justifications atomically, computes totals server-side)
+  app.post(['/api/cash-shifts/:id/close', '/cash-shifts/:id/close'], async (req: Request, res: Response) => {
+    try {
+      const auth = await verifyStaffAuth(req);
+      if (!auth.uid) {
+        res.status(401).json({
+          success: false,
+          code: 'UNAUTHORIZED',
+          message: 'Autenticação obrigatória para fechar o caixa.',
+        });
+        return;
+      }
+      if (!auth.isStaff || !['ADMINISTRADOR', 'GERENTE', 'CAIXA'].includes(auth.role.toUpperCase())) {
+        res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
           message: 'Permissão insuficiente: apenas Caixa, Gerente ou Administrador podem fechar o caixa.',
         });
         return;
@@ -3598,10 +3696,17 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       const countedCash = roundCurrencyServer(parsedCounted);
       const closedBy = String(req.body?.closedBy || auth.email || auth.role).trim().slice(0, 128) || 'Operador';
       const notes = typeof req.body?.notes === 'string' && req.body.notes.trim() ? req.body.notes.trim().slice(0, 500) : undefined;
+      const submittedJustifications = req.body?.exceptionalJustifications;
 
       const db = adminDb;
       const shiftRef = db.collection('cash_shifts').doc(shiftId);
       const now = new Date().toISOString();
+
+      // Snapshot read-only of other shifts' VENDA movements to avoid false positives if an order already has VENDA elsewhere
+      const allShiftsPreSnap = await db.collection('cash_shifts').get();
+      const otherShiftsForVendaCheck = allShiftsPreSnap.docs
+        .filter((doc) => doc.id !== shiftId)
+        .map((doc) => ({ id: doc.id, ...(doc.data() as Record<string, any>) }));
 
       let outcome: { status: number; body: Record<string, any> } = {
         status: 500,
@@ -3635,6 +3740,76 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
           return;
         }
 
+        // Single-field query inside transaction (requires zero composite Firestore index)
+        const pendingOrdersQuery = db.collection('orders').where('paymentStatus', '==', 'PENDENTE');
+        const pendingOrdersSnap = await tx.get(pendingOrdersQuery);
+        const pendingOrderDocs = pendingOrdersSnap.docs.map((doc) => ({
+          id: doc.id,
+          ...(doc.data() as Record<string, any>),
+        }));
+
+        const pendingSummary = classifyShiftPendingDeliveredOrders({
+          orders: pendingOrderDocs,
+          shift: {
+            id: shiftId,
+            status: 'ABERTO',
+            openedAt: String(shiftData.openedAt || ''),
+            movements: Array.isArray(shiftData.movements) ? shiftData.movements : [],
+          },
+          allShifts: otherShiftsForVendaCheck,
+          checkedAt: now,
+        });
+
+        let exceptionalPendingRecords: Record<string, any>[] | undefined;
+
+        if (pendingSummary.currentShiftPending.length > 0) {
+          if (!Array.isArray(submittedJustifications) || submittedJustifications.length === 0) {
+            outcome = {
+              status: 409,
+              body: {
+                success: false,
+                code: 'PENDING_DELIVERED_ORDERS_EXIST',
+                message: `Fechamento bloqueado: existem ${pendingSummary.currentShiftPendingCount} pedido(s) entregue(s) com pagamento PENDENTE neste turno (total de R$ ${pendingSummary.currentShiftPendingTotal.toFixed(2).replace('.', ',')}). Confirme os pagamentos ou registre justificativa excepcional para cada pendência.`,
+                pendingOrders: pendingSummary.currentShiftPending,
+                pendingCount: pendingSummary.currentShiftPendingCount,
+                pendingTotalAmount: pendingSummary.currentShiftPendingTotal,
+              },
+            };
+            return;
+          }
+
+          const validation = validateExceptionalClosingJustifications({
+            pendingOrders: pendingSummary.currentShiftPending,
+            submitted: submittedJustifications,
+            shiftId,
+            responsibleUid: auth.uid || 'unknown',
+            responsibleName: closedBy,
+            responsibleRole: auth.role,
+            recordedAt: now,
+          });
+
+          if (!validation.ok) {
+            outcome = {
+              status: 400,
+              body: {
+                success: false,
+                code: 'INVALID_EXCEPTIONAL_JUSTIFICATIONS',
+                message: validation.error || 'Justificativas de fechamento excepcional inválidas ou incompletas.',
+                pendingOrders: pendingSummary.currentShiftPending,
+                pendingCount: pendingSummary.currentShiftPendingCount,
+                pendingTotalAmount: pendingSummary.currentShiftPendingTotal,
+                missingOrderIds: validation.missingOrderIds || [],
+              },
+            };
+            return;
+          }
+
+          exceptionalPendingRecords = validation.records;
+        }
+
+        // CRITICAL INVARIANT:
+        // Exceptional closing NEVER alters order paymentStatus, NEVER creates VENDA movements,
+        // and NEVER modifies initialBalance, finalCalculatedBalance, finalCountedCash, or difference.
         const expectedCash = computeExpectedCashInDrawerServer(shiftData);
         const difference = roundCurrencyServer(countedCash - expectedCash);
 
@@ -3644,10 +3819,19 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
           status: 'FECHADO',
           closedAt: now,
           closedBy,
+          closedByUid: auth.uid,
           finalCalculatedBalance: expectedCash,
           finalCountedCash: countedCash,
           difference,
           ...(notes ? { notes } : {}),
+          ...(exceptionalPendingRecords && exceptionalPendingRecords.length > 0
+            ? {
+                closedWithPendingOrders: true,
+                pendingDeliveredAtCloseCount: pendingSummary.currentShiftPendingCount,
+                pendingDeliveredAtCloseTotal: pendingSummary.currentShiftPendingTotal,
+                exceptionalPendingJustifications: exceptionalPendingRecords,
+              }
+            : {}),
         };
 
         tx.set(shiftRef, closedShift);
@@ -3656,7 +3840,11 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
           body: {
             success: true,
             shift: closedShift,
-            message: 'Turno de caixa fechado e conferido atomicamente no servidor.',
+            closedWithPendingOrders: Boolean(exceptionalPendingRecords && exceptionalPendingRecords.length > 0),
+            message:
+              exceptionalPendingRecords && exceptionalPendingRecords.length > 0
+                ? 'Turno de caixa fechado excepcionalmente com justificativas registradas no servidor (pedidos pendentes permanecem PENDENTE e sem lançamento de venda).'
+                : 'Turno de caixa fechado e conferido atomicamente no servidor.',
           },
         };
       });
@@ -4118,9 +4306,10 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     author: string;
     notes?: string;
     requestedShiftId?: string;
+    requireOrderInShiftPeriod?: boolean;
     validatedNewOrder?: { cleanOrder: Record<string, any>; publicTrackingDoc: Record<string, any> } | null;
   }): Promise<{ status: number; body: Record<string, any>; createdNewOrder?: Record<string, any> }> {
-    const { db, orderId, author, notes, requestedShiftId, validatedNewOrder } = params;
+    const { db, orderId, author, notes, requestedShiftId, requireOrderInShiftPeriod, validatedNewOrder } = params;
     const allowedMethods = ['PIX', 'CARTAO_CREDITO', 'CARTAO_DEBITO', 'DINHEIRO', 'MISTO'];
     const now = new Date().toISOString();
     const deterministicSaleMovementId = `cash-sale-${orderId}`;
@@ -4286,6 +4475,20 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
 
         const shiftDocSnap = shiftResolution.docSnap;
         const shiftData = (shiftDocSnap.data() || {}) as Record<string, any>;
+
+        if (requireOrderInShiftPeriod && !isOrderWithinShiftPeriod(orderData.createdAt, shiftData.openedAt)) {
+          result = {
+            status: 409,
+            body: {
+              success: false,
+              code: 'ORDER_FROM_PREVIOUS_SHIFT',
+              message:
+                'Este pedido foi criado antes da abertura do turno atual e não pode ser lançado automaticamente neste turno do caixa.',
+            },
+          };
+          return;
+        }
+
         const existingMovements = Array.isArray(shiftData.movements) ? [...shiftData.movements] : [];
         const existingSale = existingMovements.find(
           (m: any) => m && m.type === 'VENDA' && (m.orderId === orderId || m.id === deterministicSaleMovementId)
@@ -4476,9 +4679,18 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       }
 
       const auth = await verifyStaffAuth(req);
+      if (!auth.uid) {
+        res.status(401).json({
+          success: false,
+          code: 'UNAUTHORIZED',
+          message: 'Autenticação obrigatória para confirmar pagamentos.',
+        });
+        return;
+      }
       if (!auth.isStaff || !['ADMINISTRADOR', 'GERENTE', 'CAIXA', 'ATENDENTE'].includes(auth.role.toUpperCase())) {
         res.status(403).json({
           success: false,
+          code: 'FORBIDDEN',
           message: 'Permissão insuficiente: apenas Administrador, Gerente, Caixa ou Atendente podem confirmar pagamentos.',
         });
         return;
@@ -4493,6 +4705,16 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
       const requestedShiftId = typeof req.body?.shiftId === 'string' ? req.body.shiftId.trim() : '';
       if (requestedShiftId && (!/^[a-zA-Z0-9_\-]+$/.test(requestedShiftId) || requestedShiftId.length > 128)) {
         res.status(400).json({ success: false, message: 'Identificador do turno de caixa inválido.' });
+        return;
+      }
+
+      const requireOrderInShiftPeriod = req.body?.requireOrderInShiftPeriod === true;
+      if (requireOrderInShiftPeriod && !['ADMINISTRADOR', 'GERENTE', 'CAIXA'].includes(auth.role.toUpperCase())) {
+        res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
+          message: 'Permissão insuficiente: apenas Caixa, Gerente ou Administrador podem confirmar pendências financeiras pelo controle de caixa.',
+        });
         return;
       }
 
@@ -4532,6 +4754,7 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
         author: authorStr,
         notes: notesStr,
         requestedShiftId: requestedShiftId || undefined,
+        requireOrderInShiftPeriod,
         validatedNewOrder,
       });
 
@@ -5183,8 +5406,681 @@ app.post(['/api/push/subscribe', '/push/subscribe'], async (req: Request, res: R
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Permanent Read-Only Administrative Financial Audit Endpoint
+  // Strictly restricted to active ADMINISTRADOR users verified server-side.
+  // Performs EXCLUSIVELY Firestore .get() reads on 'users', 'orders', and 'cash_shifts'.
+  // Never performs any write, mutation, or recalculation.
+  // ---------------------------------------------------------------------------
+  interface IndexedCashVendaMovement {
+    canonicalKey: string;
+    shiftId: string;
+    shiftStatus: string;
+    shiftOpenedAt: string | null;
+    shiftClosedAt: string | null;
+    shiftOpenedAtMs: number | null;
+    movementId: string | null;
+    orderId: string | null;
+    amount: number;
+    paymentMethod: string | null;
+    timestamp: string | null;
+  }
+
+  type AuditOriginClassification =
+    | 'CARDAPIO_PUBLICO_CONFIRMADO'
+    | 'PDV_CONFIRMADO'
+    | 'PROVAVEL_CARDAPIO_PUBLICO'
+    | 'PROVAVEL_PDV'
+    | 'ORIGEM_INDETERMINADA';
+
+  interface FinancialAuditOrderEntry {
+    orderId: string;
+    orderNumber: string | null;
+    createdAt: string | null;
+    updatedAt: string | null;
+    totalAmount: number;
+    paymentMethod: string | null;
+    status: string;
+    paymentStatus: string;
+    originClassification: AuditOriginClassification;
+    originIsDefinitive: boolean;
+    originNote: string;
+    originEvidence: string[];
+    saleCashShiftId: string | null;
+    saleCashMovementId: string | null;
+    relatedShiftIds: string[];
+    hasFinancialMovement: boolean;
+    matchedMovementCount: number;
+    recordedCashAmount: number;
+    matchedMovements: Array<{
+      shiftId: string;
+      shiftStatus: string;
+      shiftOpenedAt: string | null;
+      shiftClosedAt: string | null;
+      movementId: string | null;
+      amount: number;
+      paymentMethod: string | null;
+      timestamp: string | null;
+    }>;
+    inconsistencies: string[];
+  }
+
+  function parseIsoTimestampMs(value: unknown): number | null {
+    if (typeof value !== 'string' || !value.trim()) return null;
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  function classifyAuditOrderOrigin(orderData: Record<string, any>): {
+    originClassification: AuditOriginClassification;
+    originIsDefinitive: boolean;
+    originNote: string;
+    originEvidence: string[];
+  } {
+    const explicitSource = typeof orderData.source === 'string' ? orderData.source.trim().toUpperCase() : '';
+    if (explicitSource === 'PUBLIC_MENU') {
+      return {
+        originClassification: 'CARDAPIO_PUBLICO_CONFIRMADO',
+        originIsDefinitive: true,
+        originNote: 'Origem definida explicitamente pelo campo persistido source=PUBLIC_MENU.',
+        originEvidence: ['campo source="PUBLIC_MENU"'],
+      };
+    }
+    if (explicitSource === 'PDV') {
+      return {
+        originClassification: 'PDV_CONFIRMADO',
+        originIsDefinitive: true,
+        originNote: 'Origem definida explicitamente pelo campo persistido source=PDV.',
+        originEvidence: ['campo source="PDV"'],
+      };
+    }
+
+    const hasProcessedBy = typeof orderData.processedBy === 'string' && orderData.processedBy.trim().length > 0;
+    const createdBy = typeof orderData.createdBy === 'string' ? orderData.createdBy.trim() : '';
+    const customerName =
+      orderData.customer && typeof orderData.customer.name === 'string'
+        ? orderData.customer.name.trim()
+        : '';
+    const movements = Array.isArray(orderData.movements) ? orderData.movements : [];
+    const firstMov = movements.length > 0 && movements[0] && typeof movements[0] === 'object' ? movements[0] : null;
+    const firstStatus = String(firstMov?.toStatus || firstMov?.status || '').trim().toUpperCase();
+    const firstNotes = String(firstMov?.notes || firstMov?.note || '').trim().toLowerCase();
+    const hasTrackingCode = typeof orderData.trackingCode === 'string' && orderData.trackingCode.trim().length > 0;
+    const paymentMethod = String(orderData.paymentMethod || '').trim().toUpperCase();
+    const discount = Number(orderData.discount) || 0;
+
+    const pdvSignals: string[] = [];
+    if (hasProcessedBy) pdvSignals.push('possui campo processedBy');
+    if (paymentMethod === 'MISTO') pdvSignals.push('forma de pagamento MISTO (exclusiva do PDV)');
+    if (discount > 0) pdvSignals.push('possui desconto manual aplicado');
+    if (firstStatus === 'EM_PREPARO') pdvSignals.push('movimento inicial diretamente em EM_PREPARO');
+    if (
+      firstNotes.includes('pdv') ||
+      firstNotes.includes('balcão') ||
+      firstNotes.includes('balcao') ||
+      createdBy.toLowerCase().includes('pdv')
+    ) {
+      pdvSignals.push('registro inicial referencia PDV/Balcão');
+    }
+
+    const publicSignals: string[] = [];
+    if (createdBy === 'Cliente Cardápio Web') {
+      publicSignals.push('createdBy="Cliente Cardápio Web"');
+    } else if (createdBy && customerName && createdBy.toLowerCase() === customerName.toLowerCase()) {
+      publicSignals.push('createdBy coincide com o nome do cliente');
+    }
+    if (firstStatus === 'NOVO') {
+      publicSignals.push('movimento inicial com status NOVO');
+    }
+    if (
+      firstNotes.includes('cardápio') ||
+      firstNotes.includes('cardapio') ||
+      firstNotes.includes('web')
+    ) {
+      publicSignals.push('nota inicial referencia Cardápio/Web');
+    }
+    if (hasTrackingCode) {
+      publicSignals.push('possui trackingCode público');
+    }
+
+    // Never classify as public menu based solely on absence of processedBy.
+    if (pdvSignals.length > 0 && publicSignals.length === 0) {
+      return {
+        originClassification: 'PROVAVEL_PDV',
+        originIsDefinitive: false,
+        originNote: 'Origem provável de PDV (campo source não persistido no documento).',
+        originEvidence: pdvSignals,
+      };
+    }
+
+    if (
+      !hasProcessedBy &&
+      pdvSignals.length === 0 &&
+      (createdBy === 'Cliente Cardápio Web' || publicSignals.length >= 2)
+    ) {
+      return {
+        originClassification: 'PROVAVEL_CARDAPIO_PUBLICO',
+        originIsDefinitive: false,
+        originNote:
+          'Origem apenas provável de cardápio público (campo source não persistido; classificado por múltiplos sinais concordantes, não apenas pela ausência de processedBy).',
+        originEvidence: ['sem campo processedBy', ...publicSignals],
+      };
+    }
+
+    const combinedEvidence = [
+      ...(hasProcessedBy ? [] : ['sem campo processedBy (insuficiente isoladamente)']),
+      ...pdvSignals,
+      ...publicSignals,
+    ];
+    return {
+      originClassification: 'ORIGEM_INDETERMINADA',
+      originIsDefinitive: false,
+      originNote: 'Origem indeterminada: sinais insuficientes ou conflitantes sem campo source definitivo.',
+      originEvidence: combinedEvidence.length > 0 ? combinedEvidence : ['sem sinais conclusivos de origem'],
+    };
+  }
+
+  function summarizeAuditGroup(items: FinancialAuditOrderEntry[], maxItems: number) {
+    const byOriginCount: Record<AuditOriginClassification, number> = {
+      CARDAPIO_PUBLICO_CONFIRMADO: 0,
+      PDV_CONFIRMADO: 0,
+      PROVAVEL_CARDAPIO_PUBLICO: 0,
+      PROVAVEL_PDV: 0,
+      ORIGEM_INDETERMINADA: 0,
+    };
+    const byOriginAmount: Record<AuditOriginClassification, number> = {
+      CARDAPIO_PUBLICO_CONFIRMADO: 0,
+      PDV_CONFIRMADO: 0,
+      PROVAVEL_CARDAPIO_PUBLICO: 0,
+      PROVAVEL_PDV: 0,
+      ORIGEM_INDETERMINADA: 0,
+    };
+
+    let totalOrderAmount = 0;
+    let totalRecordedCashAmount = 0;
+
+    for (const item of items) {
+      totalOrderAmount = roundCurrencyServer(totalOrderAmount + item.totalAmount);
+      totalRecordedCashAmount = roundCurrencyServer(totalRecordedCashAmount + item.recordedCashAmount);
+      byOriginCount[item.originClassification] += 1;
+      byOriginAmount[item.originClassification] = roundCurrencyServer(
+        byOriginAmount[item.originClassification] + item.totalAmount
+      );
+    }
+
+    const sliced = items.slice(0, maxItems);
+    return {
+      count: items.length,
+      returnedCount: sliced.length,
+      truncated: items.length > sliced.length,
+      totalOrderAmount,
+      totalRecordedCashAmount,
+      byOrigin: {
+        counts: byOriginCount,
+        amounts: byOriginAmount,
+      },
+      items: sliced,
+    };
+  }
+
+  app.get(['/api/admin/financial-audit', '/admin/financial-audit'], async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    try {
+      const auth = await verifyStaffAuth(req);
+      if (!auth.uid || !auth.token) {
+        res.status(401).json({
+          success: false,
+          code: 'UNAUTHENTICATED',
+          message: 'Autenticação obrigatória para executar a auditoria financeira.',
+        });
+        return;
+      }
+
+      if (!auth.isStaff || auth.role.toUpperCase() !== 'ADMINISTRADOR') {
+        res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
+          message: 'Acesso negado: apenas ADMINISTRADOR ativo pode executar a auditoria financeira.',
+        });
+        return;
+      }
+
+      if (!adminDb) {
+        res.status(503).json({
+          success: false,
+          code: 'ADMIN_SDK_UNAVAILABLE',
+          message: 'Auditoria indisponível: Firebase Admin SDK não configurado no servidor.',
+        });
+        return;
+      }
+
+      // Authoritative server-side re-verification of UID and ADMINISTRADOR role directly in Firestore
+      const adminUserSnap = await adminDb.collection('users').doc(auth.uid).get();
+      if (!adminUserSnap.exists) {
+        res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
+          message: 'Acesso negado: perfil administrativo não encontrado no servidor.',
+        });
+        return;
+      }
+      const adminUserData = (adminUserSnap.data() || {}) as Record<string, any>;
+      const adminProfileStatus = String(adminUserData.status || 'ATIVO').trim().toUpperCase();
+      const adminProfileRole = String(adminUserData.role || '').trim().toUpperCase();
+      const adminProvState = adminUserData.provisioningState;
+      if (
+        (adminProvState !== undefined && adminProvState !== 'ACTIVE') ||
+        adminProfileStatus !== 'ATIVO' ||
+        (adminProfileRole !== 'ADMINISTRADOR' && adminProfileRole !== 'ADMIN')
+      ) {
+        res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN',
+          message: 'Acesso negado: somente ADMINISTRADOR ativo tem permissão para esta auditoria.',
+        });
+        return;
+      }
+
+      // Bounded response limit per group (default 500, max 2000) — totals always cover 100% of records
+      const rawLimit = typeof req.query?.limit === 'string' ? Number.parseInt(req.query.limit, 10) : 500;
+      const maxItemsPerGroup =
+        Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, 2000) : 500;
+
+      // Exclusively READ-ONLY .get() queries
+      const [ordersSnap, shiftsSnap] = await Promise.all([
+        adminDb.collection('orders').get(),
+        adminDb.collection('cash_shifts').get(),
+      ]);
+
+      // 1. Index all cash_shifts and all VENDA / ESTORNO movements (deduplicated by shiftId + movementId)
+      const shiftsById = new Map<
+        string,
+        {
+          id: string;
+          status: string;
+          openedAt: string | null;
+          closedAt: string | null;
+          openedAtMs: number | null;
+          vendaCount: number;
+          vendaTotalAmount: number;
+        }
+      >();
+      const vendaByOrderId = new Map<string, Map<string, IndexedCashVendaMovement>>();
+      const vendaByShiftAndMovementId = new Map<string, IndexedCashVendaMovement>();
+      const vendaByMovementId = new Map<string, IndexedCashVendaMovement[]>();
+      const allUniqueVendas = new Map<string, IndexedCashVendaMovement>();
+      const refundByOrderId = new Map<string, number>();
+
+      const addVendaOrderIndex = (orderIdKey: string, entry: IndexedCashVendaMovement) => {
+        if (!orderIdKey) return;
+        let bucket = vendaByOrderId.get(orderIdKey);
+        if (!bucket) {
+          bucket = new Map<string, IndexedCashVendaMovement>();
+          vendaByOrderId.set(orderIdKey, bucket);
+        }
+        bucket.set(entry.canonicalKey, entry);
+      };
+
+      shiftsSnap.forEach((docSnap) => {
+        const sData = (docSnap.data() || {}) as Record<string, any>;
+        const shiftId = docSnap.id;
+        const shiftStatus = String(sData.status || 'DESCONHECIDO').trim().toUpperCase();
+        const shiftOpenedAt = typeof sData.openedAt === 'string' ? sData.openedAt : null;
+        const shiftClosedAt = typeof sData.closedAt === 'string' ? sData.closedAt : null;
+        const shiftOpenedAtMs = parseIsoTimestampMs(shiftOpenedAt);
+        const movs = Array.isArray(sData.movements) ? sData.movements : [];
+
+        let shiftVendaCount = 0;
+        let shiftVendaTotal = 0;
+
+        movs.forEach((m: any, idx: number) => {
+          if (!m || typeof m !== 'object') return;
+          const mType = String(m.type || '').trim().toUpperCase();
+          const movId = typeof m.id === 'string' && m.id.trim() ? m.id.trim() : null;
+          const movOrderId = typeof m.orderId === 'string' && m.orderId.trim() ? m.orderId.trim() : null;
+
+          if (mType === 'ESTORNO') {
+            const refundOid =
+              movOrderId ||
+              (movId && movId.startsWith('cash-estorno-') ? movId.slice('cash-estorno-'.length) : '');
+            if (refundOid) {
+              refundByOrderId.set(refundOid, (refundByOrderId.get(refundOid) || 0) + 1);
+            }
+            return;
+          }
+
+          if (mType !== 'VENDA') return;
+
+          const canonicalKey = `${shiftId}::${movId || `idx-${idx}`}`;
+          const amount = roundCurrencyServer(Number(m.amount) || 0);
+          const indexed: IndexedCashVendaMovement = {
+            canonicalKey,
+            shiftId,
+            shiftStatus,
+            shiftOpenedAt,
+            shiftClosedAt,
+            shiftOpenedAtMs,
+            movementId: movId,
+            orderId: movOrderId,
+            amount,
+            paymentMethod: typeof m.paymentMethod === 'string' ? m.paymentMethod : null,
+            timestamp: typeof m.timestamp === 'string' ? m.timestamp : null,
+          };
+
+          if (!allUniqueVendas.has(canonicalKey)) {
+            allUniqueVendas.set(canonicalKey, indexed);
+            shiftVendaCount += 1;
+            shiftVendaTotal = roundCurrencyServer(shiftVendaTotal + amount);
+          }
+
+          if (movOrderId) {
+            addVendaOrderIndex(movOrderId, indexed);
+          }
+          if (movId && movId.startsWith('cash-sale-')) {
+            const derivedOrderId = movId.slice('cash-sale-'.length).trim();
+            if (derivedOrderId) {
+              addVendaOrderIndex(derivedOrderId, indexed);
+            }
+          }
+          if (movId) {
+            vendaByShiftAndMovementId.set(`${shiftId}::${movId}`, indexed);
+            const list = vendaByMovementId.get(movId) || [];
+            if (!list.some((x) => x.canonicalKey === canonicalKey)) {
+              list.push(indexed);
+              vendaByMovementId.set(movId, list);
+            }
+          }
+        });
+
+        shiftsById.set(shiftId, {
+          id: shiftId,
+          status: shiftStatus,
+          openedAt: shiftOpenedAt,
+          closedAt: shiftClosedAt,
+          openedAtMs: shiftOpenedAtMs,
+          vendaCount: shiftVendaCount,
+          vendaTotalAmount: shiftVendaTotal,
+        });
+      });
+
+      // 2. Cross-reference every order with deduplicated VENDA movements
+      const groupA_deliveredPendingWithoutMovement: FinancialAuditOrderEntry[] = [];
+      const groupB_paidWithoutMovement: FinancialAuditOrderEntry[] = [];
+      const groupC_movementInLaterShift: FinancialAuditOrderEntry[] = [];
+      const groupD_cancelledOrders: FinancialAuditOrderEntry[] = [];
+      const groupE_consistentWithMovement: FinancialAuditOrderEntry[] = [];
+      const groupF_probablePublicMenuWithoutDefinitiveOrigin: FinancialAuditOrderEntry[] = [];
+      const otherNonCancelledOrders: FinancialAuditOrderEntry[] = [];
+
+      const matchedCanonicalMovementKeys = new Set<string>();
+      const orderDocs: Array<{ id: string; data: Record<string, any> }> = [];
+      ordersSnap.forEach((docSnap) => {
+        orderDocs.push({ id: docSnap.id, data: (docSnap.data() || {}) as Record<string, any> });
+      });
+      orderDocs.sort((a, b) => String(b.data.createdAt || '').localeCompare(String(a.data.createdAt || '')));
+
+      for (const { id: orderId, data: o } of orderDocs) {
+        const status = String(o.status || 'DESCONHECIDO').trim().toUpperCase();
+        const paymentStatus = String(o.paymentStatus || 'PENDENTE').trim().toUpperCase();
+        const paymentMethod = typeof o.paymentMethod === 'string' ? o.paymentMethod : null;
+        const createdAt = typeof o.createdAt === 'string' ? o.createdAt : null;
+        const updatedAt = typeof o.updatedAt === 'string' ? o.updatedAt : null;
+        const createdAtMs = parseIsoTimestampMs(createdAt);
+        const totalAmount = roundCurrencyServer(Number(o.totalAmount) || 0);
+        const saleCashShiftId =
+          typeof o.saleCashShiftId === 'string' && o.saleCashShiftId.trim() ? o.saleCashShiftId.trim() : null;
+        const saleCashMovementId =
+          typeof o.saleCashMovementId === 'string' && o.saleCashMovementId.trim() ? o.saleCashMovementId.trim() : null;
+
+        // Deduplicated set of VENDA movements matching this order across all 4 reference keys
+        const matchedMap = new Map<string, IndexedCashVendaMovement>();
+        const byOrderBucket = vendaByOrderId.get(orderId);
+        if (byOrderBucket) {
+          for (const [k, v] of byOrderBucket.entries()) {
+            matchedMap.set(k, v);
+          }
+        }
+        const deterministicBucket = vendaByMovementId.get(`cash-sale-${orderId}`);
+        if (deterministicBucket) {
+          for (const v of deterministicBucket) {
+            matchedMap.set(v.canonicalKey, v);
+          }
+        }
+        if (saleCashMovementId) {
+          if (saleCashShiftId) {
+            const exact = vendaByShiftAndMovementId.get(`${saleCashShiftId}::${saleCashMovementId}`);
+            if (exact) {
+              matchedMap.set(exact.canonicalKey, exact);
+            }
+          }
+          const byMovId = vendaByMovementId.get(saleCashMovementId);
+          if (byMovId) {
+            for (const v of byMovId) {
+              matchedMap.set(v.canonicalKey, v);
+            }
+          }
+        }
+
+        const matchedMovements = Array.from(matchedMap.values());
+        for (const m of matchedMovements) {
+          matchedCanonicalMovementKeys.add(m.canonicalKey);
+        }
+
+        const hasFinancialMovement = matchedMovements.length > 0;
+        const recordedCashAmount = roundCurrencyServer(
+          matchedMovements.reduce((sum, m) => sum + m.amount, 0)
+        );
+
+        const relatedShiftSet = new Set<string>();
+        for (const m of matchedMovements) relatedShiftSet.add(m.shiftId);
+        if (saleCashShiftId) relatedShiftSet.add(saleCashShiftId);
+
+        const inconsistencies: string[] = [];
+        const registeredInLaterShift =
+          createdAtMs !== null &&
+          matchedMovements.some((m) => m.shiftOpenedAtMs !== null && m.shiftOpenedAtMs > createdAtMs);
+
+        if (registeredInLaterShift) {
+          inconsistencies.push('MOVEMENT_IN_LATER_SHIFT');
+        }
+        if (matchedMovements.length > 1) {
+          inconsistencies.push(`DUPLICATE_CASH_MOVEMENTS(${matchedMovements.length})`);
+        }
+        if (hasFinancialMovement && Math.abs(recordedCashAmount - totalAmount) > 0.01) {
+          inconsistencies.push(
+            `AMOUNT_MISMATCH(order=${totalAmount.toFixed(2)},cash=${recordedCashAmount.toFixed(2)})`
+          );
+        }
+        if ((saleCashShiftId || saleCashMovementId) && !hasFinancialMovement) {
+          inconsistencies.push('ORPHAN_SALE_CASH_REFERENCE');
+        }
+        if (status !== 'CANCELADO' && paymentStatus === 'PENDENTE' && hasFinancialMovement) {
+          inconsistencies.push('PENDING_PAYMENT_WITH_CASH_MOVEMENT');
+        }
+        if (status === 'CANCELADO' && hasFinancialMovement && !refundByOrderId.has(orderId)) {
+          inconsistencies.push('CANCELLED_WITH_SALE_AND_NO_REFUND');
+        }
+
+        const origin = classifyAuditOrderOrigin(o);
+
+        const entry: FinancialAuditOrderEntry = {
+          orderId,
+          orderNumber: typeof o.orderNumber === 'string' ? o.orderNumber : null,
+          createdAt,
+          updatedAt,
+          totalAmount,
+          paymentMethod,
+          status,
+          paymentStatus,
+          originClassification: origin.originClassification,
+          originIsDefinitive: origin.originIsDefinitive,
+          originNote: origin.originNote,
+          originEvidence: origin.originEvidence,
+          saleCashShiftId,
+          saleCashMovementId,
+          relatedShiftIds: Array.from(relatedShiftSet),
+          hasFinancialMovement,
+          matchedMovementCount: matchedMovements.length,
+          recordedCashAmount,
+          matchedMovements: matchedMovements.map((m) => ({
+            shiftId: m.shiftId,
+            shiftStatus: m.shiftStatus,
+            shiftOpenedAt: m.shiftOpenedAt,
+            shiftClosedAt: m.shiftClosedAt,
+            movementId: m.movementId,
+            amount: m.amount,
+            paymentMethod: m.paymentMethod,
+            timestamp: m.timestamp,
+          })),
+          inconsistencies,
+        };
+
+        // Group F tracks all orders whose probable origin is public menu without definitive source field
+        if (origin.originClassification === 'PROVAVEL_CARDAPIO_PUBLICO' && !origin.originIsDefinitive) {
+          groupF_probablePublicMenuWithoutDefinitiveOrigin.push(entry);
+        }
+
+        // Primary mutually exclusive classification across A, B, C, D, E (+ active/in-progress pending)
+        if (status === 'CANCELADO') {
+          groupD_cancelledOrders.push(entry);
+        } else if (status === 'ENTREGUE' && paymentStatus === 'PENDENTE' && !hasFinancialMovement) {
+          groupA_deliveredPendingWithoutMovement.push(entry);
+        } else if (paymentStatus === 'PAGO' && !hasFinancialMovement) {
+          groupB_paidWithoutMovement.push(entry);
+        } else if (hasFinancialMovement && registeredInLaterShift) {
+          groupC_movementInLaterShift.push(entry);
+        } else if (paymentStatus === 'PAGO' && hasFinancialMovement && !registeredInLaterShift) {
+          groupE_consistentWithMovement.push(entry);
+        } else {
+          otherNonCancelledOrders.push(entry);
+        }
+      }
+
+      // Identify any VENDA movements in cash_shifts whose orderId was not found in 'orders' (orphan cash sales)
+      const unmatchedCashSales: Array<{
+        shiftId: string;
+        shiftStatus: string;
+        movementId: string | null;
+        orderId: string | null;
+        amount: number;
+        paymentMethod: string | null;
+        timestamp: string | null;
+      }> = [];
+      let unmatchedCashSalesTotal = 0;
+      for (const [k, m] of allUniqueVendas.entries()) {
+        if (!matchedCanonicalMovementKeys.has(k)) {
+          unmatchedCashSalesTotal = roundCurrencyServer(unmatchedCashSalesTotal + m.amount);
+          unmatchedCashSales.push({
+            shiftId: m.shiftId,
+            shiftStatus: m.shiftStatus,
+            movementId: m.movementId,
+            orderId: m.orderId,
+            amount: m.amount,
+            paymentMethod: m.paymentMethod,
+            timestamp: m.timestamp,
+          });
+        }
+      }
+
+      // Compute non-duplicated global totals
+      const totalUniqueVendaAmountAcrossShifts = roundCurrencyServer(
+        Array.from(allUniqueVendas.values()).reduce((sum, m) => sum + m.amount, 0)
+      );
+      const nonCancelledOrdersCount = orderDocs.length - groupD_cancelledOrders.length;
+      const nonCancelledOrdersTotalAmount = roundCurrencyServer(
+        [
+          ...groupA_deliveredPendingWithoutMovement,
+          ...groupB_paidWithoutMovement,
+          ...groupC_movementInLaterShift,
+          ...groupE_consistentWithMovement,
+          ...otherNonCancelledOrders,
+        ].reduce((sum, item) => sum + item.totalAmount, 0)
+      );
+      const potentiallyUnrecordedRevenue = roundCurrencyServer(
+        groupA_deliveredPendingWithoutMovement.reduce((sum, item) => sum + item.totalAmount, 0) +
+          groupB_paidWithoutMovement.reduce((sum, item) => sum + item.totalAmount, 0)
+      );
+      const probablePublicNonCancelled = groupF_probablePublicMenuWithoutDefinitiveOrigin.filter(
+        (item) => item.status !== 'CANCELADO'
+      );
+      const probablePublicMissingCash = probablePublicNonCancelled.filter((item) => !item.hasFinancialMovement);
+
+      const allShiftsSummary = Array.from(shiftsById.values()).sort((a, b) =>
+        String(b.openedAt || '').localeCompare(String(a.openedAt || ''))
+      );
+
+      res.json({
+        success: true,
+        readOnly: true,
+        generatedAt: new Date().toISOString(),
+        executedByUid: auth.uid,
+        maxItemsPerGroup,
+        overview: {
+          totalOrdersScanned: orderDocs.length,
+          nonCancelledOrdersCount,
+          nonCancelledOrdersTotalAmount,
+          cancelledOrdersCount: groupD_cancelledOrders.length,
+          totalShiftsScanned: shiftsById.size,
+          openShiftsCount: allShiftsSummary.filter((s) => s.status === 'ABERTO').length,
+          totalUniqueVendaMovements: allUniqueVendas.size,
+          totalUniqueVendaAmountAcrossShifts,
+          potentiallyUnrecordedOrderCount:
+            groupA_deliveredPendingWithoutMovement.length + groupB_paidWithoutMovement.length,
+          potentiallyUnrecordedRevenue,
+          probablePublicMenuNonCancelledCount: probablePublicNonCancelled.length,
+          probablePublicMenuMissingCashCount: probablePublicMissingCash.length,
+          probablePublicMenuMissingCashAmount: roundCurrencyServer(
+            probablePublicMissingCash.reduce((sum, item) => sum + item.totalAmount, 0)
+          ),
+          unmatchedCashSalesCount: unmatchedCashSales.length,
+          unmatchedCashSalesTotal,
+        },
+        groups: {
+          A_deliveredPendingWithoutMovement: summarizeAuditGroup(
+            groupA_deliveredPendingWithoutMovement,
+            maxItemsPerGroup
+          ),
+          B_paidWithoutMovement: summarizeAuditGroup(groupB_paidWithoutMovement, maxItemsPerGroup),
+          C_movementInLaterShift: summarizeAuditGroup(groupC_movementInLaterShift, maxItemsPerGroup),
+          D_cancelledOrders: summarizeAuditGroup(groupD_cancelledOrders, maxItemsPerGroup),
+          E_consistentWithMovement: summarizeAuditGroup(groupE_consistentWithMovement, maxItemsPerGroup),
+          F_probablePublicMenuWithoutDefinitiveOrigin: {
+            ...summarizeAuditGroup(groupF_probablePublicMenuWithoutDefinitiveOrigin, maxItemsPerGroup),
+            nonCancelledCount: probablePublicNonCancelled.length,
+            nonCancelledTotalAmount: roundCurrencyServer(
+              probablePublicNonCancelled.reduce((sum, item) => sum + item.totalAmount, 0)
+            ),
+            missingCashCount: probablePublicMissingCash.length,
+            missingCashAmount: roundCurrencyServer(
+              probablePublicMissingCash.reduce((sum, item) => sum + item.totalAmount, 0)
+            ),
+          },
+          otherNonCancelledOrders: summarizeAuditGroup(otherNonCancelledOrders, maxItemsPerGroup),
+        },
+        unmatchedCashSales: {
+          count: unmatchedCashSales.length,
+          returnedCount: Math.min(unmatchedCashSales.length, maxItemsPerGroup),
+          truncated: unmatchedCashSales.length > maxItemsPerGroup,
+          totalAmount: unmatchedCashSalesTotal,
+          items: unmatchedCashSales.slice(0, maxItemsPerGroup),
+        },
+        shiftsSummary: allShiftsSummary.slice(0, 100),
+      });
+    } catch (err: unknown) {
+      console.error(
+        '[Admin Financial Audit] Read-only audit failure:',
+        err instanceof Error ? err.message : String(err)
+      );
+      res.status(500).json({
+        success: false,
+        code: 'FINANCIAL_AUDIT_ERROR',
+        message: 'Erro interno ao executar a auditoria financeira somente leitura.',
+      });
+    }
+  });
+
   // Fallback for unhandled API endpoints: returns guaranteed JSON 404
-  app.all(['/api/*', '/push/*', '/orders/*', '/auth/*'], (_req: Request, res: Response) => {
+  app.all(['/api/*', '/push/*', '/orders/*', '/auth/*', '/admin/*'], (_req: Request, res: Response) => {
     res.status(404).json({ success: false, message: 'Rota de API não encontrada no servidor.' });
   });
 

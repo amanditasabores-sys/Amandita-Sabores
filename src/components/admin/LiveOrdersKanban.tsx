@@ -1463,59 +1463,55 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
 
       {/* PRINTABLE THERMAL RECEIPT / COMANDA WITH QR CODE */}
       {printableOrder && (
-        <div id="printable-receipt" className="hidden print:block text-black bg-white font-mono text-[12px] p-2 max-w-[80mm]">
-          <div className="text-center pb-2 border-b border-black">
-            <h2 className="font-bold text-base">{config.name}</h2>
-            <p className="text-[10px]">{config.phone}</p>
-            <p className="text-[10px]">{config.address}</p>
-            <div className="my-2 py-1 border-y border-dashed border-black font-bold text-lg">
-              {printableOrder.orderNumber}
+        <div id="printable-receipt" className="hidden print:block text-black bg-white font-mono text-[11px] leading-[1.12] p-0.5 max-w-[80mm]">
+          <div className="text-center pb-1 border-b border-black">
+            <h2 className="font-bold text-sm leading-tight">{config.name}</h2>
+            <p className="text-[10px]">{config.phone} | {config.address}</p>
+            <div className="my-1 py-0.5 border-y border-dashed border-black font-bold text-base leading-tight">
+              {printableOrder.orderNumber} <span className="text-[11px] font-normal">({formatDateTime(printableOrder.createdAt)})</span>
             </div>
-            <p className="text-[11px]">{formatDateTime(printableOrder.createdAt)}</p>
           </div>
 
-          <div className="py-2 border-b border-dashed border-black text-left">
-            <p className="font-bold text-[13px]">CLIENTE: {printableOrder.customer.name}</p>
-            <p>TEL: {printableOrder.customer.phone}</p>
+          <div className="py-1 border-b border-dashed border-black text-left">
+            <p className="font-bold text-[12px]">CLIENTE: {printableOrder.customer.name} {printableOrder.customer.phone ? `(${printableOrder.customer.phone})` : ''}</p>
             {printableOrder.fulfillmentType === 'RETIRADA' || !printableOrder.customer.address ? (
-              <p className="font-bold mt-1 text-[13px]">*** RETIRADA NO BALCÃO ***</p>
+              <p className="font-bold mt-0.5 text-[12px]">*** RETIRADA NO BALCÃO ***</p>
             ) : (
               (() => {
                 const addrInfo = formatAddressDetails(printableOrder.customer.address);
                 return (
-                  <>
-                    <p className="font-bold mt-1">ENDEREÇO:</p>
-                    <p>{addrInfo.primaryLine}</p>
+                  <div className="mt-0.5">
+                    <p><span className="font-bold">ENDEREÇO:</span> {addrInfo.primaryLine}</p>
                     {addrInfo.secondaryLine && <p>{addrInfo.secondaryLine}</p>}
                     {addrInfo.referenceLine && <p>REF: {addrInfo.referenceLine}</p>}
-                  </>
+                  </div>
                 );
               })()
             )}
             {printableOrder.customer.notes && (
-              <p className="mt-1 font-bold">OBS: {printableOrder.customer.notes}</p>
+              <p className="mt-0.5 font-bold">OBS: {printableOrder.customer.notes}</p>
             )}
           </div>
 
-          <div className="py-2 border-b border-dashed border-black">
-            <p className="font-bold mb-1">ITENS DO PEDIDO:</p>
+          <div className="py-1 border-b border-dashed border-black">
+            <p className="font-bold mb-0.5">ITENS DO PEDIDO:</p>
             {printableOrder.items.map((it) => (
-              <div key={it.id} className="mb-1.5">
+              <div key={it.id} className="mb-0.5">
                 <div className="flex justify-between font-bold">
                   <span>{it.quantity}x {it.name}</span>
                   <span>{formatCurrency(it.subtotal)}</span>
                 </div>
                 {it.addons && it.addons.length > 0 && (
-                  <p className="text-[10px] ml-3">+ {it.addons.map((a) => a.name).join(', ')}</p>
+                  <p className="text-[10px] ml-2">+ {it.addons.map((a) => a.name).join(', ')}</p>
                 )}
                 {it.notes && (
-                  <p className="text-[10px] ml-3 italic">Obs: {it.notes}</p>
+                  <p className="text-[10px] ml-2 italic">Obs: {it.notes}</p>
                 )}
               </div>
             ))}
           </div>
 
-          <div className="py-2 border-b border-black space-y-0.5">
+          <div className="py-1 border-b border-black">
             <div className="flex justify-between">
               <span>SUBTOTAL:</span>
               <span>{formatCurrency(printableOrder.subtotal)}</span>
@@ -1524,29 +1520,29 @@ export const LiveOrdersKanban: React.FC<LiveOrdersKanbanProps> = ({ orders, onOr
               <span>TAXA ENTREGA:</span>
               <span>{formatCurrency(printableOrder.deliveryFee)}</span>
             </div>
-            <div className="flex justify-between font-bold text-sm pt-1 border-t border-dashed border-black">
+            <div className="flex justify-between font-bold text-sm pt-0.5 mt-0.5 border-t border-dashed border-black">
               <span>TOTAL:</span>
               <span>{formatCurrency(printableOrder.totalAmount)}</span>
             </div>
-            <div className="mt-1 font-bold text-[11px]">
+            <div className="mt-0.5 font-bold text-[11px]">
               PAGAMENTO: {getPaymentMethodLabel(printableOrder.paymentMethod)}
               {printableOrder.paymentChangeFor ? ` (Troco para ${formatCurrency(printableOrder.paymentChangeFor)})` : ''}
             </div>
           </div>
 
           {/* QR CODE FOR DELIVERY PERSON TO SCAN */}
-          <div className="text-center pt-3">
-            <p className="text-[10px] font-bold mb-1 uppercase tracking-wider">
+          <div className="text-center pt-1.5">
+            <p className="text-[9.5px] font-bold mb-0.5 uppercase tracking-wide">
               QR CODE PARA O ENTREGADOR ESCANEAR:
             </p>
             {receiptQrCode && (
               <img
                 src={receiptQrCode}
                 alt="QR Code Pedido"
-                className="w-36 h-36 mx-auto border border-black p-1"
+                className="w-28 h-28 mx-auto border border-black p-0.5"
               />
             )}
-            <p className="text-[9px] mt-1">O motoboy escaneia para ver endereço e confirmar entrega</p>
+            <p className="text-[9px] mt-0.5">O motoboy escaneia para ver endereço e confirmar entrega</p>
           </div>
         </div>
       )}

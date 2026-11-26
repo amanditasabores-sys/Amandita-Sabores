@@ -2420,55 +2420,51 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
 
       {/* PRINTABLE RECEIPT TEMPLATE (80mm) */}
       {printableOrder && (
-        <div id="printable-receipt" className="hidden font-mono text-[12px] leading-tight text-black">
-          <div className="text-center pb-2 border-b border-dashed border-black">
-            <h2 className="font-extrabold text-[15px]">{config.name}</h2>
-            <p className="text-[11px]">Tradição & Afeto Artesanal</p>
-            <p>{config.address}</p>
-            <p>TEL: {config.phone}</p>
+        <div id="printable-receipt" className="hidden font-mono text-[11px] leading-[1.12] text-black">
+          <div className="text-center pb-1 border-b border-dashed border-black">
+            <h2 className="font-extrabold text-[13px]">{config.name} - Tradição & Afeto Artesanal</h2>
+            <p className="text-[10px]">{config.address} | TEL: {config.phone}</p>
           </div>
 
-          <div className="py-2 border-b border-dashed border-black">
-            <p className="font-bold text-[14px]">CUPOM NÃO FISCAL - PEDIDO {printableOrder.orderNumber}</p>
-            <p>DATA: {formatDateTime(printableOrder.createdAt)}</p>
-            <p>OPERADOR: {operatorName}</p>
-            <p>CLIENTE: {printableOrder.customer.name}</p>
-            {printableOrder.customer.phone && <p>TEL: {printableOrder.customer.phone}</p>}
+          <div className="py-1 border-b border-dashed border-black">
+            <p className="font-bold text-[12px]">CUPOM NÃO FISCAL - PEDIDO {printableOrder.orderNumber}</p>
+            <p>DATA: {formatDateTime(printableOrder.createdAt)} | OP: {operatorName}</p>
+            <p>CLIENTE: {printableOrder.customer.name}{printableOrder.customer.phone ? ` | TEL: ${printableOrder.customer.phone}` : ''}</p>
             <p>TIPO: {printableOrder.fulfillmentType === 'RETIRADA' ? 'BALCÃO / RETIRADA' : 'DELIVERY'}</p>
             {printableOrder.fulfillmentType === 'DELIVERY' && printableOrder.customer.address && (() => {
               const addr = formatAddressDetails(printableOrder.customer.address);
               return (
-                <div className="space-y-0.5">
+                <div>
                   <p className="font-bold">ENTREGA: {addr.primaryLine}</p>
                   {addr.secondaryLine && <p>{addr.secondaryLine}</p>}
                   {addr.referenceLine && (
-                    <p className="text-[11px] italic">REF: {addr.referenceLine}</p>
+                    <p className="text-[10px] italic">REF: {addr.referenceLine}</p>
                   )}
                 </div>
               );
             })()}
           </div>
 
-          <div className="py-2 border-b border-dashed border-black space-y-1">
-            <div className="flex justify-between font-bold border-b border-dotted border-black pb-1">
+          <div className="py-1 border-b border-dashed border-black space-y-0.5">
+            <div className="flex justify-between font-bold border-b border-dotted border-black pb-0.5">
               <span>QTD ITEM</span>
               <span>TOTAL</span>
             </div>
             {printableOrder.items.map((i) => (
               <div key={i.id} className="text-[11px]">
-                <div className="flex justify-between">
+                <div className="flex justify-between font-semibold">
                   <span>{i.quantity}x {i.name}</span>
                   <span>{formatCurrency(i.subtotal)}</span>
                 </div>
-                {i.addons && i.addons.map((a) => (
-                  <p key={a.id} className="text-[10px] pl-2">+ {a.name}</p>
-                ))}
-                {i.notes && <p className="text-[10px] pl-2 italic">Obs: {i.notes}</p>}
+                {i.addons && i.addons.length > 0 && (
+                  <p className="text-[10px] pl-1.5">+ {i.addons.map((a) => a.name).join(', ')}</p>
+                )}
+                {i.notes && <p className="text-[10px] pl-1.5 italic">Obs: {i.notes}</p>}
               </div>
             ))}
           </div>
 
-          <div className="py-2 border-b border-dashed border-black space-y-0.5">
+          <div className="py-1 border-b border-dashed border-black">
             <div className="flex justify-between">
               <span>SUBTOTAL:</span>
               <span>{formatCurrency(printableOrder.subtotal)}</span>
@@ -2485,31 +2481,24 @@ export const PointOfSale: React.FC<PointOfSaleProps> = ({ currentUser, onOrderCr
                 <span>+ {formatCurrency(printableOrder.deliveryFee)}</span>
               </div>
             )}
-            <div className="flex justify-between font-extrabold text-[14px] pt-1 border-t border-black">
+            <div className="flex justify-between font-extrabold text-[13px] pt-0.5 mt-0.5 border-t border-black">
               <span>TOTAL:</span>
               <span>{formatCurrency(printableOrder.totalAmount)}</span>
             </div>
-            <div className="flex justify-between pt-1">
+            <div className="flex justify-between pt-0.5">
               <span>PAGAMENTO:</span>
               <span>{getPaymentMethodLabel(printableOrder.paymentMethod)}</span>
             </div>
             {printableOrder.paymentChangeFor && printableOrder.paymentChangeFor > printableOrder.totalAmount && (
-              <>
-                <div className="flex justify-between text-[11px]">
-                  <span>PAGO EM DINHEIRO:</span>
-                  <span>{formatCurrency(printableOrder.paymentChangeFor)}</span>
-                </div>
-                <div className="flex justify-between font-bold text-[12px]">
-                  <span>TROCO:</span>
-                  <span>{formatCurrency(printableOrder.paymentChangeFor - printableOrder.totalAmount)}</span>
-                </div>
-              </>
+              <div className="flex justify-between font-bold text-[11px]">
+                <span>PAGO EM DINHEIRO: {formatCurrency(printableOrder.paymentChangeFor)}</span>
+                <span>TROCO: {formatCurrency(printableOrder.paymentChangeFor - printableOrder.totalAmount)}</span>
+              </div>
             )}
           </div>
 
-          <div className="text-center pt-3 text-[11px]">
-            <p>Agradecemos a preferência!</p>
-            <p className="font-bold">Amandita Sabores</p>
+          <div className="text-center pt-1 text-[10.5px]">
+            <p>Agradecemos a preferência! <span className="font-bold">Amandita Sabores</span></p>
           </div>
         </div>
       )}

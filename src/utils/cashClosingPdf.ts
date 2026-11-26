@@ -737,6 +737,77 @@ export function generateCashClosingPdfBytes(report: CashClosingReportData): Uint
     doc.advanceY(noteLineHeight);
   }
 
+  // Seção 5A (Turno Aberto): Pedidos entregues com pagamento pendente (NÃO recebidos)
+  if (report.pendingDeliveredSummary && report.pendingDeliveredSummary.count > 0) {
+    doc.advanceY(12);
+    doc.ensureSpace(64);
+    doc.drawText('PEDIDOS ENTREGUES — PENDENTES DE PAGAMENTO (NÃO RECEBIDOS)', MARGIN_LEFT, doc.getY() - 10, {
+      fontSize: 9.5,
+      bold: true,
+      color: COLOR_AMBER_DARK,
+    });
+    doc.advanceY(15);
+    doc.drawLine(MARGIN_LEFT, doc.getY(), PAGE_WIDTH - MARGIN_RIGHT, [0.92, 0.72, 0.35], 0.8);
+    doc.advanceY(9);
+
+    doc.drawKeyValueRow(
+      `Total pendente (${report.pendingDeliveredSummary.count} pedido(s) — fora do faturamento e da gaveta):`,
+      formatReportCurrency(report.pendingDeliveredSummary.totalAmount),
+      { fontSize: 9.2, boldLabel: true, boldValue: true, labelColor: COLOR_AMBER_DARK, valueColor: COLOR_AMBER_DARK }
+    );
+
+    for (const item of report.pendingDeliveredSummary.orders) {
+      doc.drawKeyValueRow(
+        `${item.orderNumber} (${item.orderId}) — ${item.customerName} [${item.paymentMethod}]`,
+        formatReportCurrency(item.totalAmount),
+        { fontSize: 8.6, indent: 6, rowHeight: 15, labelColor: COLOR_SLATE_700, valueColor: COLOR_AMBER_DARK }
+      );
+    }
+  }
+
+  // Seção 5B (Caixa Fechado): Pendências encerradas excepcionalmente com justificativa (NÃO recebidas)
+  if (report.exceptionalPendingJustifications && report.exceptionalPendingJustifications.length > 0) {
+    const excTotal = report.exceptionalPendingJustifications.reduce((acc, r) => acc + (Number(r.amount) || 0), 0);
+    doc.advanceY(12);
+    doc.ensureSpace(72);
+    doc.drawText('PENDÊNCIAS ENCERRADAS EXCEPCIONALMENTE (NÃO RECEBIDAS)', MARGIN_LEFT, doc.getY() - 10, {
+      fontSize: 9.5,
+      bold: true,
+      color: COLOR_ROSE,
+    });
+    doc.advanceY(15);
+    doc.drawLine(MARGIN_LEFT, doc.getY(), PAGE_WIDTH - MARGIN_RIGHT, COLOR_ROSE, 0.8);
+    doc.advanceY(9);
+
+    doc.drawKeyValueRow(
+      `Pendências justificadas (${report.exceptionalPendingJustifications.length} pedido(s) — NÃO computado como venda):`,
+      formatReportCurrency(excTotal),
+      { fontSize: 9.2, boldLabel: true, boldValue: true, labelColor: COLOR_ROSE, valueColor: COLOR_ROSE }
+    );
+
+    for (const rec of report.exceptionalPendingJustifications) {
+      doc.ensureSpace(44);
+      doc.drawKeyValueRow(
+        `${rec.orderNumber} (${rec.orderId}) [${rec.paymentMethod}]`,
+        formatReportCurrency(rec.amount),
+        { fontSize: 8.8, boldLabel: true, boldValue: true, indent: 6, rowHeight: 15, labelColor: COLOR_SLATE_900, valueColor: COLOR_ROSE }
+      );
+      const reasonLine = `Motivo: ${rec.reasonLabel}${rec.reasonDetail ? ` — ${rec.reasonDetail}` : ''}`;
+      for (const line of wrapPdfText(reasonLine, CONTENT_WIDTH - 16, 8.4, false)) {
+        doc.ensureSpace(14);
+        doc.drawText(line, MARGIN_LEFT + 10, doc.getY() - 8.4, { fontSize: 8.4, color: COLOR_SLATE_700 });
+        doc.advanceY(12);
+      }
+      const auditLine = `Responsável: ${rec.responsibleName} (UID: ${rec.responsibleUid}) | Registrado em: ${formatDateTime(rec.recordedAt)}`;
+      for (const line of wrapPdfText(auditLine, CONTENT_WIDTH - 16, 8.0, false)) {
+        doc.ensureSpace(13);
+        doc.drawText(line, MARGIN_LEFT + 10, doc.getY() - 8.0, { fontSize: 8.0, color: COLOR_SLATE_500 });
+        doc.advanceY(11.5);
+      }
+      doc.advanceY(4);
+    }
+  }
+
   return doc.buildPdfBytes();
 }
 

@@ -500,6 +500,67 @@ export interface CashMovement {
   originalMovementId?: string;
 }
 
+export type ExceptionalClosingReasonCode =
+  | 'CLIENTE_NAO_PAGOU'
+  | 'PIX_AGUARDANDO_EXTRATO'
+  | 'ENTREGADOR_SEM_PRESTACAO_CONTAS'
+  | 'PAGO_SEM_COMPROVANTE'
+  | 'OUTRA_SITUACAO';
+
+export interface ExceptionalClosingJustificationInput {
+  orderId: string;
+  reasonCode: ExceptionalClosingReasonCode;
+  reasonDetail?: string;
+}
+
+export interface ExceptionalClosingPendingRecord {
+  orderId: string;
+  orderNumber: string;
+  amount: number;
+  paymentMethod: PaymentMethod | string;
+  orderCreatedAt: string;
+  customerName?: string;
+  reasonCode: ExceptionalClosingReasonCode;
+  reasonLabel: string;
+  reasonDetail?: string;
+  responsibleUid: string;
+  responsibleName: string;
+  responsibleRole?: string;
+  recordedAt: string;
+  shiftId: string;
+}
+
+export interface CashPendingDeliveredOrder {
+  orderId: string;
+  orderNumber: string;
+  createdAt: string;
+  deliveredAt?: string;
+  totalAmount: number;
+  paymentMethod: PaymentMethod | string;
+  customerName: string;
+  origin?: string;
+  originLabel: string;
+  deliveryPersonId?: string;
+  deliveryPersonName?: string;
+  fulfillmentType?: FulfillmentType | string;
+  settlementStatus?: string;
+  settlementId?: string;
+}
+
+export interface CashShiftPendingSummary {
+  shiftId: string;
+  shiftStatus: 'ABERTO' | 'FECHADO';
+  shiftOpenedAt: string;
+  shiftClosedAt?: string;
+  checkedAt: string;
+  currentShiftPending: CashPendingDeliveredOrder[];
+  currentShiftPendingCount: number;
+  currentShiftPendingTotal: number;
+  previousShiftsPending: CashPendingDeliveredOrder[];
+  previousShiftsPendingCount: number;
+  previousShiftsPendingTotal: number;
+}
+
 export interface CashRegisterShift {
   id: string;
   openedAt: string;
@@ -507,11 +568,17 @@ export interface CashRegisterShift {
   status: 'ABERTO' | 'FECHADO';
   openedBy: string;
   closedBy?: string;
+  closedByUid?: string;
   initialBalance: number; // Fundo de troco inicial
   movements: CashMovement[];
   finalCalculatedBalance?: number;
   finalCountedCash?: number;
   difference?: number;
   notes?: string;
+  closedWithPendingOrders?: boolean;
+  pendingDeliveredAtCloseCount?: number;
+  pendingDeliveredAtCloseTotal?: number;
+  exceptionalPendingJustifications?: ExceptionalClosingPendingRecord[];
 }
+
 

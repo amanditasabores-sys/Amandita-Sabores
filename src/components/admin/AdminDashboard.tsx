@@ -12,6 +12,7 @@ import { QrCodeManager } from './QrCodeManager';
 import { CashRegisterManager } from './CashRegisterManager';
 import { StoreSettings } from './StoreSettings';
 import { StaffManager } from './StaffManager';
+import { FinancialAuditPanel } from './FinancialAuditPanel';
 import { AmanditaLogo } from '../common/AmanditaLogo';
 import { FloatingOrderAlert } from '../common/FloatingOrderAlert';
 import { 
@@ -30,7 +31,8 @@ import {
   Settings,
   Users,
   Store,
-  Layers
+  Layers,
+  FileSearch
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -48,6 +50,7 @@ type TabKey =
   | 'menu' 
   | 'usuarios' 
   | 'audit' 
+  | 'financial_audit'
   | 'qrcodes' 
   | 'settings';
 
@@ -60,7 +63,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
   const config = store.getRestaurantConfig();
 
   // All system tabs mapped to module permission keys
-  const allTabs: { id: TabKey; moduleKey: AppModule; label: string; icon: React.ComponentType<{ className?: string }>; badgeCount?: number }[] = [
+  const allTabs: { id: TabKey; moduleKey: AppModule; label: string; icon: React.ComponentType<{ className?: string }>; badgeCount?: number; adminOnly?: boolean }[] = [
     { id: 'pdv', moduleKey: 'pdv', label: 'PDV Balcão', icon: Store },
     { id: 'kanban', moduleKey: 'kanban', label: 'Gestão de Pedidos', icon: Layers, badgeCount: orders.filter((o) => o.status === 'NOVO').length },
     { id: 'kds', moduleKey: 'kds', label: 'Cozinha / KDS', icon: ChefHat, badgeCount: orders.filter((o) => o.status === 'EM_PREPARO').length },
@@ -69,21 +72,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
     { id: 'menu', moduleKey: 'menu', label: 'Cardápio Digital', icon: UtensilsCrossed },
     { id: 'usuarios', moduleKey: 'usuarios', label: 'Equipe & Acessos', icon: Users },
     { id: 'audit', moduleKey: 'auditoria', label: 'Auditoria de Ações', icon: History },
+    { id: 'financial_audit', moduleKey: 'auditoria', label: 'Auditoria Financeira', icon: FileSearch, adminOnly: true },
     { id: 'qrcodes', moduleKey: 'qrcodes', label: 'QR Codes & Links', icon: QrCode },
     { id: 'settings', moduleKey: 'configuracoes', label: 'Configurações Loja', icon: Settings },
   ];
 
-  // Filter tabs by current user's authorized modules, strict cash authority, and ADMINISTRADOR-only staff management
+  // Filter tabs by current user's authorized modules, strict cash authority, and ADMINISTRADOR-only sections
   const allowedTabs = useMemo(() => {
-    if (!currentUser) return allTabs;
+    const isAdmin = currentUser?.role === 'ADMINISTRADOR';
+    if (!currentUser) return allTabs.filter((tab) => !tab.adminOnly);
     const canManageCash = store.canUserManageCash();
-    const canManageUsers = currentUser.role === 'ADMINISTRADOR' && store.canUserManageUsers();
+    const canManageUsers = isAdmin && store.canUserManageUsers();
     const roleSafeTabs = allTabs.filter((tab) => {
+      if (tab.adminOnly && !isAdmin) return false;
       if (tab.id === 'caixa' && !canManageCash) return false;
       if (tab.id === 'usuarios' && !canManageUsers) return false;
       return true;
     });
-    if (currentUser.role === 'ADMINISTRADOR') return roleSafeTabs;
+    if (isAdmin) return roleSafeTabs;
     const modules = currentUser.allowedModules || ['pdv', 'kanban'];
     return roleSafeTabs.filter((tab) => modules.includes(tab.moduleKey));
   }, [currentUser, allTabs]);
@@ -374,6 +380,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ currentUser, onL
 
         {activeTab === 'audit' && (
           <MovementAuditLog orders={orders} />
+        )}
+
+        {activeTab === 'financial_audit' && currentUser?.role === 'ADMINISTRADOR' && (
+          <FinancialAuditPanel currentUser={currentUser} />
         )}
 
         {activeTab === 'qrcodes' && (
