@@ -38,8 +38,25 @@ export interface PushStatus {
   endpoint?: string;
 }
 
-class PushNotificationService {
+export interface PushSubscribeOptions {
+  /**
+   * When true (default, e.g. manual activation by user), always syncs with backend.
+   * When false (e.g. automatic background sync), skips POST /api/push/subscribe
+   * if endpoint, role, VAPID key and subscription keys were already synced in this session.
+   */
+  forceSync?: boolean;
+}
+
+const FALLBACK_VAPID_PUBLIC_KEY =
+  'BJoRmXFaMXFlCcWPH9spcZds3eVoyOmKGsSwW6dyZJyTZR8F7oKJNNWVpkmEaQHf0TXu9bAgnCsLmDV0RIs7bBM';
+
+export class PushNotificationService {
   private currentSubscription: PushSubscription | null = null;
+  private cachedVapidPublicKey: string | null = null;
+  private inFlightVapidKeyPromise: Promise<string> | null = null;
+  private inFlightSubscribePromise: Promise<{ success: boolean; message: string }> | null = null;
+  private inFlightRole: string | null = null;
+  private lastSyncedSignature: string | null = null;
 
   public isSupported(): boolean {
     return (
@@ -82,21 +99,16 @@ class PushNotificationService {
     }
   }
 
-  public async requestAndSubscribe(role = 'staff'): Promise<{ success: boolean; message: string }> {
-    if (!this.isSupported()) {
-      return { success: false, message: 'Notificações push não são suportadas neste navegador ou dispositivo.' };
+  private async getVapidPublicKey(): Promise<string> {
+    if (this.cachedVapidPublicKey) {
+      return this.cachedVapidPublicKey;
     }
 
-    try {
-      const permission = await Notification.requestPermission();
-      if (permission !== 'granted') {
-        return {
-          success: false,
-          message: 'Permissão para notificações foi recusada. Ative as notificações nas configurações do seu navegador.',
-        };
-      }
+    if (this.inFlightVapidKeyPromise) {
+      return this.inFlightVapidKeyPromise;
+    }
 
-      // Fetch public VAPID key from backend
+    const fetchPromise = (async () => {
       let vapidPublicKey = '';
       try {
         const resKey = await fetch('/api/push/vapid-key');
@@ -113,21 +125,111 @@ class PushNotificationService {
         console.warn('[Push Service] Falha ao consultar vapid-key no servidor:', keyErr);
       }
 
+      // Cache ONLY server-confirmed public keys in memory so transient server failures can recover later
+      if (vapidPublicKey) {
+        this.cachedVapidPublicKey = vapidPublicKey;
+        return vapidPublicKey;
+      }
+
       // Fallback 1: Variáveis de ambiente configuradas no build do Vite
-      if (!vapidPublicKey) {
-        const envKey = (
-          (import.meta.env.VITE_FIREBASE_VAPID_KEY as string | undefined) ||
-          (import.meta.env.VITE_VAPID_PUBLIC_KEY as string | undefined)
-        );
-        if (envKey && envKey.trim()) {
-          vapidPublicKey = envKey.trim().replace(/\s+/g, '');
-        }
+      const metaEnv = (import.meta as unknown as { env?: Record<string, string | undefined> })?.env;
+      const envKey = metaEnv?.VITE_FIREBASE_VAPID_KEY || metaEnv?.VITE_VAPID_PUBLIC_KEY;
+      if (envKey && envKey.trim()) {
+        return envKey.trim().replace(/\s+/g, '');
       }
 
       // Fallback 2: Chave pública de contingência operacional (garante ativação do PushManager sem falha de UI)
-      if (!vapidPublicKey) {
-        vapidPublicKey = 'BJoRmXFaMXFlCcWPH9spcZds3eVoyOmKGsSwW6dyZJyTZR8F7oKJNNWVpkmEaQHf0TXu9bAgnCsLmDV0RIs7bBM';
+      return FALLBACK_VAPID_PUBLIC_KEY;
+    })();
+
+    this.inFlightVapidKeyPromise = fetchPromise;
+    try {
+      return await fetchPromise;
+    } finally {
+      if (this.inFlightVapidKeyPromise === fetchPromise) {
+        this.inFlightVapidKeyPromise = null;
       }
+    }
+  }
+
+  private buildSubscriptionSignature(
+    subscription: PushSubscription,
+    normalizedRole: string,
+    vapidPublicKey: string
+  ): string {
+    const subJson = typeof subscription.toJSON === 'function' ? subscription.toJSON() : null;
+    const p256dh =
+      subJson?.keys?.p256dh ||
+      (typeof subscription.getKey === 'function'
+        ? arrayBufferToBase64(subscription.getKey('p256dh'))
+        : '');
+    const auth =
+      subJson?.keys?.auth ||
+      (typeof subscription.getKey === 'function'
+        ? arrayBufferToBase64(subscription.getKey('auth'))
+        : '');
+
+    return JSON.stringify({
+      endpoint: subscription.endpoint || '',
+      role: normalizedRole,
+      vapidKey: cleanBase64Key(vapidPublicKey),
+      p256dh,
+      auth,
+    });
+  }
+
+  public async requestAndSubscribe(
+    role = 'staff',
+    options?: PushSubscribeOptions
+  ): Promise<{ success: boolean; message: string }> {
+    if (!this.isSupported()) {
+      return { success: false, message: 'Notificações push não são suportadas neste navegador ou dispositivo.' };
+    }
+
+    const normalizedRole = (role || 'staff').trim().toUpperCase();
+    const forceSync = options?.forceSync !== false;
+
+    // Prevent concurrent executions; reuse in-flight automatic sync for the same role,
+    // or wait for completion before executing a role change / explicit manual sync.
+    while (this.inFlightSubscribePromise) {
+      if (!forceSync && this.inFlightRole === normalizedRole) {
+        return this.inFlightSubscribePromise;
+      }
+      await this.inFlightSubscribePromise.catch(() => null);
+    }
+
+    let runPromise!: Promise<{ success: boolean; message: string }>;
+    runPromise = this.executeRequestAndSubscribe(role, normalizedRole, forceSync).finally(() => {
+      if (this.inFlightSubscribePromise === runPromise) {
+        this.inFlightSubscribePromise = null;
+        this.inFlightRole = null;
+      }
+    });
+
+    this.inFlightRole = normalizedRole;
+    this.inFlightSubscribePromise = runPromise;
+    return runPromise;
+  }
+
+  private async executeRequestAndSubscribe(
+    role: string,
+    normalizedRole: string,
+    forceSync: boolean
+  ): Promise<{ success: boolean; message: string }> {
+    try {
+      const permission =
+        Notification.permission === 'granted'
+          ? 'granted'
+          : await Notification.requestPermission();
+
+      if (permission !== 'granted') {
+        return {
+          success: false,
+          message: 'Permissão para notificações foi recusada. Ative as notificações nas configurações do seu navegador.',
+        };
+      }
+
+      const vapidPublicKey = await this.getVapidPublicKey();
 
       const reg = await navigator.serviceWorker.ready;
       let subscription = await reg.pushManager.getSubscription();
@@ -140,6 +242,7 @@ class PushNotificationService {
           console.info('[Push Service] Chave VAPID anterior divergia da atual. Renovando inscrição para garantir entrega...');
           await subscription.unsubscribe().catch(() => {});
           subscription = null;
+          this.lastSyncedSignature = null;
         }
       }
 
@@ -153,6 +256,20 @@ class PushNotificationService {
 
       if (subscription) {
         this.currentSubscription = subscription;
+
+        const currentSignature = this.buildSubscriptionSignature(
+          subscription,
+          normalizedRole,
+          vapidPublicKey
+        );
+
+        // Skip redundant backend POST when automatic sync confirms endpoint, role, VAPID key and keys are unchanged
+        if (!forceSync && this.lastSyncedSignature === currentSignature) {
+          return {
+            success: true,
+            message: 'Notificações em segundo plano já sincronizadas para este dispositivo!',
+          };
+        }
 
         // Retrieve auth token if user is signed in to attach Bearer header
         let idToken: string | null = null;
@@ -180,6 +297,9 @@ class PushNotificationService {
         });
 
         if (!regRes.ok) {
+          if (this.lastSyncedSignature === currentSignature) {
+            this.lastSyncedSignature = null;
+          }
           const rawErrText = await regRes.text().catch(() => '');
           let errData: any = {};
           if (rawErrText && rawErrText.trim()) {
@@ -190,6 +310,8 @@ class PushNotificationService {
             message: errData.message || `Servidor não pôde confirmar a gravação da inscrição (HTTP ${regRes.status}).`,
           };
         }
+
+        this.lastSyncedSignature = currentSignature;
 
         return {
           success: true,
@@ -202,6 +324,9 @@ class PushNotificationService {
         message: 'Permissão concedida. O dispositivo receberá alertas quando pedidos chegarem.',
       };
     } catch (err: unknown) {
+      if (forceSync) {
+        this.lastSyncedSignature = null;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       return { success: false, message: `Falha ao ativar notificações push: ${msg}` };
     }

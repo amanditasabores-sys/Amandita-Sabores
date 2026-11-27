@@ -22,6 +22,11 @@
   }
 }
 
+html.operational-no-ptr,
+body.operational-no-ptr {
+  overscroll-behavior-y: none;
+}
+
 .no-scrollbar {
   -ms-overflow-style: none;
   scrollbar-width: none;

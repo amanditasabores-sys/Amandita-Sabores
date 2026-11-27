@@ -599,10 +599,14 @@ class ThermalPrinterService {
       const devices = await nav.bluetooth.getDevices();
       if (!Array.isArray(devices) || devices.length === 0) return null;
 
-      // Prefere correspondência exata por ID salvo; fallback por nome salvo
+      // Prefere correspondência exata por ID salvo; fallback por nome salvo (exato ou case-insensitive)
+      const normalizedSavedName = this.config.lastDeviceName?.trim().toLowerCase() || '';
       const matched =
         (this.config.lastDeviceId ? devices.find((d: any) => d && d.id === this.config.lastDeviceId) : null) ||
-        (this.config.lastDeviceName ? devices.find((d: any) => d && d.name === this.config.lastDeviceName) : null);
+        (this.config.lastDeviceName ? devices.find((d: any) => d && d.name === this.config.lastDeviceName) : null) ||
+        (normalizedSavedName
+          ? devices.find((d: any) => d && typeof d.name === 'string' && d.name.trim().toLowerCase() === normalizedSavedName)
+          : null);
 
       if (matched && matched.gatt) {
         this.bleDevice = matched;
@@ -649,8 +653,8 @@ class ThermalPrinterService {
           return {
             success: false,
             message: options.silent
-              ? 'Sessão Bluetooth encerrada pelo recarregamento. Clique em Reconectar Impressora.'
-              : 'Handle Bluetooth encerrado pelo navegador ou dispositivo fora de alcance. Clique em "Parear / Reconectar" para autorizar novamente.',
+              ? 'Conexão Bluetooth encerrada após o recarregamento. O navegador exige ação manual para reconectar.'
+              : 'O navegador encerrou a sessão Bluetooth após o recarregamento e exige nova confirmação manual. Toque em "Parear / Reconectar" para selecionar a impressora.',
           };
         }
 
@@ -659,9 +663,18 @@ class ThermalPrinterService {
           this.notifyStatus();
         }
 
-        // Até 2 tentativas controladas (nunca loop infinito):
-        // Tentativa 1: conexão GATT direta
-        // Tentativa 2 (somente se a 1ª falhar): aguarda anúncio BLE se suportado (útil após getDevices()/reload) ou breve pausa
+        // Quando recuperado via getDevices() após reload intencional, aguarda brevemente um anúncio BLE
+        // antes da 1ª tentativa GATT para que o navegador localize a impressora no alcance sem falhar de imediato.
+        if (
+          !hadDeviceInMemory &&
+          !device.gatt.connected &&
+          options.allowWatchAdvertisements &&
+          typeof device.watchAdvertisements === 'function'
+        ) {
+          await this.waitForAdvertisementBriefly(device, 2500);
+        }
+
+        // Até 2 tentativas controladas (nunca loop infinito)
         let lastConnectError: any = null;
         for (let attempt = 1; attempt <= 2; attempt++) {
           if (this.isBleConnectionHealthy()) {
@@ -672,11 +685,7 @@ class ThermalPrinterService {
           }
 
           if (attempt === 2) {
-            if (options.allowWatchAdvertisements && !hadDeviceInMemory && typeof device.watchAdvertisements === 'function') {
-              await this.waitForAdvertisementBriefly(device, 3000);
-            } else {
-              await new Promise((r) => setTimeout(r, 350));
-            }
+            await new Promise((r) => setTimeout(r, 400));
           }
 
           try {
@@ -698,7 +707,7 @@ class ThermalPrinterService {
               return {
                 success: true,
                 message: options.silent
-                  ? `Impressora "${device.name || 'Térmica 58mm'}" reconectada automaticamente.`
+                  ? `Impressora "${device.name || 'Térmica 58mm'}" reconectada.`
                   : `Impressora "${device.name || 'Térmica 58mm'}" reconectada com sucesso!`,
               };
             }
@@ -719,14 +728,14 @@ class ThermalPrinterService {
         if (!options.silent) {
           const errorMessage = msg.startsWith('Impressora reconectada')
             ? msg
-            : `Falha ao reconectar impressora: ${msg}`;
+            : `Não foi possível reconectar automaticamente (${msg}). Toque em "Parear / Reconectar" para autorizar a impressora novamente.`;
           this.lastError = errorMessage;
           return { success: false, message: errorMessage };
         }
 
         return {
           success: false,
-          message: 'Conexão BLE aguardando reconexão. Use o botão Reconectar Impressora se necessário.',
+          message: 'Impressora aguardando reconexão manual. Toque em Reconectar Impressora quando desejar imprimir.',
         };
       } finally {
         this.isReconnecting = false;

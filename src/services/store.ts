@@ -143,6 +143,11 @@ class StoreService {
   private ordersUnsubscriber: Unsubscribe | null = null;
   private cashShiftsUnsubscriber: Unsubscribe | null = null;
   private isPublicSyncActive = false;
+  private isDailyMenuRealtimeActive = false;
+  private lastDailyMenuRealtimeAt = 0;
+  private initialDailyMenuFirestorePromise: Promise<DailyMenuConfig | null> | null = null;
+  private lastResumeSyncAt = 0;
+  private lastPublicAvailabilityFetchedAt = 0;
   private isStaffSyncActive = false;
   private isOrdersSyncActive = false;
   private isCashShiftsSyncActive = false;
@@ -860,6 +865,57 @@ class StoreService {
 
   private isSyncingDailyMenu = false;
   private lastDailyMenuServerSyncTime = 0;
+  private inFlightDailyMenuSyncPromise: Promise<DailyMenuConfig | null> | null = null;
+  private readonly DAILY_MENU_SERVER_COOLDOWN_MS = 15_000;
+  private readonly DAILY_MENU_FALLBACK_POLL_MS = 120_000;
+  private readonly RESUME_EVENT_DEBOUNCE_MS = 3_000;
+  private readonly PUBLIC_AVAILABILITY_TTL_MS = 5_000;
+
+  private isDocumentVisible(): boolean {
+    if (typeof document === 'undefined') return true;
+    return document.visibilityState !== 'hidden';
+  }
+
+  public isDailyMenuRealtimeConnected(): boolean {
+    return Boolean(db && this.isPublicSyncActive && this.isDailyMenuRealtimeActive);
+  }
+
+  private applyRemoteDailyMenuConfig(remoteConfig: DailyMenuConfig): DailyMenuConfig {
+    const normalized: DailyMenuConfig = {
+      enabled: Boolean(remoteConfig.enabled),
+      selectedItemIds: Array.isArray(remoteConfig.selectedItemIds) ? remoteConfig.selectedItemIds : [],
+      selectedComboIds: Array.isArray(remoteConfig.selectedComboIds) ? remoteConfig.selectedComboIds : [],
+      draftItemIds: Array.isArray(remoteConfig.draftItemIds)
+        ? remoteConfig.draftItemIds
+        : Array.isArray(remoteConfig.selectedItemIds)
+          ? remoteConfig.selectedItemIds
+          : [],
+      draftComboIds: Array.isArray(remoteConfig.draftComboIds)
+        ? remoteConfig.draftComboIds
+        : Array.isArray(remoteConfig.selectedComboIds)
+          ? remoteConfig.selectedComboIds
+          : [],
+      publishedAt: remoteConfig.publishedAt || '',
+      referenceDate: remoteConfig.referenceDate || '',
+    };
+
+    const localConfig = this.getDailyMenuConfig();
+    const changed =
+      Boolean(localConfig.enabled) !== normalized.enabled ||
+      (localConfig.publishedAt || '') !== (normalized.publishedAt || '') ||
+      (localConfig.referenceDate || '') !== (normalized.referenceDate || '') ||
+      JSON.stringify(localConfig.selectedItemIds || []) !== JSON.stringify(normalized.selectedItemIds) ||
+      JSON.stringify(localConfig.selectedComboIds || []) !== JSON.stringify(normalized.selectedComboIds);
+
+    if (changed) {
+      try {
+        localStorage.setItem('gf_daily_menu', JSON.stringify(normalized));
+      } catch {}
+      this.notify('DAILY_MENU_UPDATED', normalized);
+    }
+
+    return normalized;
+  }
 
   public saveDailyMenuConfig(config: DailyMenuConfig): void {
     if (!this.canUserManageMenu()) {
@@ -890,56 +946,95 @@ class StoreService {
 
   /**
    * Synchronizes the Daily Menu across all devices (mobile phones, desktop computers, customer views).
-   * Fetches latest state from /api/daily-menu. If the current device already had an active menu published locally
-   * but the server didn't have it yet, self-heals by uploading it.
+   * When Firestore realtime listener (configs/daily_menu) is active, non-forced calls avoid redundant HTTP requests.
+   * Falls back safely to /api/daily-menu whenever Firestore is unavailable or disconnected.
    */
   public async syncDailyMenuWithServer(force = false): Promise<DailyMenuConfig | null> {
     if (typeof window === 'undefined' || typeof fetch !== 'function') return null;
+
+    // Coalesce any concurrent calls (including startup + mount or focus + visibilitychange)
+    if (this.inFlightDailyMenuSyncPromise) {
+      return this.inFlightDailyMenuSyncPromise;
+    }
+
     const now = Date.now();
-    if (!force && this.isSyncingDailyMenu) return null;
-    if (!force && now - this.lastDailyMenuServerSyncTime < 3000) return null;
 
-    this.isSyncingDailyMenu = true;
-    try {
-      const res = await fetch('/api/daily-menu', {
-        headers: { 'Cache-Control': 'no-cache' },
-      });
-      if (res.ok) {
-        const json = await res.json();
-        const serverConfig = json?.dailyMenu as DailyMenuConfig | undefined;
-        const localConfig = this.getDailyMenuConfig();
+    // When Firestore realtime sync for configs/daily_menu is active, skip redundant HTTP polling
+    if (!force) {
+      if (!this.isDocumentVisible()) {
+        return null;
+      }
+      if (this.initialDailyMenuFirestorePromise) {
+        try {
+          const initialResult = await this.initialDailyMenuFirestorePromise;
+          if (this.isDailyMenuRealtimeActive) {
+            return initialResult || this.getDailyMenuConfig();
+          }
+        } catch {}
+      }
+      if (this.isDailyMenuRealtimeConnected()) {
+        return this.getDailyMenuConfig();
+      }
+      if (now - this.lastDailyMenuServerSyncTime < this.DAILY_MENU_SERVER_COOLDOWN_MS) {
+        return null;
+      }
+    } else if (now - this.lastDailyMenuServerSyncTime < 2000) {
+      // Micro-dedup consecutive forced calls (e.g. constructor + component mount within <2s)
+      return this.getDailyMenuConfig();
+    }
 
-        if (serverConfig && serverConfig.enabled) {
-          const changed =
-            !localConfig.enabled ||
-            localConfig.publishedAt !== serverConfig.publishedAt ||
-            (localConfig.selectedItemIds?.length !== serverConfig.selectedItemIds?.length) ||
-            (localConfig.selectedComboIds?.length !== serverConfig.selectedComboIds?.length);
+    const run = async (): Promise<DailyMenuConfig | null> => {
+      this.isSyncingDailyMenu = true;
+      try {
+        const res = await fetch('/api/daily-menu', {
+          headers: { 'Cache-Control': 'no-cache' },
+        });
+        if (res.ok) {
+          const json = await res.json();
+          const serverConfig = json?.dailyMenu as DailyMenuConfig | undefined;
+          const localConfig = this.getDailyMenuConfig();
 
-          if (changed) {
-            localStorage.setItem('gf_daily_menu', JSON.stringify(serverConfig));
-            this.notify('DAILY_MENU_UPDATED', serverConfig);
+          if (serverConfig && serverConfig.enabled) {
+            const applied = this.applyRemoteDailyMenuConfig(serverConfig);
+            this.lastDailyMenuServerSyncTime = Date.now();
+            return applied;
+          } else if (
+            localConfig &&
+            localConfig.enabled &&
+            (!serverConfig || !serverConfig.enabled) &&
+            this.canUserManageMenu()
+          ) {
+            // Self-heal: an authorized manager/admin published the menu locally while offline.
+            // Push it to the server and database so all devices receive it.
+            await fetch('/api/daily-menu', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(localConfig),
+            }).catch(() => {});
+            this.lastDailyMenuServerSyncTime = Date.now();
+            return localConfig;
+          } else if (serverConfig && typeof serverConfig.enabled === 'boolean') {
+            const applied = this.applyRemoteDailyMenuConfig(serverConfig);
+            this.lastDailyMenuServerSyncTime = Date.now();
+            return applied;
           }
           this.lastDailyMenuServerSyncTime = Date.now();
-          return serverConfig;
-        } else if (localConfig && localConfig.enabled && (!serverConfig || !serverConfig.enabled)) {
-          // Self-heal: the active device (e.g. mobile admin) had published the menu locally.
-          // Push it to the server and database so all desktop browsers immediately receive it!
-          await fetch('/api/daily-menu', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(localConfig),
-          }).catch(() => {});
-          this.lastDailyMenuServerSyncTime = Date.now();
-          return localConfig;
         }
+      } catch {
+        // Non-blocking fallback for offline environments
+      } finally {
+        this.isSyncingDailyMenu = false;
       }
-    } catch (err) {
-      // Non-blocking fallback for offline environments
-    } finally {
-      this.isSyncingDailyMenu = false;
-    }
-    return null;
+      return null;
+    };
+
+    const promise = run().finally(() => {
+      if (this.inFlightDailyMenuSyncPromise === promise) {
+        this.inFlightDailyMenuSyncPromise = null;
+      }
+    });
+    this.inFlightDailyMenuSyncPromise = promise;
+    return promise;
   }
 
   public publishDailyMenu(selectedItemIds: string[], selectedComboIds: string[]): void {
@@ -2062,6 +2157,9 @@ class StoreService {
       try {
         this.broadcastChannel = new BroadcastChannel('gestaofood_sync_channel');
         this.broadcastChannel.onmessage = (event) => {
+          if (event.data?.type === 'CASH_SHIFT_UPDATED') {
+            this.lastPublicAvailabilityFetchedAt = 0;
+          }
           if (event.data?.type === 'ORDER_CREATED') {
             // Strictly isolate public customer views & drivers: customers & drivers NEVER hear internal kitchen/cashier bells
             if (!this.isPublicCustomerContext()) {
@@ -2078,46 +2176,85 @@ class StoreService {
       }
     }
 
-    // Initialize public real-time data (Menu & Store Config)
+    // Initialize public real-time data (Menu, Daily Menu & Store Config)
     this.initPublicFirestoreSync();
-    this.syncDailyMenuWithServer(true).catch(() => {});
+    if (!db) {
+      this.syncDailyMenuWithServer(true).catch(() => {});
+    }
 
-    // Reconnection listener to flush pending orders and sync daily menu / public catalog automatically
+    // Unified foreground/reconnection handler: deduplicates simultaneous focus + visibilitychange bursts
     if (typeof window !== 'undefined') {
-      window.addEventListener('online', () => {
-        console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes e sincronizando cardápio...');
-        this.flushPendingSyncQueue();
-        this.refreshPublicMenuSync(true).catch(() => {});
-        this.syncDailyMenuWithServer(true).catch(() => {});
-        const current = this.getCurrentUser();
-        if (current && this.isAuthorizedStaffRole(current.role)) {
-          this.refreshStaffSync().catch(() => {});
+      const handleForegroundSync = (reason: 'online' | 'focus' | 'visibility') => {
+        if (reason !== 'online' && !this.isDocumentVisible()) {
+          return;
         }
-      });
 
-      window.addEventListener('focus', () => {
+        if (reason === 'online' || reason === 'visibility') {
+          this.flushPendingSyncQueue();
+        }
+
+        const now = Date.now();
+        if (reason !== 'online' && now - this.lastResumeSyncAt < this.RESUME_EVENT_DEBOUNCE_MS) {
+          return;
+        }
+        this.lastResumeSyncAt = now;
+
+        if (reason === 'online') {
+          console.info('[Store Sync] Conexão restabelecida. Transmitindo pedidos pendentes e sincronizando cardápio...');
+          this.refreshPublicMenuSync(true).catch(() => {});
+          if (!this.isDailyMenuRealtimeConnected()) {
+            this.syncDailyMenuWithServer(true).catch(() => {});
+          }
+          const current = this.getCurrentUser();
+          if (current && this.isAuthorizedStaffRole(current.role)) {
+            this.refreshStaffSync().catch(() => {});
+          }
+          return;
+        }
+
+        if (reason === 'visibility') {
+          console.info('[Store Sync] Retorno do segundo plano: verificando conexões e cardápio...');
+          this.refreshPublicMenuSync(false).catch(() => {});
+          if (!this.isDailyMenuRealtimeConnected()) {
+            this.syncDailyMenuWithServer(false).catch(() => {});
+          }
+          const current = this.getCurrentUser();
+          if (current && this.isAuthorizedStaffRole(current.role)) {
+            this.refreshStaffSync().catch(() => {});
+          }
+          return;
+        }
+
+        // Independent focus event (e.g. desktop window regain after debounce window)
         this.refreshPublicMenuSync(false).catch(() => {});
-        this.syncDailyMenuWithServer().catch(() => {});
-      });
+        if (!this.isDailyMenuRealtimeConnected()) {
+          this.syncDailyMenuWithServer(false).catch(() => {});
+        }
+      };
+
+      window.addEventListener('online', () => handleForegroundSync('online'));
+      window.addEventListener('focus', () => handleForegroundSync('focus'));
 
       if (typeof document !== 'undefined') {
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'visible') {
-            console.info('[Store Sync] Retorno do segundo plano: verificando conexões e cardápio...');
-            this.flushPendingSyncQueue();
-            this.refreshPublicMenuSync(true).catch(() => {});
-            this.syncDailyMenuWithServer(true).catch(() => {});
-            const current = this.getCurrentUser();
-            if (current && this.isAuthorizedStaffRole(current.role)) {
-              this.refreshStaffSync().catch(() => {});
-            }
+            handleForegroundSync('visibility');
           }
         });
       }
 
-      // Background heartbeat to retry pending sync queue and keep daily menu & listeners alive across all devices
+      // Background heartbeat: always preserves pending order queue; pauses non-critical checks while tab is hidden
       setInterval(() => {
-        this.flushPendingSyncQueue();
+        // Pending order synchronization is NEVER paused while there are unsynced orders
+        if (this.getPendingSyncOrders().length > 0) {
+          this.flushPendingSyncQueue();
+        }
+
+        // Pause non-essential background checks & HTTP fallbacks when tab is hidden
+        if (!this.isDocumentVisible()) {
+          return;
+        }
+
         if (!this.isPublicSyncActive && !this.publicSyncRetryTimer) {
           this.initPublicFirestoreSync();
         }
@@ -2135,7 +2272,14 @@ class StoreService {
             this.initStaffFirestoreSync().catch(() => {});
           }
         }
-        this.syncDailyMenuWithServer().catch(() => {});
+
+        // Safe HTTP fallback for Daily Menu ONLY when Firestore realtime listener is disconnected (every 120s)
+        if (
+          !this.isDailyMenuRealtimeConnected() &&
+          Date.now() - this.lastDailyMenuServerSyncTime >= this.DAILY_MENU_FALLBACK_POLL_MS
+        ) {
+          this.syncDailyMenuWithServer(false).catch(() => {});
+        }
       }, 10000);
     }
 
@@ -2490,6 +2634,7 @@ class StoreService {
     });
     this.publicUnsubscribers = [];
     this.isPublicSyncActive = false;
+    this.isDailyMenuRealtimeActive = false;
   }
 
   private schedulePublicSyncRetry(delayMs = 5000): void {
@@ -2801,6 +2946,14 @@ class StoreService {
           ...(remoteKey !== undefined ? { pixKey: remoteKey } : {}),
           ...(resolvedRemoteType ? { pixKeyType: resolvedRemoteType } : {}),
         };
+        // If remote open/closed status transitioned, immediately invalidate short availability TTL cache
+        if (
+          typeof remotePublic.isOpen === 'boolean' &&
+          this.lastPublicAvailability &&
+          remotePublic.isOpen !== this.lastPublicAvailability.isOpen
+        ) {
+          this.lastPublicAvailabilityFetchedAt = 0;
+        }
         try {
           localStorage.setItem('gf_restaurant_config', JSON.stringify(mergedConfig));
         } catch (storageErr) {
@@ -2854,6 +3007,43 @@ class StoreService {
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           markConfigUnavailable(msg || 'Falha ao consultar configs/restaurant no servidor.');
+        });
+
+      // 3. Synchronize Daily Menu in Real Time (Public read allowed by firestore.rules: configs/daily_menu)
+      const unsubDailyMenu = onSnapshot(
+        doc(db, 'configs', 'daily_menu'),
+        (docSnap) => {
+          this.isDailyMenuRealtimeActive = true;
+          this.lastDailyMenuRealtimeAt = Date.now();
+          if (docSnap.exists()) {
+            this.applyRemoteDailyMenuConfig(docSnap.data() as DailyMenuConfig);
+          }
+        },
+        (error) => {
+          this.isDailyMenuRealtimeActive = false;
+          console.warn('[Firestore Public Sync] Daily menu listener notice:', error.message);
+          if (this.isDocumentVisible()) {
+            this.syncDailyMenuWithServer(true).catch(() => {});
+          }
+        }
+      );
+      this.publicUnsubscribers.push(unsubDailyMenu);
+
+      this.initialDailyMenuFirestorePromise = getDocFromServer(doc(db, 'configs', 'daily_menu'))
+        .then((serverSnap) => {
+          this.isDailyMenuRealtimeActive = true;
+          this.lastDailyMenuRealtimeAt = Date.now();
+          if (serverSnap.exists()) {
+            return this.applyRemoteDailyMenuConfig(serverSnap.data() as DailyMenuConfig);
+          }
+          return null;
+        })
+        .catch(() => {
+          this.isDailyMenuRealtimeActive = false;
+          return this.syncDailyMenuWithServer(true).catch(() => null);
+        })
+        .finally(() => {
+          this.initialDailyMenuFirestorePromise = null;
         });
 
     } catch (err) {
@@ -3847,6 +4037,7 @@ class StoreService {
       source: 'firestore_snapshot',
       error: null,
     };
+    this.lastPublicAvailabilityFetchedAt = 0;
     this.notify('CASH_SHIFT_UPDATED', openShift);
   }
 
@@ -4280,6 +4471,9 @@ class StoreService {
   }
 
   private notify(type: string, payload?: unknown, options?: { skipBroadcast?: boolean }) {
+    if (type === 'CASH_SHIFT_UPDATED') {
+      this.lastPublicAvailabilityFetchedAt = 0;
+    }
     if (this.broadcastChannel && !options?.skipBroadcast) {
       try {
         this.broadcastChannel.postMessage({ type, payload });
@@ -9174,6 +9368,7 @@ class StoreService {
       checkedAt: new Date().toISOString(),
     };
     this.lastPublicAvailability = closedAvailability;
+    this.lastPublicAvailabilityFetchedAt = 0;
     try {
       localStorage.setItem('gf_restaurant_config', JSON.stringify({ ...cfg, isOpen: false }));
     } catch {}
@@ -9189,13 +9384,29 @@ class StoreService {
     retryDelayMs?: number;
     notifyOnFailure?: boolean;
     broadcastOnFailure?: boolean;
+    force?: boolean;
   }): Promise<PublicStoreAvailability> {
     const notifyOnFailure = options?.notifyOnFailure !== false;
     const broadcastOnFailure = options?.broadcastOnFailure === true;
+    const force = options?.force !== false;
 
     // Coalesce concurrent standard public availability requests to avoid redundant overlapping HTTP calls
     if (notifyOnFailure && !broadcastOnFailure && this.publicAvailabilityInFlightPromise) {
       return this.publicAvailabilityInFlightPromise;
+    }
+
+    // Short in-memory TTL (5s) for non-forced verified responses to avoid focus/visibility/event storms.
+    // Never used when force === true, never caches unverified errors, and invalidated immediately on open/close transitions.
+    // Order creation ALWAYS performs authoritative live validation on the server (/api/orders).
+    if (
+      !force &&
+      notifyOnFailure &&
+      !broadcastOnFailure &&
+      this.lastPublicAvailability &&
+      this.lastPublicAvailability.verified &&
+      Date.now() - this.lastPublicAvailabilityFetchedAt < this.PUBLIC_AVAILABILITY_TTL_MS
+    ) {
+      return this.lastPublicAvailability;
     }
 
     const execute = async (): Promise<PublicStoreAvailability> => {
@@ -9298,6 +9509,7 @@ class StoreService {
           };
 
           this.lastPublicAvailability = availability;
+          this.lastPublicAvailabilityFetchedAt = Date.now();
 
           const nextCfg: RestaurantConfig = {
             ...cfg,

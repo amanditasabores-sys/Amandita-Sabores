@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { store } from '../../services/store';
-import { MenuItem, MenuItemAddon, OrderItem, PaymentMethod, FulfillmentType, Order, Combo, DailyMenuConfig, PublicStoreAvailability } from '../../types';
+import { MenuItem, MenuItemAddon, OrderItem, PaymentMethod, FulfillmentType, Order, Combo, DailyMenuConfig, PublicStoreAvailability, RestaurantConfig } from '../../types';
 import { formatCurrency, generateWhatsAppOrderMessage, formatCustomerAddress } from '../../utils/formatters';
 import { getPublicAppUrl } from '../../utils/url';
 import { generateQRCodeDataUrl } from '../../utils/qrcode';
@@ -126,7 +126,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
         if (!availabilityRetryTimerRef.current) {
           availabilityRetryTimerRef.current = setTimeout(() => {
             availabilityRetryTimerRef.current = null;
-            if (isMounted) {
+            if (isMounted && (typeof document === 'undefined' || document.visibilityState !== 'hidden')) {
               refreshAvailability(true);
             }
           }, 3000);
@@ -146,15 +146,24 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
 
     applyAvailabilityResultRef.current = applyAvailabilityResult;
 
+    const AVAILABILITY_POLL_INTERVAL_MS = 60_000;
+    const AVAILABILITY_EVENT_DEBOUNCE_MS = 5_000;
+    let wasHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+
     const refreshAvailability = async (force = false) => {
       const now = Date.now();
-      if (!force && now - lastAvailabilityCheckRef.current < 400) {
-        return;
+      if (!force) {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          return;
+        }
+        if (now - lastAvailabilityCheckRef.current < AVAILABILITY_EVENT_DEBOUNCE_MS) {
+          return;
+        }
       }
       lastAvailabilityCheckRef.current = now;
 
       try {
-        const res = await store.fetchPublicStoreAvailability();
+        const res = await store.fetchPublicStoreAvailability({ force });
         applyAvailabilityResult(res);
       } catch {
         if (isMounted) {
@@ -164,7 +173,8 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     };
 
     refreshAvailability(true);
-    store.syncDailyMenuWithServer(true).finally(() => {
+    // Avoid duplicating startup /api/daily-menu when Firestore realtime or store boot sync is already active
+    store.syncDailyMenuWithServer(false).finally(() => {
       if (isMounted) {
         setDailyConfig(store.getDailyMenuConfig());
         setIsInitialLoadingDailyMenu(false);
@@ -172,29 +182,58 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
     });
 
     const intervalId = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
       refreshAvailability(false);
-    }, 10000);
+    }, AVAILABILITY_POLL_INTERVAL_MS);
 
-    const handleVisibilityOrFocus = () => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
-        refreshAvailability(false);
+    const handleVisibilityChange = () => {
+      if (typeof document === 'undefined') return;
+      if (document.visibilityState === 'hidden') {
+        wasHidden = true;
+        clearScheduledRetry();
+        return;
+      }
+      if (document.visibilityState === 'visible' && wasHidden) {
+        wasHidden = false;
+        // Immediately refresh when returning from background; sets lastAvailabilityCheckRef so paired focus event is deduplicated
+        refreshAvailability(true);
       }
     };
 
-    window.addEventListener('focus', handleVisibilityOrFocus);
-    window.addEventListener('online', handleVisibilityOrFocus);
+    const handleFocus = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      refreshAvailability(false);
+    };
+
+    const handleOnline = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastAvailabilityCheckRef.current < 1000) {
+        return;
+      }
+      refreshAvailability(true);
+    };
+
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleOnline);
     if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+      document.addEventListener('visibilitychange', handleVisibilityChange);
     }
 
     return () => {
       isMounted = false;
       clearInterval(intervalId);
       clearScheduledRetry();
-      window.removeEventListener('focus', handleVisibilityOrFocus);
-      window.removeEventListener('online', handleVisibilityOrFocus);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleOnline);
       if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
       }
     };
   }, []);
@@ -207,6 +246,17 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
   const [pixQrDataUrl, setPixQrDataUrl] = useState<string>('');
   const [pixQrError, setPixQrError] = useState<string | null>(null);
   const [copiedPixCode, setCopiedPixCode] = useState(false);
+
+  // Single authoritative dismissal helper so polling/listeners can never reopen a closed confirmation
+  const handleDismissOrderConfirmation = () => {
+    setCreatedOrder(null);
+    setCreatedOrderId(null);
+    setCreatedOrderNumber('');
+    setWhatsappShareUrl('');
+    setPixQrDataUrl('');
+    setPixQrError(null);
+    setCopiedPixCode(false);
+  };
 
   // Sync state & immediate remote open/close transition
   useEffect(() => {
@@ -223,19 +273,50 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
       if (eventType === 'STORE_AVAILABILITY_UPDATED' && detail?.payload) {
         const nextAvail = detail.payload as PublicStoreAvailability;
         applyAvailabilityResultRef.current(nextAvail);
-      } else if (eventType === 'CONFIG_UPDATED' || eventType === 'CASH_SHIFT_UPDATED') {
-        const now = Date.now();
-        if (now - lastAvailabilityCheckRef.current >= 400) {
-          lastAvailabilityCheckRef.current = now;
-          store.fetchPublicStoreAvailability().then((res) => {
+      } else if (eventType === 'CASH_SHIFT_UPDATED') {
+        // Immediate authoritative refresh when cash shift opens or closes (paused if tab is hidden; resumes on return)
+        if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+          lastAvailabilityCheckRef.current = Date.now();
+          store.fetchPublicStoreAvailability({ force: true }).then((res) => {
             applyAvailabilityResultRef.current(res);
           }).catch(() => {});
+        }
+      } else if (eventType === 'CONFIG_UPDATED') {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          // Hidden tab skips background HTTP; handleVisibilityChange forces immediate refresh on return
+        } else {
+          const remoteIsOpen = (detail?.payload as Partial<RestaurantConfig> | undefined)?.isOpen;
+          const lastKnownOpen =
+            store.getLastPublicStoreAvailability()?.isOpen ??
+            lastConfirmedOpenAvailabilityRef.current?.isOpen;
+          const isOpenTransition =
+            typeof remoteIsOpen === 'boolean' &&
+            typeof lastKnownOpen === 'boolean' &&
+            remoteIsOpen !== lastKnownOpen;
+
+          if (isOpenTransition) {
+            // Immediate authoritative refresh when remote store status flips open/closed
+            lastAvailabilityCheckRef.current = Date.now();
+            store.fetchPublicStoreAvailability({ force: true }).then((res) => {
+              applyAvailabilityResultRef.current(res);
+            }).catch(() => {});
+          } else {
+            const now = Date.now();
+            if (now - lastAvailabilityCheckRef.current >= 5000) {
+              lastAvailabilityCheckRef.current = now;
+              store.fetchPublicStoreAvailability({ force: false }).then((res) => {
+                applyAvailabilityResultRef.current(res);
+              }).catch(() => {});
+            }
+          }
         }
       }
 
       if (createdOrderId) {
         const fresh = store.getOrderById(createdOrderId);
-        if (fresh) setCreatedOrder(fresh);
+        if (fresh) {
+          setCreatedOrder((prev) => (prev && prev.id === createdOrderId ? fresh : prev));
+        }
       }
     };
     window.addEventListener('gestaofood_state_changed', handleUpdate);
@@ -695,7 +776,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
           setClosedCheckoutNotice(errorMessage);
           setIsCartOpen(false);
           setSelectedItemForModal(null);
-          store.fetchPublicStoreAvailability().then((freshAvail) => {
+          store.fetchPublicStoreAvailability({ force: true }).then((freshAvail) => {
             setAvailability(freshAvail);
             setConfig(store.getRestaurantConfig());
           }).catch(() => {});
@@ -2087,7 +2168,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
                   onClick={() => {
                     const id = createdOrder.id;
                     const tk = createdOrder.trackingCode;
-                    setCreatedOrder(null);
+                    handleDismissOrderConfirmation();
                     onNavigateToTracking(id, tk);
                   }}
                   className="w-full min-h-[42px] py-2.5 bg-[#0F2342] hover:bg-[#1B365D] text-white font-bold rounded-xl text-xs transition cursor-pointer"
@@ -2098,7 +2179,7 @@ export const CustomerMenu: React.FC<CustomerMenuProps> = ({
 
               <button
                 type="button"
-                onClick={() => setCreatedOrder(null)}
+                onClick={handleDismissOrderConfirmation}
                 className="text-xs text-[#64748B] hover:text-[#0F2342] font-semibold pt-1.5 cursor-pointer"
               >
                 Voltar ao Cardápio

@@ -23,6 +23,18 @@ import {
 
 export type AppView = 'admin' | 'cardapio' | 'entregador' | 'producao' | 'caixa' | 'atendente' | 'rastreio';
 
+export function isSameUserProfile(prev: User | null, next: User | null): boolean {
+  if (prev === next) return true;
+  if (!prev || !next) return false;
+  return (
+    prev.id === next.id &&
+    prev.role === next.role &&
+    prev.status === next.status &&
+    prev.name === next.name &&
+    prev.email === next.email
+  );
+}
+
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(() => store.getCurrentUser());
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
@@ -140,7 +152,7 @@ export default function App() {
 
     const activeUser = store.getCurrentUser();
     if (activeUser) {
-      setCurrentUser((prev) => (!prev || prev.id !== activeUser.id ? activeUser : prev));
+      setCurrentUser((prev) => (isSameUserProfile(prev, activeUser) ? prev : activeUser));
     }
     const validViews: AppView[] = ['admin', 'cardapio', 'entregador', 'producao', 'caixa', 'atendente', 'rastreio'];
 
@@ -192,13 +204,13 @@ export default function App() {
         const fresh = store.getUserById(activeUser.id) || activeUser;
         if (fresh.status === 'DESATIVADO' || fresh.status === 'BLOQUEADO') {
           store.logout();
-          setCurrentUser(null);
+          setCurrentUser((prev) => (prev === null ? prev : null));
           setSecurityNotice('Sua conta de colaborador foi desativada ou bloqueada pela administração.');
         } else {
-          setCurrentUser(fresh);
+          setCurrentUser((prev) => (isSameUserProfile(prev, fresh) ? prev : fresh));
         }
       } else {
-        setCurrentUser(null);
+        setCurrentUser((prev) => (prev === null ? prev : null));
       }
     };
 
@@ -209,7 +221,7 @@ export default function App() {
     // Authoritative profile recovery when Firebase Auth session is already active
     store.refreshSessionProfileFromAuth().then((recovered) => {
       if (recovered) {
-        setCurrentUser(recovered);
+        setCurrentUser((prev) => (isSameUserProfile(prev, recovered) ? prev : recovered));
       }
     }).catch(() => {});
 
@@ -226,16 +238,33 @@ export default function App() {
   // Ensure real-time Firestore synchronization whenever staff is active or viewing staff screens
   useEffect(() => {
     const isStaffView = ['admin', 'atendente', 'producao', 'caixa', 'entregador'].includes(currentView);
-    if (currentUser && isStaffView) {
+    if (currentUser?.id && isStaffView) {
       store.ensureFirebaseAuthForStaff().then(() => {
         store.initStaffFirestoreSync();
       }).catch(() => {});
 
       // Sincroniza inscrição de notificações push se o navegador já tiver permissão
       if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-        pushNotificationService.requestAndSubscribe(currentUser.role).catch(() => {});
+        pushNotificationService
+          .requestAndSubscribe(currentUser.role || 'staff', { forceSync: false })
+          .catch(() => {});
       }
     }
+  }, [currentUser?.id, currentUser?.role, currentView]);
+
+  // Prevent accidental native browser pull-to-refresh reload on operational screens
+  // so active Web Bluetooth GATT printer connections are not dropped while scrolling
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const isOperationalView =
+      Boolean(currentUser) &&
+      ['admin', 'atendente', 'producao', 'caixa', 'entregador'].includes(currentView);
+    document.documentElement.classList.toggle('operational-no-ptr', isOperationalView);
+    document.body.classList.toggle('operational-no-ptr', isOperationalView);
+    return () => {
+      document.documentElement.classList.remove('operational-no-ptr');
+      document.body.classList.remove('operational-no-ptr');
+    };
   }, [currentUser, currentView]);
 
   const navigateTo = (
@@ -245,7 +274,7 @@ export default function App() {
   ) => {
     const activeUser = store.getCurrentUser();
     if (activeUser) {
-      setCurrentUser((prev) => (!prev || prev.id !== activeUser.id ? activeUser : prev));
+      setCurrentUser((prev) => (isSameUserProfile(prev, activeUser) ? prev : activeUser));
     }
     if (!isViewAllowedForUser(view, activeUser)) {
       if (activeUser) {
